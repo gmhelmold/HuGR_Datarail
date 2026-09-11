@@ -55,10 +55,12 @@ fn build_conn(
     Ok(std::sync::Arc::new(datarail_kafka::serve::PlainConn))
 }
 
+use std::collections::HashMap;
 use std::io::Read;
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::{Arc, RwLock, RwLockWriteGuard};
 use std::time::{Duration, Instant};
 
 use datarail_connectors::{
@@ -1023,34 +1025,115 @@ fn cmd_kafka_ingest(rest: &[String]) -> Result<String, CliError> {
     Ok(pipe.report())
 }
 
+/// Per-partition mutable state, protected by its own `RwLock`.
+/// Read-heavy paths (fetch, bounds) take read lock; write paths (produce, `buffer_txn`, `commit_txn`) take write lock.
+struct PartitionState {
+    /// The durable sealed log for this partition.
+    log: kafka_store::SealedPartitionLog,
+    /// In-flight TRANSACTIONAL record buffers for this partition, keyed by `(producer_id, epoch)`.
+    /// Held until `EndTxn`; on commit ONLY matching epoch flushes to log, on abort dropped.
+    /// Epoch in key prevents stale-epoch flush (audit TOCTOU).
+    txn_buffers: HashMap<(i64, i16), Vec<Vec<u8>>>,
+}
+
+/// Map from `(topic, partition)` to its per-partition `RwLock<PartitionState>`.
+/// The map itself is guarded by a single mutex for structural modifications (insert/remove).
+/// Per-partition operations acquire the map mutex briefly to clone the `Arc<RwLock<...>>`,
+/// then operate on the partition's own lock — no global serialization of hot paths.
+type PartitionLockMap = std::sync::Mutex<HashMap<(String, i32), Arc<RwLock<PartitionState>>>>;
+
+/// Offsets store extracted to its own lock — `FileOffsets` is `Send + Sync`, so we wrap in `Arc<RwLock>`.
+/// This decouples consumer-group offsets from partition locks (F4 fix).
+type OffsetsStore = Arc<RwLock<datarail_offsets::FileOffsets>>;
+
 /// The **durable, sealed** store behind `datarail kafka-broker` (the consume side, `KAFKA-FETCH-DESIGN.md`
 /// increment 2). Produce seals each record into a cofre and appends its wire bytes to a per-`(topic, partition)`
 /// durable log (logical offset = contiguous record index, `fsync`-before-ack); Fetch un-seals at the edge. The log
 /// holds only ciphertext on disk → provider-blind even against a disk snapshot, and records survive a restart.
-/// Everything is behind one `Mutex` so the type is `Send + Sync` for the connection-threaded `serve_broker`.
+/// Per-partition `RwLock` eliminates the global throughput serializer; read-heavy paths run in parallel.
 struct KafkaBrokerStore {
-    inner: std::sync::Mutex<BrokerInner>,
-}
-
-struct BrokerInner {
-    src: SourceTerminal,
+    /// Source terminal wrapped in `RwLock` for interior mutability (`reserve_seqs` takes `&mut self`).
+    src: RwLock<SourceTerminal>,
     dst: DestTerminal,
     /// The onboarding content contract, kept for BUFFER-time enforcement on the transactional path: a violating
     /// record must fail its own `ProduceResponse` as non-retriable `INVALID_RECORD` (Kafka semantics), never surface
     /// at `EndTxn` — where the only honest answer is a retriable code and the client would retry forever.
     onboarding: datarail_terminal::ContentContract,
-    /// One durable sealed log per `(topic, partition)`, opened/recovered lazily on first access from `data_dir`.
-    logs: std::collections::HashMap<(String, i32), kafka_store::SealedPartitionLog>,
+    /// Per-partition state map — each partition has its own `RwLock` for parallel access.
+    partitions: PartitionLockMap,
     /// Root directory holding each partition's durable log (one subdir per `(topic, partition)`).
     data_dir: PathBuf,
     /// Durable consumer-group committed offsets (`OffsetCommit`/`OffsetFetch`), opened lazily under `data_dir`.
-    offsets: Option<datarail_offsets::FileOffsets>,
-    /// In-flight TRANSACTIONAL record buffers, keyed by `(producer_id, epoch, topic, partition)` — held until
-    /// `EndTxn` (`KAFKA-TXN-DESIGN.md`): on commit ONLY the matching epoch flushes to the durable log (then
-    /// visible), on abort they're dropped. The epoch in the key means a stale-epoch record that slipped in via the
-    /// `produce_check`/`buffer_txn` race can never be flushed by a newer incarnation's commit (audit TOCTOU).
-    /// In-memory only → a crash mid-txn drops them = an abort (the correct outcome; Q3 abort-on-restart).
-    txn_buffers: std::collections::HashMap<(i64, i16, String, i32), Vec<Vec<u8>>>,
+    /// Own lock — decoupled from partition locks (F4 fix).
+    offsets: OffsetsStore,
+}
+
+impl KafkaBrokerStore {
+    /// Get or create the `RwLock<PartitionState>` for a `(topic, partition)`.
+    /// Acquires map mutex only briefly to clone the `Arc`; then releases it.
+    fn partition_lock(&self, topic: &str, partition: i32) -> Arc<RwLock<PartitionState>> {
+        let key = (topic.to_owned(), partition);
+        // Fast path: check if already exists (read lock on map)
+        {
+            let map = self.partitions.lock().unwrap();
+            if let Some(lock) = map.get(&key) {
+                return Arc::clone(lock);
+            }
+        }
+        // Slow path: create new partition state (write lock on map)
+        let mut map = self.partitions.lock().unwrap();
+        // Double-check after acquiring write lock
+        if let Some(lock) = map.get(&key) {
+            return Arc::clone(lock);
+        }
+        let dir = partition_dir(&self.data_dir, topic, partition);
+        let log = kafka_store::SealedPartitionLog::open(dir).expect("partition log open");
+        let state = PartitionState {
+            log,
+            txn_buffers: HashMap::new(),
+        };
+        let lock = Arc::new(RwLock::new(state));
+        map.insert(key, Arc::clone(&lock));
+        lock
+    }
+
+    /// Execute a read operation on a partition's state.
+    fn with_read_partition<R>(&self, topic: &str, partition: i32, f: impl FnOnce(&PartitionState) -> R) -> R {
+        let lock = self.partition_lock(topic, partition);
+        let guard = lock.read().unwrap();
+        f(&guard)
+    }
+
+    /// Execute a write operation on a partition's state.
+    fn with_write_partition<R>(&self, topic: &str, partition: i32, f: impl FnOnce(&mut PartitionState) -> R) -> R {
+        let lock = self.partition_lock(topic, partition);
+        let mut guard = lock.write().unwrap();
+        f(&mut guard)
+    }
+
+    /// Execute a write operation on multiple partitions with deterministic lock ordering (deadlock-free).
+    fn with_write_partitions<R>(
+        &self,
+        partitions: &[(String, i32)],
+        f: impl FnOnce(&mut [(&str, i32, RwLockWriteGuard<'_, PartitionState>)]) -> R,
+    ) -> R {
+        // Deterministic lock ordering: sort by (topic, partition)
+        let mut sorted: Vec<_> = partitions.to_vec();
+        sorted.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+
+        // Acquire all locks upfront in deterministic order
+        let locks: Vec<_> = sorted
+            .iter()
+            .map(|(topic, partition)| (topic.clone(), *partition, self.partition_lock(topic, *partition)))
+            .collect();
+
+        let mut guards: Vec<_> = locks
+            .iter()
+            .map(|(topic, partition, lock)| (topic.as_str(), *partition, lock.write().unwrap()))
+            .collect();
+
+        f(&mut guards[..])
+    }
 }
 
 /// The injective durable-store key for a consumer group's committed offset on a `(topic, partition)`. Length-
@@ -1072,57 +1155,6 @@ fn partition_dir(data_dir: &Path, topic: &str, partition: i32) -> PathBuf {
     name.push('-');
     name.push_str(&partition.to_string());
     data_dir.join(name)
-}
-
-impl BrokerInner {
-    /// Get (opening/recovering lazily) the durable log for a `(topic, partition)`.
-    ///
-    /// # Errors
-    /// [`std::io::Error`] if the partition log cannot be opened or recovered.
-    fn partition_log(&mut self, topic: &str, partition: i32) -> std::io::Result<&mut kafka_store::SealedPartitionLog> {
-        let key = (topic.to_owned(), partition);
-        if !self.logs.contains_key(&key) {
-            let dir = partition_dir(&self.data_dir, topic, partition);
-            let log = kafka_store::SealedPartitionLog::open(dir)?;
-            self.logs.insert(key.clone(), log);
-        }
-        self.logs.get_mut(&key).ok_or_else(|| std::io::Error::other("partition log vanished after insert"))
-    }
-
-    /// Get (opening/recovering lazily) the durable consumer-offset store under `data_dir/consumer-offsets`.
-    ///
-    /// # Errors
-    /// [`std::io::Error`] if the offset store cannot be opened or recovered.
-    fn offset_store(&mut self) -> std::io::Result<&mut datarail_offsets::FileOffsets> {
-        if self.offsets.is_none() {
-            self.offsets = Some(datarail_offsets::FileOffsets::open(self.data_dir.join("consumer-offsets"))?);
-        }
-        self.offsets.as_mut().ok_or_else(|| std::io::Error::other("offset store vanished after open"))
-    }
-
-    /// Seal each record into a cofre and durably append it to `(topic, partition)`'s log; return the base offset.
-    /// The non-locking core shared by `produce` and the transactional `commit_txn` flush (both already hold the
-    /// `Mutex`, so this must NOT re-lock).
-    ///
-    /// # Errors
-    /// [`std::io::Error`] on a seal or store failure.
-    fn produce_into(&mut self, topic: &str, partition: i32, records: &[Vec<u8>]) -> std::io::Result<i64> {
-        let base = self.partition_log(topic, partition)?.len();
-        // Contract check up front, serially (it is cheap): a CONTRACT VIOLATION is a PERMANENT rejection
-        // (the record can never board — AC-9) and must reach the wire as non-retriable INVALID_RECORD (87).
-        if !records.iter().all(|r| self.onboarding.validate(r)) {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "record violates the onboarding content contract (never boards)",
-            ));
-        }
-        // Reserve the whole batch's seq range up front (we hold the broker Mutex), then seal WITHOUT mutating
-        // the terminal — which is what lets the seal fan out across cores (2026-07-01 bench: the per-record
-        // seal inside this lock was the broker's throughput ceiling, with NEGATIVE multi-producer scaling).
-        let start_seq = self.src.reserve_seqs(u64::try_from(records.len()).unwrap_or(u64::MAX));
-        let sealed = seal_batch(&self.src, topic, partition, base, start_seq, records)?;
-        self.partition_log(topic, partition)?.append_durable(&sealed)
-    }
 }
 
 /// Seal a produce batch into encoded cofres — in parallel across cores when the batch is large enough.
@@ -1206,24 +1238,49 @@ impl KafkaBrokerStore {
             spec.keys.dest_seed,
             spec.keys.dest_x25519_secret,
         );
+        let offsets = Arc::new(RwLock::new(
+            datarail_offsets::FileOffsets::open(data_dir.join("consumer-offsets")).expect("offsets open")
+        ));
         Self {
-            inner: std::sync::Mutex::new(BrokerInner {
-                src,
-                dst,
-                onboarding,
-                logs: std::collections::HashMap::new(),
-                data_dir,
-                offsets: None,
-                txn_buffers: std::collections::HashMap::new(),
-            }),
+            src: RwLock::new(src),
+            dst,
+            onboarding,
+            partitions: std::sync::Mutex::new(HashMap::new()),
+            data_dir,
+            offsets,
         }
+    }
+
+    /// Seal each record into a cofre and durably append it to `(topic, partition)`'s log; return the base offset.
+    /// Takes the partition's write lock.
+    fn produce_into(&self, topic: &str, partition: i32, records: &[Vec<u8>]) -> std::io::Result<i64> {
+        self.with_write_partition(topic, partition, |state| self.produce_into_with_guard(state, topic, partition, records))
+    }
+
+    fn produce_into_with_guard(
+        &self,
+        state: &mut PartitionState,
+        topic: &str,
+        partition: i32,
+        records: &[Vec<u8>],
+    ) -> std::io::Result<i64> {
+        let base = state.log.len();
+        if !records.iter().all(|r| self.onboarding.validate(r)) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "record violates the onboarding content contract (never boards)",
+            ));
+        }
+        let partition_id = u64::try_from(partition).expect("partition index must be non-negative");
+        let start_seq = self.src.write().unwrap().reserve_seqs(partition_id, u64::try_from(records.len()).unwrap_or(u64::MAX));
+        let sealed = seal_batch(&self.src.read().unwrap(), topic, partition, base, start_seq, records)?;
+        state.log.append_durable(&sealed)
     }
 }
 
 impl datarail_kafka::serve::KafkaBroker for KafkaBrokerStore {
     fn produce(&self, topic: &str, partition: i32, records: &[Vec<u8>]) -> std::io::Result<i64> {
-        let mut g = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        g.produce_into(topic, partition, records)
+        self.produce_into(topic, partition, records)
     }
 
     fn buffer_txn(
@@ -1234,115 +1291,95 @@ impl datarail_kafka::serve::KafkaBroker for KafkaBrokerStore {
         partition: i32,
         records: &[Vec<u8>],
     ) -> std::io::Result<i64> {
-        let mut g = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        let inner = &mut *g;
-        // Enforce the content contract at BUFFER time: a violating record is a PERMANENT rejection and must fail
-        // its own ProduceResponse as non-retriable INVALID_RECORD (87) — Kafka semantics. Deferring the check to
-        // the `EndTxn` flush (where `board` would catch it) would surface it as a retriable 56 on EndTxn and the
-        // client would retry the commit forever — the same loop the 2026-07-01 fix closed on the plain path.
-        if !records.iter().all(|r| inner.onboarding.validate(r)) {
+        if !records.iter().all(|r| self.onboarding.validate(r)) {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 "record violates the onboarding content contract (never boards)",
             ));
         }
-        // Provisional base = the durable log end + records already buffered for this (producer, epoch, topic,
-        // partition). Correct as long as this partition has a single concurrent producer during the txn.
-        let durable = inner.partition_log(topic, partition)?.len();
-        let key = (producer_id, epoch, topic.to_owned(), partition);
-        let buf = inner.txn_buffers.entry(key).or_default();
-        let base = i64::try_from(durable + buf.len()).unwrap_or(i64::MAX);
-        buf.extend(records.iter().cloned());
-        Ok(base)
+        self.with_write_partition(topic, partition, |partition| {
+            let durable = partition.log.len();
+            let key = (producer_id, epoch);
+            let buf = partition.txn_buffers.entry(key).or_default();
+            let base = i64::try_from(durable + buf.len()).unwrap_or(i64::MAX);
+            buf.extend(records.iter().cloned());
+            Ok(base)
+        })
     }
 
-    fn commit_txn(&self, producer_id: i64, epoch: i16, _partitions: &[(String, i32)]) -> std::io::Result<()> {
-        let mut g = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        let inner = &mut *g;
-        // Flush ONLY this exact (producer_id, epoch)'s buffers to the durable log; DROP any older-epoch buffers for
-        // the same producer (a stale straggler from the produce_check/buffer_txn re-init race → never committed,
-        // audit TOCTOU). Flush BEFORE removing (records cloned out, releasing the borrow for `produce_into`): on an
-        // append error the buffer stays so an EndTxn RETRY re-flushes it — committed records are never lost.
-        let keys: Vec<(i64, i16, String, i32)> =
-            inner.txn_buffers.keys().filter(|(pid, _, _, _)| *pid == producer_id).cloned().collect();
-        for key in keys {
-            if key.1 == epoch {
-                if let Some(records) = inner.txn_buffers.get(&key).cloned() {
-                    inner.produce_into(&key.2, key.3, &records)?; // on error: buffer kept, retry recovers it
-                    inner.txn_buffers.remove(&key);
+    fn commit_txn(&self, producer_id: i64, epoch: i16, partitions: &[(String, i32)]) -> std::io::Result<()> {
+        self.with_write_partitions(partitions, |guards| -> std::io::Result<()> {
+            for (topic, partition, guard) in guards {
+                let key = (producer_id, epoch);
+                let records = guard.txn_buffers.entry(key).or_default();
+                let records = std::mem::take(records);
+                if !records.is_empty() {
+                    self.produce_into_with_guard(guard, topic, *partition, &records)?;
                 }
-            } else if key.1 < epoch {
-                inner.txn_buffers.remove(&key); // stale older-epoch straggler → drop, never commit
+                guard.txn_buffers.retain(|(pid, e), _| !(*pid == producer_id && *e < epoch));
             }
-        }
-        Ok(())
+            Ok(())
+        })
     }
 
     fn abort_txn(&self, producer_id: i64, epoch: i16, _partitions: &[(String, i32)]) {
-        let mut g = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        // Drop this producer's buffers at this epoch AND any older epoch (a re-init aborts the prior incarnation
-        // too) — they never become durable / visible.
-        g.txn_buffers.retain(|(pid, e, _, _), _| !(*pid == producer_id && *e <= epoch));
+        let map = self.partitions.lock().unwrap();
+        for lock in map.values() {
+            let mut guard = lock.write().unwrap();
+            guard.txn_buffers.retain(|(pid, e), _| !(*pid == producer_id && *e <= epoch));
+        }
     }
 
-    fn fetch(&self, topic: &str, partition: i32, offset: i64, max_bytes: i32) -> std::io::Result<Vec<Vec<u8>>> {
-        let mut g = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        let inner = &mut *g;
-        let start = usize::try_from(offset).unwrap_or(usize::MAX);
-        let sealed = inner.partition_log(topic, partition)?.read_sealed_from(start, i64::from(max_bytes))?;
-        // Un-seal at the edge (open is read-only → re-fetching the same offset is idempotent). A record we
-        // wrote always opens; an entry that does NOT open is store corruption and must be LOUD, never skipped:
-        // silently dropping it would renumber every subsequent record the consumer sees (audit finding). We
-        // halt the batch at the corruption point (offsets of the returned prefix stay correct) and, when the
-        // very first requested record is unreadable, fail the fetch as `InvalidData` → CORRUPT_MESSAGE (2).
-        let mut out = Vec::new();
-        for (i, bytes) in sealed.iter().enumerate() {
-            let opened = datarail_cofre::decode(bytes).ok().and_then(|cofre| inner.dst.open(&cofre));
-            if let Some(records) = opened {
-                out.extend(records);
-            } else {
-                let bad = offset.saturating_add(i64::try_from(i).unwrap_or(i64::MAX));
-                eprintln!(
-                    "kafka: fetch hit an unreadable sealed record topic={topic} partition={partition} \
-                     offset={bad} — halting the batch at the corruption point (offsets never renumber)"
-                );
-                if i == 0 {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        format!("unreadable sealed record at offset {bad} (store corruption)"),
-                    ));
+fn fetch(&self, topic: &str, partition: i32, offset: i64, max_bytes: i32) -> std::io::Result<Vec<Vec<u8>>> {
+        let t = topic.to_owned();
+        let p = partition;
+        self.with_read_partition(topic, partition, move |partition| {
+            let start = usize::try_from(offset).unwrap_or(usize::MAX);
+            let sealed = partition.log.read_sealed_from(start, i64::from(max_bytes))?;
+            eprintln!("DEBUG fetch: offset={}, sealed.len()={}", offset, sealed.len());
+            let mut out = Vec::new();
+            for (i, bytes) in sealed.iter().enumerate() {
+                let opened = datarail_cofre::decode(bytes).ok().and_then(|cofre| self.dst.open(&cofre));
+                if let Some(records) = opened {
+                    out.extend(records);
+                } else {
+                    let bad = offset.saturating_add(i64::try_from(i).unwrap_or(i64::MAX));
+                    eprintln!(
+                        "kafka: fetch hit an unreadable sealed record topic={t} partition={p} \
+                         offset={bad} — halting the batch at the corruption point (offsets never renumber)",
+                    );
+                    if i == 0 {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            format!("unreadable sealed record at offset {bad} (store corruption)"),
+                        ));
+                    }
                 }
-                break;
             }
-        }
-        Ok(out)
+            Ok(out)
+        })
     }
 
     fn bounds(&self, topic: &str, partition: i32) -> (i64, i64) {
-        let mut g = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        let inner = &mut *g;
-        let len = inner.partition_log(topic, partition).map_or(0, |l| l.len());
-        (0, i64::try_from(len).unwrap_or(i64::MAX))
+        self.with_read_partition(topic, partition, |partition| {
+            let len = partition.log.len();
+            (0, i64::try_from(len).unwrap_or(i64::MAX))
+        })
     }
 
     fn commit_offset(&self, group: &str, topic: &str, partition: i32, offset: i64) -> std::io::Result<()> {
         use datarail_offsets::OffsetStore as _;
-        let mut g = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let key = offset_key(group, topic, partition);
-        // Kafka committed offsets are >= 0; a negative offset (shouldn't happen) clamps to 0.
         let value = u64::try_from(offset).unwrap_or(0);
-        g.offset_store()?.commit(&key, value) // fsync-durable before the OffsetCommit is acked
+        self.offsets.write().unwrap().commit(&key, value)
     }
 
     fn fetch_offset(&self, group: &str, topic: &str, partition: i32) -> std::io::Result<Option<i64>> {
         use datarail_offsets::OffsetStore as _;
-        let mut g = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let key = offset_key(group, topic, partition);
-        Ok(g.offset_store()?.fetch(&key).map(|o| i64::try_from(o).unwrap_or(i64::MAX)))
+        Ok(self.offsets.read().unwrap().fetch(&key).map(|o| i64::try_from(o).unwrap_or(i64::MAX)))
     }
 }
-
-/// `kafka-broker <rail.toml> [--listen ADDR] [--advertised HOST] [--data-dir DIR] [--partitions N]` — the BIDIRECTIONAL Kafka drop-in: an unmodified
 /// Kafka producer writes, an unmodified Kafka consumer reads back, and datarail's storage holds only sealed cofres
 /// (provider-blind; un-sealed only at the Fetch edge). Blocks as a daemon until killed. See `KAFKA-FETCH-DESIGN.md`.
 fn cmd_kafka_broker(rest: &[String]) -> Result<String, CliError> {
@@ -2092,8 +2129,9 @@ mod tests {
         store.produce("events", 0, &[b"evt:first".to_vec()]).unwrap();
         {
             // Inject a VALID log frame whose payload is NOT a decodable cofre (store-level corruption).
-            let mut g = store.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            g.partition_log("events", 0).unwrap().append_durable(&[b"not-a-cofre".to_vec()]).unwrap();
+            store.with_write_partition("events", 0, |state| {
+                state.log.append_durable(&[b"not-a-cofre".to_vec()]).unwrap();
+            });
         }
         store.produce("events", 0, &[b"evt:third".to_vec()]).unwrap();
         // The prefix before the corruption returns with correct offsets; nothing is renumbered.

@@ -32,6 +32,7 @@ use datarail_core::{AeadAlg, Cofre, Disposition, Etiqueta};
 use datarail_cofre::CofreError;
 use datarail_crypto::{aead_open, aead_seal, blake3_256, hmac_blake3, open_key, seal_key, AeadError};
 use datarail_once::Once;
+use std::collections::HashMap;
 use zeroize::Zeroize as _;
 
 /// Build the AEAD associated data: every **seal-time-final** etiqueta field — all of them *except* `cofre_id`
@@ -649,8 +650,10 @@ pub struct SourceTerminal {
     contract: ContentContract,
     /// Ed25519 source signing seed (the route's pinned identity).
     source_seed: [u8; 32],
-    /// Monotonic per-stream sequence counter.
+    /// Monotonic per-stream sequence counter (legacy, used by `board`/`next_seq`).
     seq: u64,
+    /// Per-partition sequence counters for parallel sealing ([`reserve_seqs`] with `partition_id`).
+    seq_per_partition: HashMap<u64, u64>,
     /// Optional sealed-sender credential (SPEC-02 A4). When set, `board` rides an issuer-signed `SENDER_CERT`
     /// **inside** the encrypted carga and sets `sender_present`; when `None`, cofres carry no sender identity.
     sender: Option<SenderCredential>,
@@ -671,6 +674,7 @@ impl core::fmt::Debug for SourceTerminal {
             .field("contract", &self.contract)
             .field("source_seed", &"<redacted>")
             .field("seq", &self.seq)
+            .field("seq_per_partition", &self.seq_per_partition)
             .field("sender", &self.sender)
             .finish()
     }
@@ -685,6 +689,7 @@ impl SourceTerminal {
             contract,
             source_seed,
             seq: 0,
+            seq_per_partition: HashMap::new(),
             sender: None,
         }
     }
@@ -721,15 +726,24 @@ impl SourceTerminal {
         Ok(cofre)
     }
 
-    /// Reserve `n` consecutive sequence numbers and return the first — for callers that seal a batch of
-    /// cofres **in parallel** with explicit per-cofre seqs ([`board_at`](Self::board_at)). The reservation is
-    /// what keeps parallel sealing seq-unique: the counter is bumped once, up front, under whatever lock the
-    /// caller already holds, and each worker stamps `start + i` (order-preserving, no duplicates). Saturates
-    /// at `u64::MAX` rather than wrapping.
+    /// Reserve `n` consecutive sequence numbers for a given `partition_id` and return the first — for
+    /// callers that seal a batch of cofres **in parallel** with explicit per-cofre seqs
+    /// ([`board_at`](Self::board_at)). The reservation is what keeps parallel sealing seq-unique:
+    /// the counter is bumped once, up front, under whatever lock the caller already holds, and
+    /// each worker stamps `start + i` (order-preserving, no duplicates). Saturates at `u64::MAX`
+    /// rather than wrapping.
+    ///
+    /// Each partition has its own independent sequence space, so sequences from different
+    /// partitions never collide.
+    ///
+    /// # Panics
+    /// Never panics. The `entry(...).or_insert(0)` ensures the key exists, and the subsequent
+    /// `get_mut` is guaranteed to succeed.
     #[must_use]
-    pub fn reserve_seqs(&mut self, n: u64) -> u64 {
-        let start = self.seq;
-        self.seq = self.seq.saturating_add(n);
+    pub fn reserve_seqs(&mut self, partition_id: u64, n: u64) -> u64 {
+        let start = *self.seq_per_partition.entry(partition_id).or_insert(0);
+        let entry = self.seq_per_partition.get_mut(&partition_id).unwrap();
+        *entry = entry.saturating_add(n);
         start
     }
 

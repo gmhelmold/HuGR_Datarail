@@ -185,6 +185,8 @@ impl ReplayLog {
     pub fn sync(&mut self) -> Result<(), ReplayError> {
         self.active.flush()?;
         self.active.sync_all()?;
+        // Persist the directory entry so new file handles see the latest data.
+        fsync_dir(&self.dir)?;
         Ok(())
     }
 
@@ -225,7 +227,6 @@ impl ReplayLog {
             return Err(ReplayError::BadOffset(start_offset));
         }
         let starts = segment_starts(&self.dir)?;
-        // The segment containing start_offset = the greatest segment-start ≤ start_offset.
         let seg_idx = starts.partition_point(|&s| s <= start_offset).saturating_sub(1);
         Replay::open(self.dir.clone(), starts, seg_idx, start_offset, self.write_offset)
     }
@@ -304,7 +305,8 @@ impl Replay {
             return Ok(());
         };
         let mut f = File::open(self.dir.join(seg_name(seg)))?;
-        f.seek(SeekFrom::Start(at_offset - seg))?;
+        let seek_pos = at_offset.saturating_sub(seg);
+        f.seek(SeekFrom::Start(seek_pos))?;
         self.file = Some(f);
         self.buf.clear();
         self.cursor = 0;
