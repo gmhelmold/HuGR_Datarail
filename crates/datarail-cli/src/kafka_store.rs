@@ -26,7 +26,7 @@
 //! storage-integrity failure outside the crash-consistency model; hardening it (per-record durable logical ids /
 //! an integrity checkpoint that fails loud instead of renumbering) is tracked future work, not claimed here.
 
-use std::io::{self, Write};
+use std::io;
 use std::path::Path;
 
 use datarail_replaylog::ReplayLog;
