@@ -198,6 +198,11 @@ impl DurableLog {
 
     /// Frame and buffer a cofre; flush+fsync if the byte or time threshold is hit. Buffer is reused (no growth).
     fn append(&mut self, cofre: &Cofre) -> Result<(), WalError> {
+        if self.poisoned {
+            return Err(
+                std::io::Error::other("wal is poisoned after a prior write failure").into(),
+            );
+        }
         let bytes = datarail_cofre::encode(cofre);
         if bytes.len() > MAX_COFRE_WIRE_LEN {
             return Err(WalError::Codec("cofre exceeds MAX_COFRE_WIRE_LEN".into()));
@@ -644,6 +649,10 @@ mod tests {
         FAIL_SEGMENT_SYNC.with(|failed| failed.set(true));
         assert!(log.flush().is_err());
         FAIL_SEGMENT_SYNC.with(|failed| failed.set(false));
+        assert!(
+            log.send(&cofre_seq(1)).is_err(),
+            "poisoned log must reject new writes"
+        );
         assert!(
             log.flush().is_err(),
             "failed log must not retry an ambiguous buffer"

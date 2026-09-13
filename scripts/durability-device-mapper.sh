@@ -58,7 +58,7 @@ docker run --rm --privileged \
             if [ "$cleanup_failed" -ne 0 ] && [ "$cleanup_status" -eq 0 ]; then
                 cleanup_status=1
             fi
-            return "$cleanup_status"
+            exit "$cleanup_status"
         }
         trap cleanup EXIT
 
