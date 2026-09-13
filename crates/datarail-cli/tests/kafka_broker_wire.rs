@@ -6,14 +6,12 @@
 //! (increment 2 durability), the moat over an in-memory store.
 
 use std::io::{Read, Write};
-use std::net::TcpStream;
+use std::net::{TcpListener, TcpStream};
 use std::process::{Child, Command};
 use std::time::{Duration, Instant};
 
 use datarail_kafka::codec::{Reader, Writer};
 use datarail_kafka::produce::parse_record_batch;
-
-const PORT: u16 = 19_093;
 
 fn req_header(api_key: i16, api_version: i16, correlation_id: i32) -> Writer {
     let mut w = Writer::new();
@@ -190,25 +188,32 @@ impl Drop for Daemon {
     }
 }
 
-/// Spawn `datarail kafka-broker` on `PORT` over `data_dir`, and return the daemon + a connected stream once it is
+/// Spawn `datarail kafka-broker` on `port` over `data_dir`, and return the daemon + a connected stream once it is
 /// listening. (Killing the returned `Daemon` and calling this again with the same `data_dir` simulates a restart.)
-fn spawn_broker(rail: &std::path::Path, data_dir: &std::path::Path) -> (Daemon, TcpStream) {
+fn spawn_broker(
+    rail: &std::path::Path,
+    data_dir: &std::path::Path,
+    port: u16,
+) -> (Daemon, TcpStream) {
     let child = Command::new(env!("CARGO_BIN_EXE_datarail"))
         .args([
             "kafka-broker",
             rail.to_str().unwrap(),
             "--listen",
-            &format!("127.0.0.1:{PORT}"),
+            &format!("127.0.0.1:{port}"),
             "--data-dir",
             data_dir.to_str().unwrap(),
         ])
         .spawn()
         .expect("spawn datarail kafka-broker");
-    let daemon = Daemon(child);
+    let mut daemon = Daemon(child);
     let deadline = Instant::now() + Duration::from_secs(10);
     let stream = loop {
-        if let Ok(s) = TcpStream::connect(("127.0.0.1", PORT)) {
+        if let Ok(s) = TcpStream::connect(("127.0.0.1", port)) {
             break s;
+        }
+        if let Ok(Some(status)) = daemon.0.try_wait() {
+            panic!("kafka-broker exited before listening: {status}");
         }
         assert!(
             Instant::now() < deadline,
@@ -243,10 +248,16 @@ fn produce_then_fetch_round_trips_and_survives_a_broker_restart() {
     .expect("write rail.toml");
     let data_dir = std::env::temp_dir().join(format!("kafka-broker-data-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&data_dir);
+    let reservation = TcpListener::bind(("127.0.0.1", 0)).expect("reserve a loopback port");
+    let port = reservation
+        .local_addr()
+        .expect("read reserved loopback port")
+        .port();
+    drop(reservation);
 
     // ---- PHASE 1: produce + fetch through a live broker ----
     {
-        let (_daemon, mut stream) = spawn_broker(&rail, &data_dir);
+        let (_daemon, mut stream) = spawn_broker(&rail, &data_dir, port);
 
         // PRODUCE 3 records (sealed + durably stored by the broker).
         stream
@@ -296,14 +307,14 @@ fn produce_then_fetch_round_trips_and_survives_a_broker_restart() {
         "on-disk bytes are sealed ciphertext, never plaintext (provider-blind across restart)"
     );
 
-    exercise_idempotent_restart(&rail, &data_dir);
+    exercise_idempotent_restart(&rail, &data_dir, port);
 
     let _ = std::fs::remove_file(&rail);
     let _ = std::fs::remove_dir_all(&data_dir);
 }
 
-fn exercise_idempotent_restart(rail: &std::path::Path, data_dir: &std::path::Path) {
-    let (_daemon, mut stream) = spawn_broker(rail, data_dir);
+fn exercise_idempotent_restart(rail: &std::path::Path, data_dir: &std::path::Path, port: u16) {
+    let (_daemon, mut stream) = spawn_broker(rail, data_dir, port);
     stream
         .write_all(&idempotent_produce_req(
             5,
