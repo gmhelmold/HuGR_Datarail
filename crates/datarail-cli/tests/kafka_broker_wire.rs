@@ -296,61 +296,50 @@ fn produce_then_fetch_round_trips_and_survives_a_broker_restart() {
         "on-disk bytes are sealed ciphertext, never plaintext (provider-blind across restart)"
     );
 
-    // ---- PHASE 2: restart the broker on the SAME data dir → every acked record is recovered ----
-    {
-        let (_daemon, mut stream) = spawn_broker(&rail, &data_dir);
-
-        stream
-            .write_all(&idempotent_produce_req(
-                5,
-                "events",
-                &[b"evt:m0", b"evt:m1", b"evt:m2"],
-                41,
-                2,
-                0,
-            ))
-            .unwrap();
-        let (base, error) = produce_ack(&read_frame(&mut stream));
-        assert_eq!(error, 0, "retry of committed sequence must ack cleanly");
-        assert_eq!(base, 0, "retry must return original stable base offset");
-
-        stream
-            .write_all(&idempotent_produce_req(6, "events", &[b"evt:m3"], 41, 2, 3))
-            .unwrap();
-        let (base, error) = produce_ack(&read_frame(&mut stream));
-        assert_eq!(error, 0);
-        assert_eq!(base, 3, "new sequence appends at stable next offset");
-
-        stream.write_all(&list_offsets_req(7, "events")).unwrap();
-        let resp = read_frame(&mut stream);
-        assert_eq!(
-            list_offset_latest(&resp),
-            4,
-            "retry is deduplicated; new sequence extends log"
-        );
-
-        stream.write_all(&fetch_req(8, "events", 0)).unwrap();
-        let resp = read_frame(&mut stream);
-        assert_eq!(
-            fetch_values(&resp),
-            vec![
-                b"evt:m0".to_vec(),
-                b"evt:m1".to_vec(),
-                b"evt:m2".to_vec(),
-                b"evt:m3".to_vec(),
-            ],
-            "the retry does not duplicate records"
-        );
-        // Fetch from offset 3 independently confirms the new sequence's stable offset.
-        stream.write_all(&fetch_req(9, "events", 3)).unwrap();
-        assert_eq!(
-            fetch_values(&read_frame(&mut stream)),
-            vec![b"evt:m3".to_vec()]
-        );
-    }
+    exercise_idempotent_restart(&rail, &data_dir);
 
     let _ = std::fs::remove_file(&rail);
     let _ = std::fs::remove_dir_all(&data_dir);
+}
+
+fn exercise_idempotent_restart(rail: &std::path::Path, data_dir: &std::path::Path) {
+    let (_daemon, mut stream) = spawn_broker(rail, data_dir);
+    stream
+        .write_all(&idempotent_produce_req(
+            5,
+            "events",
+            &[b"evt:m0", b"evt:m1", b"evt:m2"],
+            41,
+            2,
+            0,
+        ))
+        .unwrap();
+    let (base, error) = produce_ack(&read_frame(&mut stream));
+    assert_eq!(error, 0, "retry of committed sequence must ack cleanly");
+    assert_eq!(base, 0, "retry must return original stable base offset");
+    stream
+        .write_all(&idempotent_produce_req(6, "events", &[b"evt:m3"], 41, 2, 3))
+        .unwrap();
+    let (base, error) = produce_ack(&read_frame(&mut stream));
+    assert_eq!(error, 0);
+    assert_eq!(base, 3, "new sequence appends at stable next offset");
+    stream.write_all(&list_offsets_req(7, "events")).unwrap();
+    assert_eq!(list_offset_latest(&read_frame(&mut stream)), 4);
+    stream.write_all(&fetch_req(8, "events", 0)).unwrap();
+    assert_eq!(
+        fetch_values(&read_frame(&mut stream)),
+        vec![
+            b"evt:m0".to_vec(),
+            b"evt:m1".to_vec(),
+            b"evt:m2".to_vec(),
+            b"evt:m3".to_vec(),
+        ]
+    );
+    stream.write_all(&fetch_req(9, "events", 3)).unwrap();
+    assert_eq!(
+        fetch_values(&read_frame(&mut stream)),
+        vec![b"evt:m3".to_vec()]
+    );
 }
 
 /// Recursively read+concatenate every file under `dir` (for the on-disk provider-blind check).

@@ -13,9 +13,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Restart tests for committed records/offsets and unresolved intent rollback
 - Deterministic in-process fault-point test covers main boundaries; process-level restart proof remains open
 
+### Added — Backlog Wave 02
+- `ReplayLog::replay_from` now drops stale cross-segment framing after corruption; later segments remain seekable
+- Broker idempotent-producer sequence dedup persists across restart with bounded CRC metadata
+- `[keys]` supports fail-closed `env:` and `file:` references; KMS remains unsupported
+- QUIC production connect verifies configured CA and hostname; insecure identity is explicit dev/test only
+- `datarail-manifest` exposes standalone receipt verification for external consumers
+- Real-client compatibility matrix harness records version and refuses unknown/unavailable results
+
 ### Fixed — ReplayLog Corruption Handling
-- **`read_sealed_from` now bypasses buggy `ReplayLog::replay_from` seek mechanism** — reads directly from segment files with manual seek + CRC-32C validation
-- Corrupt frames (oversize length or CRC mismatch) now halt replay cleanly, matching `ReplayLog` semantics
+- **`ReplayLog::replay_from` now resets framing when advancing across segments** — later intact segments remain seekable after prior corruption
+- `read_sealed_from` retains direct segment reads as a defensive path with manual seek + CRC-32C validation
+- Corrupt frames (oversize length or CRC mismatch) halt replay cleanly, matching `ReplayLog` semantics
 - `fetch_halts_loud_at_a_corrupt_record_and_never_renumbers` test un-ignored and passing
 
 ### Added — Per-Partition Locking (WP-01 Phase 1 In Review)

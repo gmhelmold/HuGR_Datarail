@@ -75,14 +75,14 @@ This repo's whole credibility rests on claims matching reality. Before writing a
 
 1. **WP1 evidence/release decision** — implementation and local stress are done; independent A/B, p99/RSS, CI-scale
    evidence, and `v0.1.1` release gates remain.
-2. **ReplayLog seek + power-loss durability** — direct-read mitigation exists; fix internal seek semantics and add
-   fsync/rename fault injection beyond `kill9_crash.rs`.
-3. **Durable transaction protocol** — `EndTxn` remains non-crash-atomic across partitions; add intent/commit journal,
-   recovery, offset atomicity, and kill-during-commit proof.
-4. **Broker restart dedup + real Kafka clients** — wire restart dedup; test Java, franz-go, kafka-python, Sarama,
-   librdkafka 2.x, and real-client transactions.
-5. **Security/architecture** — key references, QUIC certificate verification, external crypto review, replication
-   decision, Merkle extraction, and real FASP transport; owner/external queue tracked in canonical backlog.
+2. **ReplayLog + power-loss durability** — core seek fix and persistent idempotent dedup landed; remove direct-read
+   workaround and add fsync/rename fault injection beyond `kill9_crash.rs`.
+3. **Durable transaction protocol** — journal/recovery/offset atomicity foundation landed; process-level kill-during-
+   commit and ambiguous-write proof remain open.
+4. **Real Kafka clients + key refs** — compatibility harness and env/file refs landed; run Java, franz-go, kafka-python,
+   Sarama, librdkafka 2.x, real-client transactions, and add KMS integration.
+5. **Security/architecture** — verified QUIC and standalone Merkle verifier landed; external crypto review, replication
+   decision, verifier CLI/typed boundary, real FASP transport, and owner/external queue remain.
 
 ## Owner-reserved files
 

@@ -622,7 +622,7 @@ mod s4_gates {
         }
         match err {
             Some(FaspError::Io(e)) => {
-                assert_eq!(e.kind(), std::io::ErrorKind::TimedOut, "wrong error kind")
+                assert_eq!(e.kind(), std::io::ErrorKind::TimedOut, "wrong error kind");
             }
             other => panic!("send did not time out; got {other:?}"),
         }

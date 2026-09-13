@@ -56,22 +56,14 @@ fn uc4_offline_backlog_drains_once_then_replay_is_all_duplicate() {
     // --- Phase 2: a FRESH destination drains the whole backlog in seq order, exactly once. ---
     {
         let mut dst_store = ObjectStoreSubstrate::open(&dir).expect("reopen as dest");
-        let mut drained = 0usize;
-        while drained < N {
-            let c = dst_store
-                .recv()
-                .expect("GET from backlog")
-                .expect("a backlogged object");
-            let disp = rig.dest.offload(&c).expect("offload");
-            tally.observe(disp);
-            assert_eq!(
-                disp,
-                Disposition::Delivered,
-                "every backlogged record delivers exactly once"
-            );
-            dst_store.ack(c.etiqueta.cofre_id).expect("ack + GC");
-            drained += 1;
-        }
+        drain_backlog(
+            &mut dst_store,
+            &mut rig,
+            &mut tally,
+            N,
+            Disposition::Delivered,
+            "backlog delivery",
+        );
         assert!(
             dst_store.recv().expect("drain").is_none(),
             "bucket fully drained + GC'd after the backlog"
@@ -102,22 +94,14 @@ fn uc4_offline_backlog_drains_once_then_replay_is_all_duplicate() {
     }
     {
         let mut dst_again = ObjectStoreSubstrate::open(&dir).expect("reopen dest for replay");
-        let mut replayed = 0usize;
-        while replayed < N {
-            let c = dst_again
-                .recv()
-                .expect("GET replay")
-                .expect("a replayed object");
-            let disp = rig.dest.offload(&c).expect("offload replay");
-            tally.observe(disp);
-            assert_eq!(
-                disp,
-                Disposition::Duplicate,
-                "a replayed already-committed record must dedup"
-            );
-            dst_again.ack(c.etiqueta.cofre_id).expect("ack + GC");
-            replayed += 1;
-        }
+        drain_backlog(
+            &mut dst_again,
+            &mut rig,
+            &mut tally,
+            N,
+            Disposition::Duplicate,
+            "replay dedup",
+        );
     }
 
     // 0-dup at the sink: the full replay committed nothing new.
@@ -144,4 +128,24 @@ fn uc4_offline_backlog_drains_once_then_replay_is_all_duplicate() {
         tally.report("uc4 store-and-forward")
     );
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+fn drain_backlog(
+    store: &mut ObjectStoreSubstrate,
+    rig: &mut Rig,
+    tally: &mut Tally,
+    count: usize,
+    expected: Disposition,
+    label: &str,
+) {
+    for _ in 0..count {
+        let cofre = store
+            .recv()
+            .expect("GET object")
+            .expect("backlogged object");
+        let disposition = rig.dest.offload(&cofre).expect("offload");
+        tally.observe(disposition);
+        assert_eq!(disposition, expected, "{label}");
+        store.ack(cofre.etiqueta.cofre_id).expect("ack + GC");
+    }
 }

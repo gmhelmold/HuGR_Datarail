@@ -347,7 +347,7 @@ async fn serve(cfg: Config) -> Result<(), ShimError> {
     let ingress_registry = Arc::clone(&registry);
     let ingress_cfg = cfg.clone();
     let ingress_task = tokio::spawn(async move {
-        accept_loop(ingress, ingress_registry, ingress_cfg, ConnKind::Ingress).await
+        accept_loop(ingress, ingress_registry, ingress_cfg, ConnKind::Ingress).await;
     });
     let egress_task =
         tokio::spawn(async move { accept_loop(egress, registry, cfg, ConnKind::Egress).await });

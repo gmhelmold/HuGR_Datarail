@@ -249,32 +249,7 @@ fn handle_request<B: IdempotentBroker>(
             correlation_id,
             &fetch_results(broker, &parse_fetch(reader, api_version)?),
         ),
-        API_LIST_OFFSETS => {
-            let topics = parse_list_offsets(reader, api_version)?;
-            let mut out = Vec::with_capacity(topics.len());
-            for topic in &topics {
-                let partitions = topic
-                    .partitions
-                    .iter()
-                    .map(|part| {
-                        let (earliest, latest) = broker.bounds(&topic.name, part.partition);
-                        ListOffsetResult {
-                            partition: part.partition,
-                            offset: if part.timestamp == -2 {
-                                earliest
-                            } else {
-                                latest
-                            },
-                        }
-                    })
-                    .collect();
-                out.push(ListOffsetTopicResult {
-                    name: topic.name.clone(),
-                    partitions,
-                });
-            }
-            list_offsets_response(api_version, correlation_id, &out)
-        }
+        API_LIST_OFFSETS => handle_list_offsets(reader, api_version, correlation_id, broker)?,
         API_FIND_COORDINATOR => {
             let _ = parse_find_coordinator(reader, api_version)?;
             find_coordinator_response(api_version, correlation_id, 0, context.host, context.port)
@@ -317,6 +292,37 @@ fn handle_request<B: IdempotentBroker>(
         }
     };
     Ok((response, suppress))
+}
+
+fn handle_list_offsets<B: KafkaBroker>(
+    reader: &mut Reader<'_>,
+    api_version: i16,
+    correlation_id: i32,
+    broker: &B,
+) -> io::Result<Vec<u8>> {
+    let topics = parse_list_offsets(reader, api_version)?;
+    let out = topics
+        .iter()
+        .map(|topic| ListOffsetTopicResult {
+            name: topic.name.clone(),
+            partitions: topic
+                .partitions
+                .iter()
+                .map(|part| {
+                    let (earliest, latest) = broker.bounds(&topic.name, part.partition);
+                    ListOffsetResult {
+                        partition: part.partition,
+                        offset: if part.timestamp == -2 {
+                            earliest
+                        } else {
+                            latest
+                        },
+                    }
+                })
+                .collect(),
+        })
+        .collect::<Vec<_>>();
+    Ok(list_offsets_response(api_version, correlation_id, &out))
 }
 
 enum SaslOutcome {

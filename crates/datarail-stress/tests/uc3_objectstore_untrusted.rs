@@ -67,7 +67,6 @@ fn uc3_untrusted_store_delivers_only_legit_rejects_every_injection() {
     let mut tally = Tally::new();
 
     // --- PUT the legit cofres through the real substrate (correct seq-keyed layout), remembering their ids. ---
-    let mut legit_ids = Vec::with_capacity(LEGIT);
     let mut legit_payloads = Vec::with_capacity(LEGIT);
     {
         let mut store = ObjectStoreSubstrate::open(&dir).expect("open bucket (source)");
@@ -78,7 +77,6 @@ fn uc3_untrusted_store_delivers_only_legit_rejects_every_injection() {
                 .source
                 .board(&[rec.as_slice()], &rk)
                 .expect("board legit");
-            legit_ids.push(cofre.etiqueta.cofre_id);
             legit_payloads.push(rec);
             store.send(&cofre).expect("PUT legit");
         }
@@ -123,22 +121,7 @@ fn uc3_untrusted_store_delivers_only_legit_rejects_every_injection() {
     write_oversized(&oversized_path);
     let oversized_files = 1usize;
 
-    // --- DRIVE delivery exactly as a hardened destination must over an UNTRUSTED store: enumerate objects,
-    //     apply the substrate's own guards (size cap + decode), then offload decodable cofres (verify gate). ---
-    let mut substrate_rejected = 0u64; // garbage/oversized/structurally-broken: rejected before becoming a Cofre.
-    for path in sorted_cofre_files(&dir) {
-        let meta = std::fs::metadata(&path).expect("stat object");
-        if meta.len() > MAX_COFRE_WIRE_LEN as u64 {
-            // AUDIT-03 F3 — the same bound the substrate's `recv` enforces; an oversized object is refused.
-            substrate_rejected += 1;
-            continue;
-        }
-        let raw = std::fs::read(&path).expect("read object");
-        match datarail_cofre::decode(&raw) {
-            Err(_) => substrate_rejected += 1, // garbage / structurally-broken: never becomes a Cofre.
-            Ok(cofre) => tally.observe(rig.dest.offload(&cofre).expect("offload")),
-        }
-    }
+    let substrate_rejected = deliver_untrusted_objects(&dir, &mut rig, &mut tally);
 
     // --- 0-loss / 0-dup / 0-leak assertions. ---
     let committed = rig.dest.sink().committed();
@@ -153,33 +136,12 @@ fn uc3_untrusted_store_delivers_only_legit_rejects_every_injection() {
         "legit records delivered exactly once, in seq order"
     );
 
-    // Every payload-tampered cofre that DID decode is a reason-coded dead-letter; none reached the sink.
     let dead = rig.dest.dead_letters();
     assert!(
         !dead.is_empty(),
         "payload-tampered cofres must be reason-coded onto the dead-letter siding"
     );
-    for entry in dead.entries() {
-        assert_ne!(entry.cofre.etiqueta.cofre_id, [0u8; 32]);
-        // It must be a seal failure (tamper), never an accidental delivery.
-        assert!(
-            matches!(
-                entry.reason,
-                datarail_terminal::DeadLetterReason::SealFailed(_)
-            ),
-            "tampered cofre dead-lettered for the wrong reason: {:?}",
-            entry.reason
-        );
-    }
-
-    // No forged/tampered payload ever appears in the sink (explicit anti-leak check).
-    for j in 0..tampered_files {
-        let leaked = conforming_record(1_000_000 + j);
-        assert!(
-            !committed.contains(&leaked),
-            "a tampered payload leaked into the sink (0-leak violation)"
-        );
-    }
+    assert_tampered_rejected(committed, dead, tampered_files);
 
     assert_eq!(
         tally.delivered, LEGIT as u64,
@@ -203,6 +165,40 @@ fn uc3_untrusted_store_delivers_only_legit_rejects_every_injection() {
         tally.report("uc3 untrusted-store")
     );
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+fn assert_tampered_rejected(
+    committed: &[Vec<u8>],
+    dead: &datarail_terminal::DeadLetterSiding,
+    tampered_files: usize,
+) {
+    for entry in dead.entries() {
+        assert_ne!(entry.cofre.etiqueta.cofre_id, [0u8; 32]);
+        assert!(matches!(
+            entry.reason,
+            datarail_terminal::DeadLetterReason::SealFailed(_)
+        ));
+    }
+    for j in 0..tampered_files {
+        let leaked = conforming_record(1_000_000 + j);
+        assert!(!committed.contains(&leaked), "tampered payload leaked");
+    }
+}
+
+fn deliver_untrusted_objects(dir: &Path, rig: &mut Rig, tally: &mut Tally) -> u64 {
+    let mut rejected = 0u64;
+    for path in sorted_cofre_files(dir) {
+        let meta = std::fs::metadata(&path).expect("stat object");
+        if meta.len() > MAX_COFRE_WIRE_LEN as u64 {
+            rejected += 1;
+            continue;
+        }
+        match datarail_cofre::decode(&std::fs::read(&path).expect("read object")) {
+            Err(_) => rejected += 1,
+            Ok(cofre) => tally.observe(rig.dest.offload(&cofre).expect("offload")),
+        }
+    }
+    rejected
 }
 
 /// The substrate's OWN defensive bounds (AUDIT-03 F3): drive `ObjectStoreSubstrate::recv` over a bucket holding

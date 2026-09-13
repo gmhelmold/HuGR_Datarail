@@ -992,7 +992,20 @@ impl Pipeline {
 /// `kafka-ingest <rail.toml> [--listen ADDR] [--advertised HOST] [--sink-postgres CONN | --sink-webhook URL | --sink-file F]`
 /// Run a Kafka wire-protocol endpoint: an UNMODIFIED Kafka producer sends records, datarail seals each through the
 /// rail and lands it via the sink (provider-blind, no producer code change). Blocks as a daemon until killed.
-fn cmd_kafka_ingest(rest: &[String]) -> Result<String, CliError> {
+struct KafkaIngestArgs {
+    spec: RailSpec,
+    listen: String,
+    advertised: String,
+    sink_pg: Option<String>,
+    sink_file: Option<String>,
+    sink_webhook: Option<String>,
+    at_least_once: bool,
+    tls: bool,
+    tls_cert: Option<String>,
+    tls_key: Option<String>,
+}
+
+fn parse_kafka_ingest_args(rest: &[String]) -> Result<KafkaIngestArgs, CliError> {
     let spec = load_spec(require(rest, 0, "rail.toml")?)?;
     let mut listen = "0.0.0.0:9092".to_owned();
     let mut advertised = "127.0.0.1".to_owned();
@@ -1049,6 +1062,33 @@ fn cmd_kafka_ingest(rest: &[String]) -> Result<String, CliError> {
             }
         }
     }
+    Ok(KafkaIngestArgs {
+        spec,
+        listen,
+        advertised,
+        sink_pg,
+        sink_file,
+        sink_webhook,
+        at_least_once,
+        tls,
+        tls_cert,
+        tls_key,
+    })
+}
+
+fn cmd_kafka_ingest(rest: &[String]) -> Result<String, CliError> {
+    let KafkaIngestArgs {
+        spec,
+        listen,
+        advertised,
+        sink_pg,
+        sink_file,
+        sink_webhook,
+        at_least_once,
+        tls,
+        tls_cert,
+        tls_key,
+    } = parse_kafka_ingest_args(rest)?;
     let port: i32 = listen
         .rsplit(':')
         .next()
@@ -2041,7 +2081,21 @@ impl datarail_kafka::serve::KafkaBroker for KafkaBrokerStore {
 
 /// Kafka producer writes, an unmodified Kafka consumer reads back, and datarail's storage holds only sealed cofres
 /// (provider-blind; un-sealed only at the Fetch edge). Blocks as a daemon until killed. See `KAFKA-FETCH-DESIGN.md`.
-fn cmd_kafka_broker(rest: &[String]) -> Result<String, CliError> {
+struct KafkaBrokerArgs {
+    spec: RailSpec,
+    listen: String,
+    advertised: String,
+    data_dir: PathBuf,
+    partitions: i32,
+    tls: bool,
+    tls_cert: Option<String>,
+    tls_key: Option<String>,
+    tls_client_ca: Option<String>,
+    sasl_user: Option<String>,
+    sasl_pass: Option<String>,
+}
+
+fn parse_kafka_broker_args(rest: &[String]) -> Result<KafkaBrokerArgs, CliError> {
     let spec = load_spec(require(rest, 0, "rail.toml")?)?;
     let mut listen = "0.0.0.0:9092".to_owned();
     let mut advertised = "127.0.0.1".to_owned();
@@ -2111,6 +2165,35 @@ fn cmd_kafka_broker(rest: &[String]) -> Result<String, CliError> {
             }
         }
     }
+    Ok(KafkaBrokerArgs {
+        spec,
+        listen,
+        advertised,
+        data_dir,
+        partitions,
+        tls,
+        tls_cert,
+        tls_key,
+        tls_client_ca,
+        sasl_user,
+        sasl_pass,
+    })
+}
+
+fn cmd_kafka_broker(rest: &[String]) -> Result<String, CliError> {
+    let KafkaBrokerArgs {
+        spec,
+        listen,
+        advertised,
+        data_dir,
+        partitions,
+        tls,
+        tls_cert,
+        tls_key,
+        tls_client_ca,
+        sasl_user,
+        sasl_pass,
+    } = parse_kafka_broker_args(rest)?;
     // SASL/PLAIN: both flags or neither. Without --tls the password is on the wire in the clear — warn.
     let sasl_creds = match (sasl_user, sasl_pass) {
         (Some(user), Some(pass)) => {

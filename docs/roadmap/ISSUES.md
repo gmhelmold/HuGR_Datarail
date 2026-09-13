@@ -13,9 +13,9 @@ transaction visibility gate now exist. Deterministic in-process panic points cov
 process-level restart coverage, ambiguous journal-write handling, and full all-or-none proof remain open; do not claim
 crash atomicity yet.
 
-**Do:** implement contract in [`KAFKA-TXN-DURABILITY.md`](../design/KAFKA-TXN-DURABILITY.md): durable transaction
-intent/prepare, partition flush, commit marker, restart recovery, and atomic offset application. Keep control metadata
-provider-blind. Do not claim Kafka EOS until kill-during-commit proves all-or-none.
+**Do:** finish process-level crash tests and ambiguous journal-write handling against
+[`KAFKA-TXN-DURABILITY.md`](../design/KAFKA-TXN-DURABILITY.md). Keep control metadata provider-blind. Do not claim
+Kafka EOS until kill-during-commit proves all-or-none.
 
 **Acceptance:** injected crash at every commit boundary leaves either all enrolled records and offsets visible or none;
 recovery is deterministic; stale epoch cannot finish a newer transaction.
@@ -33,10 +33,10 @@ survives the injected cut.
 ### STOR-01 - Fix `ReplayLog::replay_from` seek after corruption
 **Legacy:** WP-01 checklist remaining issue
 
-**Status:** open, active mitigation. `SealedPartitionLog::read_sealed_from` reads segment files directly and validates
-CRC. Internal `ReplayLog` API still has the seek/replay defect under corrupt-frame conditions.
+**Status:** core seek fix landed and regression-tested. `SealedPartitionLog::read_sealed_from` still uses direct segment
+reads as a defensive path; removing that workaround and revalidating all storage semantics remain open.
 
-**Do:** fix `ReplayLog` seek/replay semantics, or formally split a corruption-safe reader API with equivalent tests.
+**Do:** remove direct-read workaround after proving equivalent corruption-safe fetch behavior.
 
 **Acceptance:** arbitrary valid record offsets after corrupt frames return exact suffixes; no renumbering; existing
 corruption tests remain green; direct-read workaround can be removed.
@@ -69,8 +69,8 @@ transactions where supported.
 ### DEDUP-01 - Persist broker restart deduplication
 **Legacy:** Issue #6
 
-**Status:** open. Broker mode is at-least-once across restarts for non-idempotent producers; library dedup exists but
-is not wired into the broker path.
+**Status:** implemented for idempotent producers. Persistent per-partition sequence metadata survives broker restart;
+non-idempotent producers remain at-least-once.
 
 **Acceptance:** produce, restart, retry sequence lands each record once at stable offsets; scope remains distinct from
 rail-mode and Postgres exactly-once claims.
@@ -80,7 +80,7 @@ rail-mode and Postgres exactly-once claims.
 ### KEY-01 - Replace inline demo secrets with key references
 **Legacy:** Issue #7
 
-**Status:** open. `examples/rail.toml` intentionally contains demo seeds; production key-ref/KMS path is absent.
+**Status:** partial. `env:` and `file:` key refs work and demo inline seeds remain; KMS path is absent.
 
 **Acceptance:** env/file/KMS handle references boot rail and broker without raw secret material in config; errors fail
 closed and secret lifetime is documented.
@@ -88,7 +88,8 @@ closed and secret lifetime is documented.
 ### QUIC-01 - Verify real QUIC server certificates
 **Legacy:** Issue #8
 
-**Status:** open. Embedded dev certificate and accept-any-server behavior remain dev-only paths.
+**Status:** implemented. Production `connect` verifies caller CA and hostname; embedded cert and accept-any behavior
+remain explicit dev/test paths.
 
 **Acceptance:** CA/hostname verification rejects wrong-cert MITM; dev certificate path requires explicit opt-in.
 
@@ -114,10 +115,11 @@ the project as single-node/embedded and remove unfulfilled product language.
 ### MAN-01 - Extract Merkle delivery receipt crate
 **Legacy:** Issue #10
 
-**Status:** open, lower leverage. Extract `datarail-manifest` into a dependency-light crate with verifier CLI and
-standalone docs.
+**Status:** partial. Public standalone verifier API and external-consumer tests/docs landed; verifier CLI and a
+serialization protocol remain absent.
 
-**Acceptance:** external consumer can verify receipt offline without importing CLI internals.
+**Acceptance:** external consumer can verify receipt offline without importing CLI internals; add verifier CLI or
+freeze an explicit typed-input boundary.
 
 ### NET-01 - Wire FASP delay controller into real lossy transport
 
