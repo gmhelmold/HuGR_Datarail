@@ -38,15 +38,27 @@ docker run --rm --privileged \
         loop=
         mounted=0
         cleanup() {
+            cleanup_status=$?
             set +e
+            cleanup_failed=0
             if [ "$mounted" -eq 1 ]; then
-                umount -l /mnt/datarail-fault
+                umount /mnt/datarail-fault || cleanup_failed=1
             fi
-            dmsetup remove --deferred "$dm_name"
+            if dmsetup info "$dm_name" >/dev/null 2>&1; then
+                dmsetup remove --deferred "$dm_name" || cleanup_failed=1
+                if dmsetup info "$dm_name" >/dev/null 2>&1; then
+                    printf "DUR-01: device-mapper mapping remained after cleanup: %s\n" "$dm_name" >&2
+                    cleanup_failed=1
+                fi
+            fi
             if [ -n "$loop" ]; then
-                losetup -d "$loop"
+                losetup -d "$loop" || cleanup_failed=1
             fi
-            rm -f "$image"
+            rm -f "$image" || cleanup_failed=1
+            if [ "$cleanup_failed" -ne 0 ] && [ "$cleanup_status" -eq 0 ]; then
+                cleanup_status=1
+            fi
+            return "$cleanup_status"
         }
         trap cleanup EXIT
 
@@ -72,7 +84,7 @@ docker run --rm --privileged \
             esac
             mount_opts=$(findmnt -n -o OPTIONS /mnt/datarail-fault)
             case ",$mount_opts," in
-                *,nobarrier,*)
+                *,nobarrier,*|*,barrier=0,*)
                     printf "%s\n" "DUR-01: flakey mode requires filesystem write barriers" >&2
                     exit 1
                     ;;

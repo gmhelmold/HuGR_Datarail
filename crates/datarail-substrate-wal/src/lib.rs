@@ -38,6 +38,7 @@ const FRAME_OVERHEAD: usize = 8;
 #[cfg(test)]
 thread_local! {
     static FAIL_DIR_FSYNC: Cell<bool> = const { Cell::new(false) };
+    static FAIL_SEGMENT_SYNC: Cell<bool> = const { Cell::new(false) };
 }
 
 /// Tunables for the log (all have warp-but-safe defaults).
@@ -137,6 +138,7 @@ pub struct DurableLog {
     // ---- ack / GC (RAM: bounded by the in-flight, delivered-but-un-acked window — NOT total volume) ----
     inflight: HashMap<[u8; 32], u64>, // cofre_id → segment id it was delivered from
     seg_inflight: HashMap<u64, u64>,  // segment id → count of delivered-un-acked cofres in it
+    poisoned: bool,
 }
 
 impl DurableLog {
@@ -190,6 +192,7 @@ impl DurableLog {
             read_file: None,
             inflight: HashMap::new(),
             seg_inflight: HashMap::new(),
+            poisoned: false,
         })
     }
 
@@ -220,17 +223,41 @@ impl DurableLog {
     /// # Errors
     /// [`WalError::Io`] on write/fsync failure.
     pub fn flush(&mut self) -> Result<(), WalError> {
+        if self.poisoned {
+            return Err(
+                std::io::Error::other("wal is poisoned after a prior write failure").into(),
+            );
+        }
         if !self.buf.is_empty() {
-            self.active.write_all(&self.buf)?;
+            if let Err(error) = self.active.write_all(&self.buf) {
+                self.poisoned = true;
+                self.buf.clear();
+                return Err(error.into());
+            }
             // sync_all (not sync_data) so the inode metadata is durable too. NOTE: std `fsync` flushes to the
             // device but does NOT issue a drive-cache barrier on macOS (needs F_FULLFSYNC, unavailable in safe
             // std) — true power-loss durability holds on Linux/ext4/xfs with write barriers, not on the macOS
             // dev box or a no-barrier container FS. See DURABLE-LOG.md "durability boundary".
-            self.active.sync_all()?;
+            #[cfg(test)]
+            let sync_result = if FAIL_SEGMENT_SYNC.with(Cell::get) {
+                Err(std::io::Error::from_raw_os_error(5))
+            } else {
+                self.active.sync_all()
+            };
+            #[cfg(not(test))]
+            let sync_result = self.active.sync_all();
+            if let Err(error) = sync_result {
+                self.poisoned = true;
+                self.buf.clear();
+                return Err(error.into());
+            }
             self.write_off += self.buf.len() as u64;
             self.buf.clear();
             if self.write_off >= self.cfg.segment_bytes {
-                self.rotate()?;
+                if let Err(error) = self.rotate() {
+                    self.poisoned = true;
+                    return Err(error);
+                }
             }
         }
         self.last_flush = Instant::now();
@@ -414,6 +441,9 @@ impl Substrate for DurableLog {
 
 impl Drop for DurableLog {
     fn drop(&mut self) {
+        if self.poisoned {
+            return;
+        }
         let _ = self.flush();
         let _ = self.checkpoint();
     }
@@ -548,7 +578,7 @@ mod tests {
     use datarail_core::Substrate;
     use datarail_rail::testsupport::cofre_seq;
 
-    use super::{fsync_dir_with, DurableLog, WalError, FAIL_DIR_FSYNC};
+    use super::{fsync_dir_with, DurableLog, WalError, FAIL_DIR_FSYNC, FAIL_SEGMENT_SYNC};
 
     static UNIQUE: AtomicU64 = AtomicU64::new(0);
 
@@ -598,6 +628,33 @@ mod tests {
 
         let mut reopened = DurableLog::open(&dir).expect("reopen test log");
         assert!(reopened.recv().expect("recv after durable ack").is_none());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn failed_segment_sync_poisoned_log_cannot_duplicate_buffer() {
+        let dir = temp_dir();
+        let cfg = super::WalConfig {
+            flush_bytes: 1 << 20,
+            flush_micros: u64::MAX,
+            segment_bytes: 1 << 20,
+        };
+        let mut log = DurableLog::open_with(&dir, cfg).expect("open test log");
+        log.send(&cofre_seq(0)).expect("buffer");
+        FAIL_SEGMENT_SYNC.with(|failed| failed.set(true));
+        assert!(log.flush().is_err());
+        FAIL_SEGMENT_SYNC.with(|failed| failed.set(false));
+        assert!(
+            log.flush().is_err(),
+            "failed log must not retry an ambiguous buffer"
+        );
+        drop(log);
+
+        let mut reopened = DurableLog::open_with(&dir, cfg).expect("reopen test log");
+        let cofre = reopened.recv().expect("recv").expect("durable frame");
+        assert_eq!(cofre.etiqueta.seq, 0);
+        reopened.ack(cofre.etiqueta.cofre_id).expect("ack");
+        assert!(reopened.recv().expect("drain").is_none());
         let _ = std::fs::remove_dir_all(dir);
     }
 }

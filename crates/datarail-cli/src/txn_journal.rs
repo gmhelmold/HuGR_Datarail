@@ -227,6 +227,13 @@ impl TxnJournal {
             }
         }
         self.file.write_all(&frame)?;
+        // Test-only process hook: simulate fsync returning an error after the complete Commit frame was written.
+        // The frame may or may not be durable, so the broker must fail-stop and let recovery decide.
+        if kind == COMMIT
+            && std::env::var("DATARAIL_TXN_JOURNAL_SYNC_ERROR").as_deref() == Ok("commit")
+        {
+            return Err(std::io::Error::from_raw_os_error(5));
+        }
         self.file.sync_all()
     }
 }
@@ -711,5 +718,26 @@ mod tests {
             std::fs::metadata(&source).expect("source metadata").len()
         );
         let _ = std::fs::remove_file(source);
+    }
+
+    #[test]
+    fn complete_corrupt_commit_tail_fails_closed() {
+        let path = path("corrupt-commit");
+        let _ = std::fs::remove_file(&path);
+        let mut journal = TxnJournal::open(&path).expect("open");
+        let prepared = journal
+            .prepare("tx", 13, 0, Vec::new(), Vec::new())
+            .expect("prepare");
+        journal.commit(&prepared, &[]).expect("commit");
+        drop(journal);
+
+        let mut bytes = std::fs::read(&path).expect("read journal");
+        *bytes.last_mut().expect("commit crc") ^= 0xFF;
+        std::fs::write(&path, bytes).expect("corrupt journal");
+        assert!(
+            TxnJournal::open(&path).is_err(),
+            "corrupt complete Commit must fail closed"
+        );
+        let _ = std::fs::remove_file(path);
     }
 }

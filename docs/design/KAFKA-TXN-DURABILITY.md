@@ -73,6 +73,10 @@ their per-partition locks; the gate is held only for the transaction boundary, n
 4. For `Abort`, ensure participant data is at pre-commit boundaries and restore before-values.
 5. Only after recovery succeeds, open the broker listener.
 
+If `Commit` fsync returns an error after its frame was written, the broker fails stop instead of attempting rollback:
+the frame may already be durable. Restart recovery then deterministically commits a valid frame or rolls back the
+unresolved `Prepare`.
+
 ## Fault Matrix
 
 Fault injection must stop the process after each of these points and restart on the same data directory:
@@ -82,6 +86,7 @@ Fault injection must stop the process after each of these points and restart on 
 - after the last participant fsync;
 - after the staged-offset batch write and fsync;
 - before and after `Commit` append and fsync;
+- after a complete `Commit` frame write with fsync returning an error;
 - after recovery truncation and offset restore.
 
 Expected result: all records plus all offsets, or no records plus old offsets. Retry of the same transaction is
@@ -89,8 +94,9 @@ idempotent. A successful wire test without this matrix is not a crash-atomicity 
 
 The unit test injects panics at these boundaries and reopens the data directory after unwinding. The real-binary
 `kafka_txn_wire` harness aborts and restarts at each post-fsync boundary (points 1 through 5), then writes partial
-`Commit` prefixes at several cuts plus a complete frame before aborting before fsync. Recovery proves records and
-staged offsets are all-or-none for both absent/partial and complete ambiguous journal outcomes.
+`Commit` prefixes at several cuts plus a complete frame before aborting before fsync. It also forces a complete frame's
+fsync to return `EIO`; the broker fail-stops and recovery proves records and staged offsets are all-or-none for absent,
+partial, complete-unfsynced, and explicit-sync-error outcomes.
 
 ## Explicit Non-Goals
 

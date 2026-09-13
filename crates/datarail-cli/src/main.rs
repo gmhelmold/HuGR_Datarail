@@ -1712,7 +1712,11 @@ impl PartitionBrokerStore {
             }
             txn_fault(4); // after offsets fsync
             if let Err(error) = self.txn_journal.lock().unwrap().commit(&prepared, &post) {
-                return rollback_transaction(self, guards, &prepared, error);
+                // Commit fsync failure is ambiguous: the complete frame may already be durable. Rolling back here
+                // could append Abort after a valid Commit and make startup reject the journal. Fail-stop instead;
+                // recovery deterministically chooses Commit or rolls back the unresolved Prepare.
+                eprintln!("fatal: transaction Commit durability is ambiguous: {error}");
+                std::process::abort();
             }
             txn_fault(5); // after Commit fsync
             for (_, _, state) in guards.iter_mut() {

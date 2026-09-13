@@ -41,6 +41,9 @@ time window (`FLUSH_MICROS`, e.g. 1000 µs) — whichever first. `flush()`:
 
 **One fsync amortized over a whole batch of cofres** = group-commit durability at high throughput (as databases and Kafka's own log do). At the SUBSTRATE layer the cofre is durable after step 2. **End-to-end through the OMB shim, however, the producer is acked earlier — at the ingress→worker handoff (acks=1), before the seal+fsync** — so the strong end-to-end guarantee is acks=1; the WAL provides acks=all-grade durability at the substrate, not (yet) end-to-end.
 
+If segment write or fsync fails after bytes may have reached the file, the log is poisoned and refuses further writes. The
+caller must reopen it; recovery truncates an incomplete tail and never retries an ambiguous buffer in place.
+
 ### Read path — O(1) sequential cursor, no id-set
 `recv()` reads the next frame at `read_off` from disk (`read_exact` into a reused read buffer), verifies the
 CRC, decodes, advances `read_off` in RAM, returns the cofre. **Exactly-once is the cursor, not a `HashSet`:** a
