@@ -403,7 +403,13 @@ pub fn verify_ack(
     if !verify_domain(
         ctx::ACK,
         dest_vk,
-        &ack_signing_bytes(&ack.route_id, &ack.stream_id, ack.seq, &ack.sth_root, ack.epoch),
+        &ack_signing_bytes(
+            &ack.route_id,
+            &ack.stream_id,
+            ack.seq,
+            &ack.sth_root,
+            ack.epoch,
+        ),
         &ack.dest_sig,
     ) {
         return Err(ManifestError::BadAckSig);
@@ -480,7 +486,15 @@ pub fn verify_delivery(p: &DeliveryProof<'_>) -> Result<(), ManifestError> {
         return Err(ManifestError::BadInclusion);
     }
     // (4) ack signed by dest, position matches the leaf, and its bound STH-root matches the proof root.
-    verify_ack(p.ack, p.dest_vk, p.route_id, p.stream_id, p.seq, p.epoch, &p.sth.root)
+    verify_ack(
+        p.ack,
+        p.dest_vk,
+        p.route_id,
+        p.stream_id,
+        p.seq,
+        p.epoch,
+        &p.sth.root,
+    )
 }
 
 /// E4 — BLAKE3 verified-streaming **chunk resume** (SPEC 07), built on this crate's Merkle tree.
@@ -589,7 +603,11 @@ pub mod bao {
                 });
             }
         }
-        Committed { root, total, pieces }
+        Committed {
+            root,
+            total,
+            pieces,
+        }
     }
 
     /// A resumable chunk receiver: the trusted `root` + `total`, a received-chunk bitfield, and the reassembly
@@ -641,7 +659,9 @@ pub mod bao {
         /// The indices still missing — the resume request set.
         #[must_use]
         pub fn missing(&self) -> Vec<usize> {
-            (0..self.total).filter(|&i| self.slots[i].is_none()).collect()
+            (0..self.total)
+                .filter(|&i| self.slots[i].is_none())
+                .collect()
         }
 
         /// Whether every chunk has arrived.
@@ -700,7 +720,10 @@ pub mod bao {
             }
             assert!(!rx.is_complete());
             let missing = rx.missing();
-            assert!(missing.iter().all(|i| i % 2 == 1), "only odd chunks remain: {missing:?}");
+            assert!(
+                missing.iter().all(|i| i % 2 == 1),
+                "only odd chunks remain: {missing:?}"
+            );
             assert_eq!(rx.reassemble(), Err(BaoError::Incomplete));
 
             // Resume: deliver exactly the missing chunks.
@@ -708,7 +731,11 @@ pub mod bao {
                 rx.accept(&c.pieces[i]).expect("resumed chunk");
             }
             assert!(rx.is_complete());
-            assert_eq!(rx.reassemble().expect("complete"), data, "partial + resume reassembles the original");
+            assert_eq!(
+                rx.reassemble().expect("complete"),
+                data,
+                "partial + resume reassembles the original"
+            );
         }
 
         #[test]
@@ -718,7 +745,11 @@ pub mod bao {
             let mut rx = ChunkReceiver::new(c.root, c.total);
             let mut bad = c.pieces[2].clone();
             bad.bytes[0] ^= 0x01; // flip one byte
-            assert_eq!(rx.accept(&bad), Err(BaoError::Unauthenticated), "a tampered chunk is rejected");
+            assert_eq!(
+                rx.accept(&bad),
+                Err(BaoError::Unauthenticated),
+                "a tampered chunk is rejected"
+            );
             assert!(!rx.has(2));
         }
 
@@ -767,8 +798,8 @@ pub mod bao {
 mod tests {
     use super::{
         leaf_hash, merkle_root, root_from_path, sign_ack, verify_ack, verify_delivery,
-        verify_inclusion, verify_sth, DeliveryProof, DestAck, ManifestError, ManifestLog, ProofStep,
-        SignedTreeHead,
+        verify_inclusion, verify_sth, DeliveryProof, DestAck, ManifestError, ManifestLog,
+        ProofStep, SignedTreeHead,
     };
     use datarail_crypto::{blake3_256, ctx, verify_domain, verifying_key};
 
@@ -927,13 +958,13 @@ mod tests {
 
     /// A fully-valid bundle for index 3 of a 9-leaf log, returned with all the pieces to tamper.
     fn valid_fixture() -> (
-        Vec<u8>,            // carga
-        u64,                // seq
+        Vec<u8>, // carga
+        u64,     // seq
         super::InclusionProof,
         SignedTreeHead,
-        [u8; 32],           // source_vk
+        [u8; 32], // source_vk
         DestAck,
-        [u8; 32],           // dest_vk
+        [u8; 32], // dest_vk
     ) {
         let cs = cargas(9);
         let log = build_log(&cs);
@@ -985,7 +1016,16 @@ mod tests {
         let mut bad = carga.clone();
         bad[0] ^= 0x01;
         ack.cofre_id = blake3_256(&bad);
-        ack.dest_sig = sign_ack(&DEST_SEED, ack.cofre_id, ROUTE, STREAM, seq, sth.root, EPOCH).dest_sig;
+        ack.dest_sig = sign_ack(
+            &DEST_SEED,
+            ack.cofre_id,
+            ROUTE,
+            STREAM,
+            seq,
+            sth.root,
+            EPOCH,
+        )
+        .dest_sig;
         assert_eq!(
             run(&bad, seq, &proof, &sth, &svk, &ack, &dvk),
             Err(ManifestError::BadInclusion)
@@ -1050,17 +1090,13 @@ mod tests {
             s.root = forged_root;
             // re-sign over the forged root
             super::SignedTreeHead {
-                sig: datarail_crypto::sign_domain(
-                    ctx::STH,
-                    &SOURCE_SEED,
-                    &{
-                        let mut b = Vec::new();
-                        b.extend_from_slice(&forged_root);
-                        b.extend_from_slice(&s.tree_size.to_le_bytes());
-                        b.extend_from_slice(&s.ts.to_le_bytes());
-                        b
-                    },
-                ),
+                sig: datarail_crypto::sign_domain(ctx::STH, &SOURCE_SEED, &{
+                    let mut b = Vec::new();
+                    b.extend_from_slice(&forged_root);
+                    b.extend_from_slice(&s.tree_size.to_le_bytes());
+                    b.extend_from_slice(&s.ts.to_le_bytes());
+                    b
+                }),
                 ..s
             }
         };
@@ -1103,7 +1139,15 @@ mod tests {
 
         // (b) ack lifted onto a different route → position mismatch (signature stays valid for its own msg).
         let (carga_b, seq_b, proof_b, sth_b, svk_b, _a_b, dvk_b) = valid_fixture();
-        let ack_b = sign_ack(&DEST_SEED, blake3_256(&carga_b), [0xAA; 16], STREAM, seq_b, sth_b.root, EPOCH);
+        let ack_b = sign_ack(
+            &DEST_SEED,
+            blake3_256(&carga_b),
+            [0xAA; 16],
+            STREAM,
+            seq_b,
+            sth_b.root,
+            EPOCH,
+        );
         assert_eq!(
             run(&carga_b, seq_b, &proof_b, &sth_b, &svk_b, &ack_b, &dvk_b),
             Err(ManifestError::AckPositionMismatch)
@@ -1113,7 +1157,15 @@ mod tests {
         let (carga_c, seq_c, proof_c, sth_c, svk_c, _a, dvk_c) = valid_fixture();
         let mut stale_root = sth_c.root;
         stale_root[0] ^= 0x01;
-        let ack_c = sign_ack(&DEST_SEED, blake3_256(&carga_c), ROUTE, STREAM, seq_c, stale_root, EPOCH);
+        let ack_c = sign_ack(
+            &DEST_SEED,
+            blake3_256(&carga_c),
+            ROUTE,
+            STREAM,
+            seq_c,
+            stale_root,
+            EPOCH,
+        );
         assert_eq!(
             run(&carga_c, seq_c, &proof_c, &sth_c, &svk_c, &ack_c, &dvk_c),
             Err(ManifestError::AckRootMismatch)
@@ -1194,6 +1246,9 @@ mod tests {
             sibling: sib,
             sibling_is_right: true,
         };
-        assert_eq!(root_from_path(&leaf, &[step]), super::hash_node(&leaf, &sib));
+        assert_eq!(
+            root_from_path(&leaf, &[step]),
+            super::hash_node(&leaf, &sib)
+        );
     }
 }

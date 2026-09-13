@@ -49,8 +49,16 @@ fn power_loss_recovery_zero_loss() {
         got.push(c.etiqueta.seq);
         reopened.ack(id).expect("ack");
     }
-    assert_eq!(got.len(), usize::try_from(N).unwrap(), "every fsync'd cofre must survive the crash");
-    assert_eq!(got, (0..N).collect::<Vec<_>>(), "recovered cofres must be in seq order, 0-loss/0-dup");
+    assert_eq!(
+        got.len(),
+        usize::try_from(N).unwrap(),
+        "every fsync'd cofre must survive the crash"
+    );
+    assert_eq!(
+        got,
+        (0..N).collect::<Vec<_>>(),
+        "recovered cofres must be in seq order, 0-loss/0-dup"
+    );
 }
 
 /// A torn write (power-loss mid-append) must be truncated to the last intact frame; earlier cofres survive.
@@ -86,7 +94,11 @@ fn torn_tail_is_truncated_prior_intact() {
         got.push(c.etiqueta.seq);
         reopened.ack(id).expect("ack");
     }
-    assert_eq!(got, (0..N).collect::<Vec<_>>(), "torn tail dropped; all intact cofres recovered exactly");
+    assert_eq!(
+        got,
+        (0..N).collect::<Vec<_>>(),
+        "torn tail dropped; all intact cofres recovered exactly"
+    );
 }
 
 /// Round-trip with rotation: a small segment size forces many segments; send→recv→ack still 0-loss, and
@@ -95,7 +107,11 @@ fn torn_tail_is_truncated_prior_intact() {
 fn rotation_and_gc_zero_loss() {
     const N: u64 = 1000;
     let dir = temp_dir("rotate");
-    let cfg = WalConfig { flush_bytes: 4096, flush_micros: 1, segment_bytes: 16 * 1024 };
+    let cfg = WalConfig {
+        flush_bytes: 4096,
+        flush_micros: 1,
+        segment_bytes: 16 * 1024,
+    };
     let mut log = DurableLog::open_with(&dir, cfg).expect("open");
     for seq in 0..N {
         log.send(&cofre_seq(seq)).expect("send");
@@ -107,14 +123,21 @@ fn rotation_and_gc_zero_loss() {
         got.push(c.etiqueta.seq);
         log.ack(id).expect("ack");
     }
-    assert_eq!(got, (0..N).collect::<Vec<_>>(), "0-loss across many rotated segments");
+    assert_eq!(
+        got,
+        (0..N).collect::<Vec<_>>(),
+        "0-loss across many rotated segments"
+    );
     // After draining + acking everything, GC should have deleted the early segments.
     let remaining = std::fs::read_dir(&dir)
         .unwrap()
         .filter_map(Result::ok)
         .filter(|e| e.path().extension().is_some_and(|x| x == "seg"))
         .count();
-    assert!(remaining <= 2, "fully-acked segments must be GC'd (found {remaining} seg files)");
+    assert!(
+        remaining <= 2,
+        "fully-acked segments must be GC'd (found {remaining} seg files)"
+    );
 }
 
 /// THE masterpiece gate (de-rigged after the durability audit): RSS must not grow with TOTAL volume across the
@@ -132,7 +155,11 @@ fn ram_flat_across_full_send_recv_ack_cycle() {
     };
     let dir = temp_dir("ramflat");
     // bigger flush threshold so the test isn't dominated by per-record fsyncs
-    let cfg = WalConfig { flush_bytes: 1 << 20, flush_micros: 200_000, segment_bytes: 4 << 20 };
+    let cfg = WalConfig {
+        flush_bytes: 1 << 20,
+        flush_micros: 200_000,
+        segment_bytes: 4 << 20,
+    };
     let mut log = DurableLog::open_with(&dir, cfg).expect("open");
     let cofre = cofre_seq(0);
     let mut peak = rss0;
@@ -167,7 +194,11 @@ fn unacked_backlog_ram_is_bounded_by_inflight_and_reclaimed_on_ack() {
     const N: u64 = 500;
     let rss0 = rss_kb(); // informational only (Some on Linux, None elsewhere) — the invariant below is RSS-free
     let dir = temp_dir("backlog");
-    let cfg = WalConfig { flush_bytes: 1 << 20, flush_micros: 200_000, segment_bytes: 4 << 20 };
+    let cfg = WalConfig {
+        flush_bytes: 1 << 20,
+        flush_micros: 200_000,
+        segment_bytes: 4 << 20,
+    };
     let mut log = DurableLog::open_with(&dir, cfg).expect("open");
     // DISTINCT cofres → the in-flight map (keyed by cofre_id) genuinely holds one entry per delivered-un-acked
     // cofre. (A single repeated cofre would collapse to one map entry and prove nothing about the backlog cost.)
@@ -182,7 +213,11 @@ fn unacked_backlog_ram_is_bounded_by_inflight_and_reclaimed_on_ack() {
     }
     assert_eq!(ids.len(), usize::try_from(N).unwrap(), "all delivered");
     // The un-acked backlog holds O(in-flight) bookkeeping (one entry per delivered-un-acked cofre).
-    assert_eq!(log.inflight_len(), usize::try_from(N).unwrap(), "the backlog is tracked, O(in-flight)");
+    assert_eq!(
+        log.inflight_len(),
+        usize::try_from(N).unwrap(),
+        "the backlog is tracked, O(in-flight)"
+    );
     let backlog_rss = rss_kb();
     // Now ack everything → the bookkeeping must be RECLAIMED.
     for id in &ids {
@@ -193,7 +228,11 @@ fn unacked_backlog_ram_is_bounded_by_inflight_and_reclaimed_on_ack() {
     // in-flight map is released. RSS reclaim is NOT asserted — glibc malloc keeps freed pages in its arenas, so RSS
     // need not drop on Linux even though the bookkeeping is gone (that exact false failure showed up on CI). RSS is
     // an informational print: the honest claim is O(in-flight)-and-reclaimed, proven by the count returning to 0.
-    assert_eq!(log.inflight_len(), 0, "acking the full backlog reclaims ALL in-flight bookkeeping — not a leak");
+    assert_eq!(
+        log.inflight_len(),
+        0,
+        "acking the full backlog reclaims ALL in-flight bookkeeping — not a leak"
+    );
     if let (Some(r0), Some(rb), Some(ra)) = (rss0, backlog_rss, after_ack) {
         eprintln!("backlog RSS: rss0 {r0} → un-acked {rb} → acked {ra} KB (reclaim allocator-dependent; invariant proven by inflight_len)");
     }
@@ -205,7 +244,11 @@ fn unacked_backlog_ram_is_bounded_by_inflight_and_reclaimed_on_ack() {
 fn lost_cursor_plus_gc_still_recovers_unacked_tail() {
     const N: u64 = 1200;
     let dir = temp_dir("lostcursor");
-    let cfg = WalConfig { flush_bytes: 2048, flush_micros: 1, segment_bytes: 8 * 1024 };
+    let cfg = WalConfig {
+        flush_bytes: 2048,
+        flush_micros: 1,
+        segment_bytes: 8 * 1024,
+    };
     {
         let mut log = DurableLog::open_with(&dir, cfg).expect("open");
         for seq in 0..N {
@@ -230,7 +273,10 @@ fn lost_cursor_plus_gc_still_recovers_unacked_tail() {
     // The un-acked tail (the second half) MUST be recovered — not 0 (the bug). Duplicates of the first half are
     // fine (at-least-once → deduped downstream); the requirement is no LOSS of the un-acked tail.
     for seq in (N / 2)..N {
-        assert!(got.contains(&seq), "un-acked cofre seq {seq} was LOST after lost-cursor+GC (the total-loss bug)");
+        assert!(
+            got.contains(&seq),
+            "un-acked cofre seq {seq} was LOST after lost-cursor+GC (the total-loss bug)"
+        );
     }
 }
 
@@ -240,7 +286,11 @@ fn lost_cursor_plus_gc_still_recovers_unacked_tail() {
 fn corrupt_interior_frame_in_sealed_segment_errors() {
     const N: u64 = 400;
     let dir = temp_dir("corrupt");
-    let cfg = WalConfig { flush_bytes: 2048, flush_micros: 1, segment_bytes: 8 * 1024 };
+    let cfg = WalConfig {
+        flush_bytes: 2048,
+        flush_micros: 1,
+        segment_bytes: 8 * 1024,
+    };
     {
         let mut log = DurableLog::open_with(&dir, cfg).expect("open");
         for seq in 0..N {
@@ -277,7 +327,10 @@ fn corrupt_interior_frame_in_sealed_segment_errors() {
             }
         }
     }
-    assert!(errored, "corruption inside a sealed segment must surface as an error, not be silently swallowed");
+    assert!(
+        errored,
+        "corruption inside a sealed segment must surface as an error, not be silently swallowed"
+    );
 }
 
 /// Audit CRITICAL regression: `recv` advances the read cursor on DELIVERY, so a crash after delivering-but-not-
@@ -316,7 +369,10 @@ fn delivered_but_unacked_records_are_redelivered_after_a_crash() {
         if seq == acked_seq {
             continue;
         }
-        assert!(got.contains(&seq), "un-acked record {seq} was LOST across the crash (recovered {got:?})");
+        assert!(
+            got.contains(&seq),
+            "un-acked record {seq} was LOST across the crash (recovered {got:?})"
+        );
     }
 }
 

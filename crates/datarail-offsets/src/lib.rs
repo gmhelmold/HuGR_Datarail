@@ -27,7 +27,9 @@ impl MemOffsets {
     /// A new empty store.
     #[must_use]
     pub fn new() -> Self {
-        Self { map: BTreeMap::new() }
+        Self {
+            map: BTreeMap::new(),
+        }
     }
 }
 impl OffsetStore for MemOffsets {
@@ -101,6 +103,15 @@ pub struct FileOffsets {
     records: usize,
 }
 
+/// A prior value for one group, used by a durable transaction recovery path. `None` means the group did not exist.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OffsetSnapshot {
+    /// Consumer-group key.
+    pub group: String,
+    /// Previously committed value, if any.
+    pub offset: Option<u64>,
+}
+
 /// fsync a directory so a `create`/`rename` within it is durable across a power loss (the file's own data fsync
 /// does NOT guarantee its directory entry is persisted). Unix-targeted; the project runs on macOS/Linux.
 fn fsync_dir(dir: &Path) -> io::Result<()> {
@@ -121,12 +132,71 @@ impl FileOffsets {
         // live log is authoritative, so drop the partial snapshot.
         let _ = std::fs::remove_file(dir.join(TMP_NAME));
         let path: PathBuf = dir.join(LOG_NAME);
-        let mut file = OpenOptions::new().read(true).append(true).create(true).open(path)?;
+        let mut file = OpenOptions::new()
+            .read(true)
+            .append(true)
+            .create(true)
+            .open(path)?;
         let (map, records) = Self::replay(&mut file)?;
         // Make the log's directory entry durable: a first-ever create must survive a power loss, else a
         // committed offset whose file data fsync'd could vanish with the lost create (audit D-6).
         fsync_dir(&dir)?;
-        Ok(Self { file, map, dir, records })
+        Ok(Self {
+            file,
+            map,
+            dir,
+            records,
+        })
+    }
+
+    /// Capture current values for groups that may be changed by one transaction.
+    #[must_use]
+    pub fn snapshot(&self, groups: &[String]) -> Vec<OffsetSnapshot> {
+        groups
+            .iter()
+            .map(|group| OffsetSnapshot {
+                group: group.clone(),
+                offset: self.map.get(group).copied(),
+            })
+            .collect()
+    }
+
+    /// Durably apply several group offsets under one file fsync boundary.
+    ///
+    /// # Errors
+    /// Returns an I/O or encoding error. On failure the in-memory map is unchanged; recovery can restore the prior
+    /// snapshot if a prefix reached disk.
+    pub fn commit_many(&mut self, values: &[(String, u64)]) -> io::Result<()> {
+        let mut encoded = Vec::new();
+        for (group, offset) in values {
+            encoded.extend_from_slice(&Self::encode_record(group, *offset)?);
+        }
+        self.file.write_all(&encoded)?;
+        self.file.sync_all()?;
+        for (group, offset) in values {
+            self.map.insert(group.clone(), *offset);
+        }
+        self.records += values.len();
+        self.maybe_compact()
+    }
+
+    /// Restore a captured group snapshot through an atomic compacted replacement.
+    ///
+    /// # Errors
+    /// Returns an I/O or encoding error. The caller must fail closed if restoration does not complete.
+    pub fn restore_many(&mut self, snapshots: &[OffsetSnapshot]) -> io::Result<()> {
+        let mut restored = self.map.clone();
+        for snapshot in snapshots {
+            match snapshot.offset {
+                Some(offset) => {
+                    restored.insert(snapshot.group.clone(), offset);
+                }
+                None => {
+                    restored.remove(&snapshot.group);
+                }
+            }
+        }
+        self.rewrite_map(&restored)
     }
 
     /// Read the whole log and fold it into the latest-offset-per-group map,
@@ -178,13 +248,20 @@ impl FileOffsets {
     /// rename completes the old log is untouched, and the rename is atomic, so
     /// recovery always sees exactly one intact file.
     fn compact(&mut self) -> io::Result<()> {
+        self.rewrite_map(&self.map.clone())
+    }
+
+    fn rewrite_map(&mut self, map: &BTreeMap<String, u64>) -> io::Result<()> {
         let tmp_path = self.dir.join(TMP_NAME);
         let live_path = self.dir.join(LOG_NAME);
         {
-            let mut tmp =
-                OpenOptions::new().write(true).create(true).truncate(true).open(&tmp_path)?;
+            let mut tmp = OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&tmp_path)?;
             let mut snapshot = Vec::new();
-            for (group, &offset) in &self.map {
+            for (group, &offset) in map {
                 snapshot.extend_from_slice(&Self::encode_record(group, offset)?);
             }
             tmp.write_all(&snapshot)?;
@@ -195,12 +272,16 @@ impl FileOffsets {
         // handle now points at the unlinked inode). The directory fsync is a durability nicety done AFTER, and is
         // best-effort — if it errored before the reopen, a subsequent `commit` would write to the dead inode and
         // be silently lost on the next open.
-        self.file = OpenOptions::new().read(true).append(true).open(&live_path)?;
-        self.records = self.map.len();
+        self.file = OpenOptions::new()
+            .read(true)
+            .append(true)
+            .open(&live_path)?;
+        self.records = map.len();
         // fsync the directory so the rename itself is durable across a power loss. Done AFTER the reopen (a
         // pre-reopen error would strand `self.file` on the dead inode); propagated now (audit D-6) so a caller
         // learns the rename may not be durable rather than silently assuming it is.
         fsync_dir(&self.dir)?;
+        self.map.clone_from(map);
         Ok(())
     }
 
@@ -245,7 +326,7 @@ impl OffsetStore for FileOffsets {
 
 #[cfg(test)]
 mod tests {
-    use super::{FileOffsets, OffsetStore};
+    use super::{FileOffsets, OffsetSnapshot, OffsetStore};
     use std::path::PathBuf;
 
     /// A unique, auto-cleaned temp dir per test.
@@ -256,7 +337,11 @@ mod tests {
             let nanos = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map_or(0, |d| d.as_nanos());
-            p.push(format!("datarail-offsets-{}-{}-{nanos}", std::process::id(), tag));
+            p.push(format!(
+                "datarail-offsets-{}-{}-{nanos}",
+                std::process::id(),
+                tag
+            ));
             std::fs::create_dir_all(&p).expect("create temp dir");
             Self(p)
         }
@@ -288,6 +373,41 @@ mod tests {
         assert_eq!(store.fetch("alpha"), Some(1));
         assert_eq!(store.fetch("beta"), Some(22));
         assert_eq!(store.fetch("gamma"), Some(333));
+    }
+
+    #[test]
+    fn batch_offsets_snapshot_and_restore_survive_reopen() {
+        let tmp = TmpDir::new("batch");
+        let mut store = FileOffsets::open(&tmp.0).expect("open");
+        store.commit("g", 7).expect("seed");
+        let groups = vec!["g".to_owned(), "new".to_owned()];
+        let before = store.snapshot(&groups);
+        assert_eq!(
+            before,
+            vec![
+                OffsetSnapshot {
+                    group: "g".to_owned(),
+                    offset: Some(7)
+                },
+                OffsetSnapshot {
+                    group: "new".to_owned(),
+                    offset: None
+                },
+            ]
+        );
+
+        store
+            .commit_many(&[("g".to_owned(), 8), ("new".to_owned(), 9)])
+            .expect("batch commit");
+        assert_eq!(store.fetch("g"), Some(8));
+        assert_eq!(store.fetch("new"), Some(9));
+        store.restore_many(&before).expect("restore snapshot");
+        assert_eq!(store.fetch("g"), Some(7));
+        assert_eq!(store.fetch("new"), None);
+
+        let reopened = FileOffsets::open(&tmp.0).expect("reopen");
+        assert_eq!(reopened.fetch("g"), Some(7));
+        assert_eq!(reopened.fetch("new"), None);
     }
 
     #[test]
@@ -341,7 +461,11 @@ mod tests {
             store.commit("g", i).expect("commit");
         }
         // One group, last-write-wins: the log must stay O(groups), not O(commits).
-        assert!(log_size(&tmp.0) < 4096, "log not compacted: {}", log_size(&tmp.0));
+        assert!(
+            log_size(&tmp.0) < 4096,
+            "log not compacted: {}",
+            log_size(&tmp.0)
+        );
         assert_eq!(store.fetch("g"), Some(2_099));
     }
 

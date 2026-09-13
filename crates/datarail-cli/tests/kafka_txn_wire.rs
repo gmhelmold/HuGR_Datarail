@@ -1,17 +1,20 @@
 //! FULL-CHAIN transactional-EOS proof: spawn the real `datarail kafka-broker` and drive a TRANSACTIONAL producer
 //! through `InitProducerId`(`transactional_id`) → `AddPartitionsToTxn` → (transactional) Produce → `EndTxn`. Asserts:
-//! buffered records are INVISIBLE before commit; a COMMIT makes them visible ATOMICALLY across two partitions; an
+//! buffered records are INVISIBLE before commit; a successful COMMIT makes them visible across two partitions; an
 //! ABORT discards them (never visible). `KAFKA-TXN-DESIGN.md` (buffer-until-commit model). Runs in normal CI.
 
 use std::io::{Read, Write};
-use std::net::TcpStream;
+use std::net::{TcpListener, TcpStream};
 use std::process::{Child, Command};
 use std::time::{Duration, Instant};
 
 use datarail_kafka::codec::{Reader, Writer};
 use datarail_kafka::produce::parse_record_batch;
 
-const PORT: u16 = 19_097;
+fn free_port() -> u16 {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind ephemeral port");
+    listener.local_addr().expect("read ephemeral port").port()
+}
 
 fn req_header(api_key: i16, api_version: i16, correlation_id: i32) -> Writer {
     let mut w = Writer::new();
@@ -91,7 +94,14 @@ fn init_producer_id(resp: &[u8]) -> (i64, i16) {
     (pid, epoch)
 }
 
-fn add_partitions_req(correlation_id: i32, tid: &str, pid: i64, epoch: i16, topic: &str, partitions: &[i32]) -> Vec<u8> {
+fn add_partitions_req(
+    correlation_id: i32,
+    tid: &str,
+    pid: i64,
+    epoch: i16,
+    topic: &str,
+    partitions: &[i32],
+) -> Vec<u8> {
     let mut w = req_header(24, 1, correlation_id);
     w.string(tid);
     w.int64(pid);
@@ -105,7 +115,14 @@ fn add_partitions_req(correlation_id: i32, tid: &str, pid: i64, epoch: i16, topi
     Writer::frame(&w.into_bytes())
 }
 
-fn produce_txn_req(correlation_id: i32, topic: &str, partition: i32, pid: i64, epoch: i16, values: &[&[u8]]) -> Vec<u8> {
+fn produce_txn_req(
+    correlation_id: i32,
+    topic: &str,
+    partition: i32,
+    pid: i64,
+    epoch: i16,
+    values: &[&[u8]],
+) -> Vec<u8> {
     let batch = txn_record_batch(values, pid, epoch, 0);
     let mut w = req_header(0, 7, correlation_id);
     w.nullable_string(Some("tx-1")); // transactional_id on the Produce request (v3+)
@@ -158,7 +175,11 @@ fn fetch_values(resp: &[u8]) -> Vec<Vec<u8>> {
     let _aborted = r.int32().unwrap();
     match r.nullable_bytes().unwrap() {
         None => Vec::new(),
-        Some(blob) => parse_record_batch(&blob).expect("parse fetched batch").values,
+        Some(blob) => {
+            parse_record_batch(&blob)
+                .expect("parse fetched batch")
+                .values
+        }
     }
 }
 
@@ -171,7 +192,8 @@ impl Drop for Daemon {
 }
 
 #[test]
-fn transactional_commit_is_visible_atomically_and_abort_is_hidden() {
+fn transactional_commit_is_visible_after_success_and_abort_is_hidden() {
+    let port = free_port();
     let rail = std::env::temp_dir().join(format!("kafka-txn-{}.toml", std::process::id()));
     std::fs::write(
         &rail,
@@ -197,7 +219,7 @@ fn transactional_commit_is_visible_atomically_and_abort_is_hidden() {
             "kafka-broker",
             rail.to_str().unwrap(),
             "--listen",
-            &format!("127.0.0.1:{PORT}"),
+            &format!("127.0.0.1:{port}"),
             "--advertised",
             "127.0.0.1",
             "--data-dir",
@@ -211,51 +233,109 @@ fn transactional_commit_is_visible_atomically_and_abort_is_hidden() {
     let mut stream = {
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
-            if let Ok(s) = TcpStream::connect(("127.0.0.1", PORT)) {
+            if let Ok(s) = TcpStream::connect(("127.0.0.1", port)) {
                 break s;
             }
             assert!(Instant::now() < deadline, "broker never started");
             std::thread::sleep(Duration::from_millis(100));
         }
     };
-    stream.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
 
     // --- a transactional producer, COMMIT path ---
     stream.write_all(&init_producer_id_req(1, "tx-1")).unwrap();
     let (pid, epoch) = init_producer_id(&read_frame(&mut stream));
 
-    stream.write_all(&add_partitions_req(2, "tx-1", pid, epoch, "events", &[0, 1])).unwrap();
+    stream
+        .write_all(&add_partitions_req(
+            2,
+            "tx-1",
+            pid,
+            epoch,
+            "events",
+            &[0, 1],
+        ))
+        .unwrap();
     let _ = read_frame(&mut stream);
 
     // Produce transactional batches to BOTH partitions (buffered, not yet visible).
-    stream.write_all(&produce_txn_req(3, "events", 0, pid, epoch, &[b"evt:p0a", b"evt:p0b"])).unwrap();
+    stream
+        .write_all(&produce_txn_req(
+            3,
+            "events",
+            0,
+            pid,
+            epoch,
+            &[b"evt:p0a", b"evt:p0b"],
+        ))
+        .unwrap();
     let _ = read_frame(&mut stream);
-    stream.write_all(&produce_txn_req(4, "events", 1, pid, epoch, &[b"evt:p1a"])).unwrap();
+    stream
+        .write_all(&produce_txn_req(4, "events", 1, pid, epoch, &[b"evt:p1a"]))
+        .unwrap();
     let _ = read_frame(&mut stream);
 
     // Before commit: BOTH partitions are EMPTY (records buffered, invisible).
     stream.write_all(&fetch_req(5, "events", 0, 0)).unwrap();
-    assert!(fetch_values(&read_frame(&mut stream)).is_empty(), "p0 invisible before commit");
+    assert!(
+        fetch_values(&read_frame(&mut stream)).is_empty(),
+        "p0 invisible before commit"
+    );
     stream.write_all(&fetch_req(6, "events", 1, 0)).unwrap();
-    assert!(fetch_values(&read_frame(&mut stream)).is_empty(), "p1 invisible before commit");
+    assert!(
+        fetch_values(&read_frame(&mut stream)).is_empty(),
+        "p1 invisible before commit"
+    );
 
-    // COMMIT → both partitions become visible atomically.
-    stream.write_all(&end_txn_req(7, "tx-1", pid, epoch, true)).unwrap();
+    // Successful COMMIT → both partitions become visible after the flush returns.
+    stream
+        .write_all(&end_txn_req(7, "tx-1", pid, epoch, true))
+        .unwrap();
     let _ = read_frame(&mut stream);
     stream.write_all(&fetch_req(8, "events", 0, 0)).unwrap();
-    assert_eq!(fetch_values(&read_frame(&mut stream)), vec![b"evt:p0a".to_vec(), b"evt:p0b".to_vec()], "p0 visible after commit");
+    assert_eq!(
+        fetch_values(&read_frame(&mut stream)),
+        vec![b"evt:p0a".to_vec(), b"evt:p0b".to_vec()],
+        "p0 visible after commit"
+    );
     stream.write_all(&fetch_req(9, "events", 1, 0)).unwrap();
-    assert_eq!(fetch_values(&read_frame(&mut stream)), vec![b"evt:p1a".to_vec()], "p1 visible after commit (atomic)");
+    assert_eq!(
+        fetch_values(&read_frame(&mut stream)),
+        vec![b"evt:p1a".to_vec()],
+        "p1 visible after commit"
+    );
 
     // --- a second transaction, ABORT path (re-init bumps the epoch) ---
     stream.write_all(&init_producer_id_req(10, "tx-1")).unwrap();
     let (pid2, epoch2) = init_producer_id(&read_frame(&mut stream));
-    stream.write_all(&add_partitions_req(11, "tx-1", pid2, epoch2, "events", &[0])).unwrap();
+    stream
+        .write_all(&add_partitions_req(
+            11,
+            "tx-1",
+            pid2,
+            epoch2,
+            "events",
+            &[0],
+        ))
+        .unwrap();
     let _ = read_frame(&mut stream);
-    stream.write_all(&produce_txn_req(12, "events", 0, pid2, epoch2, &[b"evt:doomed"])).unwrap();
+    stream
+        .write_all(&produce_txn_req(
+            12,
+            "events",
+            0,
+            pid2,
+            epoch2,
+            &[b"evt:doomed"],
+        ))
+        .unwrap();
     let _ = read_frame(&mut stream);
     // ABORT → the doomed record is discarded.
-    stream.write_all(&end_txn_req(13, "tx-1", pid2, epoch2, false)).unwrap();
+    stream
+        .write_all(&end_txn_req(13, "tx-1", pid2, epoch2, false))
+        .unwrap();
     let _ = read_frame(&mut stream);
     // p0 still shows ONLY the committed records — the aborted one never appears.
     stream.write_all(&fetch_req(14, "events", 0, 0)).unwrap();
@@ -268,20 +348,55 @@ fn transactional_commit_is_visible_atomically_and_abort_is_hidden() {
     // --- ZOMBIE FENCE (audit CRITICAL): a stale-epoch Produce must NOT be committed ---
     stream.write_all(&init_producer_id_req(15, "tx-1")).unwrap();
     let (pid3, epoch3) = init_producer_id(&read_frame(&mut stream)); // epoch bumped again; pid2/epoch2 now fenced
-    stream.write_all(&add_partitions_req(16, "tx-1", pid3, epoch3, "events", &[0])).unwrap();
+    stream
+        .write_all(&add_partitions_req(
+            16,
+            "tx-1",
+            pid3,
+            epoch3,
+            "events",
+            &[0],
+        ))
+        .unwrap();
     let _ = read_frame(&mut stream);
     // A legit record at the CURRENT epoch.
-    stream.write_all(&produce_txn_req(17, "events", 0, pid3, epoch3, &[b"evt:legit"])).unwrap();
+    stream
+        .write_all(&produce_txn_req(
+            17,
+            "events",
+            0,
+            pid3,
+            epoch3,
+            &[b"evt:legit"],
+        ))
+        .unwrap();
     let _ = read_frame(&mut stream);
     // A ZOMBIE record at the OLD (fenced) epoch — must be rejected, never buffered.
-    stream.write_all(&produce_txn_req(18, "events", 0, pid2, epoch2, &[b"evt:zombie"])).unwrap();
+    stream
+        .write_all(&produce_txn_req(
+            18,
+            "events",
+            0,
+            pid2,
+            epoch2,
+            &[b"evt:zombie"],
+        ))
+        .unwrap();
     let _ = read_frame(&mut stream);
-    stream.write_all(&end_txn_req(19, "tx-1", pid3, epoch3, true)).unwrap();
+    stream
+        .write_all(&end_txn_req(19, "tx-1", pid3, epoch3, true))
+        .unwrap();
     let _ = read_frame(&mut stream);
     stream.write_all(&fetch_req(20, "events", 0, 0)).unwrap();
     let got = fetch_values(&read_frame(&mut stream));
-    assert!(got.contains(&b"evt:legit".to_vec()), "the current-epoch record committed");
-    assert!(!got.contains(&b"evt:zombie".to_vec()), "the fenced stale-epoch record was NEVER committed");
+    assert!(
+        got.contains(&b"evt:legit".to_vec()),
+        "the current-epoch record committed"
+    );
+    assert!(
+        !got.contains(&b"evt:zombie".to_vec()),
+        "the fenced stale-epoch record was NEVER committed"
+    );
 
     let _ = std::fs::remove_file(&rail);
     let _ = std::fs::remove_dir_all(&data_dir);

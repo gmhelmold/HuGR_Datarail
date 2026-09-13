@@ -1,11 +1,11 @@
-# WP-01 — Estado Compacto (Fase 0 Completa)
+# WP-01 — Estado Compacto (Fase 1 em revisão)
 
-**Commit:** `5193649` (`main`, rebase`d em `v0.1.0` `3cc5bb9`)
+**Base:** `v0.1.0` (`3cc5bb9`); current worktree uncommitted
 **Data:** 2026-09-10
 **Status Fase 0:** ✅ COMPLETA
-**Status Fase 1-6:** ⬜ NÃO INICIADAS
-**Bug ReplayLog:** `#[ignore]` documentado (not gambiarra)
-**Release:** `v0.1.1` — bloqueado por replaylog bug real
+**Status Fase 1:** ⚠️ locking implementado; evidência independente e atomicidade crash pendentes
+**Bug ReplayLog:** contornado em `kafka_store`, teste de corrupção ativo
+**Release:** `v0.1.1` — bloqueado por gates de txn, rollback e benchmark
 
 ---
 
@@ -16,7 +16,7 @@
 | `datarail-terminal/src/lib.rs` | `reserve_seqs(partition_id, n)` + `HashMap<u64,u64>` | ✅ Feito |
 | `datarail-cli/src/main.rs` | Call site passa `partition_id = u64::try_from(partition)`; `KafkaBrokerStore` refatorado para `RwLock` per-partition (scaffold) | ✅ Feito |
 | `datarail-replaylog/src/lib.rs` | `fsync_dir` no `sync()` + 10ms sleep | ✅ Feito (não resolve seek bug) |
-| `datarail-cli/src/kafka_store.rs` | Debug prints adicionados para evidenciar bug | ✅ Limpo |
+| `datarail-cli/src/kafka_store.rs` | Leitura direta de segmento + CRC, contornando seek defeituoso | ✅ Teste ativo |
 
 ---
 
@@ -29,7 +29,7 @@
 
 ## Bug Real Documentado (Não Gambiarra)
 
-**`fetch_halts_loud_at_a_corrupt_record_and_never_renumbers` — `#[ignore]`**
+**`fetch_halts_loud_at_a_corrupt_record_and_never_renumbers`**
 
 Root cause: `ReplayLog::replay_from(start_offset=363)` com `segment_starts=[0]` não busca corretamente para posição 363 após frame corrupto no log. O replay lê do início (offset 0) ao invés do offset correto.
 
@@ -38,17 +38,21 @@ Evidência (`DEBUG` prints no replaylog):
 - `open_segment: seek_to=363` → seek calculado corretamente
 - Mas `read_sealed_from` retorna registros de `starts=[0, 344, 363]` no offset 2 (deveria só 1 registro — o 3º)
 
-Fix necessário: redesign do `ReplayLog::replay_from` seek logic após frame corrupto. Não é gambiarra — é bug real no storage-layer (`replaylog` crate) que precisa ser corrigido separadamente.
+Mitigação atual: `SealedPartitionLog::read_sealed_from` busca diretamente no segmento e valida CRC. O redesign de
+`ReplayLog::replay_from` continua separado; não alegamos que o crate foi corrigido.
 
 ---
 
 ## Próximos Passos (Fase 1-6)
 
-**Fase 1 (CT-1..CT-12):** `PartitionLockMap` + `PartitionState` + per-partition `RwLock` para `produce`, `fetch`, `bounds`, `buffer_txn`, `commit_txn`, `abort_txn`. Multi-partition `commit_txn` precisa lock ordering determinístico (sorted by `(topic, partition)`).
+**Fase 1:** `PartitionLockMap` + `PartitionState` implementados; abort, retry de commit, lazy-init, sequência por
+partição e fencing de epoch corrigidos; buffer não-lançado é restaurado após falha de commit. Stress de 10k ops passa.
+Atomicidade crash cross-partition ainda pendente.
 
-**Fase 2-6:** Testes de integração (`per_partition_scaling`), benchmark A/B, docs (`v0.1.1` tag), rollback (`DR-1` feature flag).
+**Próximos:** seguir backlog canônico em `docs/roadmap/ISSUES.md`; primeiro `TXN-01`, `DUR-01` e `STOR-01`.
 
-**Dependência bloqueante:** Fix do `replaylog` bug (`replay_from` seek) — sem isso, o `kafka_store` não pode garantir integridade de replay com frames corruptos no log.
+**Dependências bloqueantes:** protocolo txn durável, power-loss/seek evidence e WP1 release evidence. A leitura direta
+mitiga o caso de corrupção testado, mas não corrige API interna de `ReplayLog`.
 
 ---
 
@@ -56,16 +60,18 @@ Fix necessário: redesign do `ReplayLog::replay_from` seek logic após frame cor
 
 | Axioma | Status |
 |-------|--------|
-| A1 — Single Writer Per Partition | ⬜ Pendente (scaffold feito) |
-| A2 — Seq Uniqueness | ✅ MT-1 completo |
-| A3 — Txn Atomicity | ⬜ Pendente (CT-8) |
-| A4 — Offsets Isolation | ✅ F4 fix aplicado |
-| A5 — Zero Behavioral Regression | ⬜ Pendente (testes verdes, mas `fetch_halts_loud` ignorado) |
-| A6 — Positive Scaling Measured | ⬜ Pendente (TB-3) |
+| A1 — Single Writer Per Partition | ✅ Lock por partição; sequência reservada por partição |
+| A2 — Seq Uniqueness | ✅ Contiguous/non-overlapping per-partition ranges tested; namespaces intentionally independent |
+| A3 — Txn Atomicity | ⚠️ Retry + epoch + buffer restore testados; commit cross-partition não é crash-atômico |
+| A4 — Offsets Isolation | ✅ F4 fix applied (separate `OffsetsStore` lock) |
+| A5 — Zero Behavioral Regression | ✅ Testes + mutation probe + stress de 10k ops verdes |
+| A6 — Positive Scaling Measured | ⚠️ Local default samples 1.154x–1.684x; independent/CI/RSS evidence pending |
 
 **Gate Phase 0:** ✅ PASSADO (clippy + terminal tests + cli integration + checklist frozen)
 
+**Gate Phase 1:** ⬜ NÃO PASSADO (correções e evidência pendentes)
+
 ---
 
-**Commit:** `5193649`
-**Tag release bloqueado:** `v0.1.1` → precisa `replaylog` fix real antes.
+**Commit:** working tree (revisão em andamento)
+**Tag release:** `v0.1.1` bloqueado até gates passarem

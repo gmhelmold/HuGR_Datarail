@@ -32,7 +32,10 @@ fn durable_networked_broker_resumes_from_committed_offset_after_restart() {
         let mut c = Client::connect(addr).expect("connect1");
         for i in 0..N {
             let o = c
-                .produce(format!("k{}", i % 50).as_bytes(), format!("v{i}").as_bytes())
+                .produce(
+                    format!("k{}", i % 50).as_bytes(),
+                    format!("v{i}").as_bytes(),
+                )
                 .expect("produce");
             offsets.push(o);
         }
@@ -47,7 +50,11 @@ fn durable_networked_broker_resumes_from_committed_offset_after_restart() {
     // ---- Phase 2: "restart" — a brand-new broker over the SAME on-disk dirs. Durable state must have survived. ----
     let topic2 = Topic::open(&dt, 1 << 16).expect("reopen topic");
     let off2 = FileOffsets::open(&dof).expect("reopen offsets");
-    assert_eq!(off2.fetch("g"), Some(offsets[CONSUMED]), "committed offset did NOT survive the restart");
+    assert_eq!(
+        off2.fetch("g"),
+        Some(offsets[CONSUMED]),
+        "committed offset did NOT survive the restart"
+    );
 
     let addr2 = serve(Server::new(topic2, off2), "127.0.0.1:0").expect("serve2");
     let mut c2 = Client::connect(addr2).expect("connect2");
@@ -58,13 +65,25 @@ fn durable_networked_broker_resumes_from_committed_offset_after_restart() {
 
     // The group resumed EXACTLY at the committed offset and replayed only the un-consumed tail — nothing lost,
     // nothing re-delivered — over the network, after a restart.
-    assert_eq!(got.len(), usize::try_from(N).expect("fits") - CONSUMED, "did not resume the exact un-consumed tail");
+    assert_eq!(
+        got.len(),
+        usize::try_from(N).expect("fits") - CONSUMED,
+        "did not resume the exact un-consumed tail"
+    );
     // The returned offset is the post-record RESUME point; correctness is in the payloads (resumed at record
     // CONSUMED, not re-delivering CONSUMED-1, not skipping CONSUMED).
-    assert_eq!(got[0].2, format!("v{CONSUMED}").into_bytes(), "did not resume exactly at the committed record");
+    assert_eq!(
+        got[0].2,
+        format!("v{CONSUMED}").into_bytes(),
+        "did not resume exactly at the committed record"
+    );
     for (j, rec) in got.iter().enumerate() {
         let i = CONSUMED + j;
-        assert_eq!(rec.2, format!("v{i}").into_bytes(), "payload corrupted/lost across restart at record {i}");
+        assert_eq!(
+            rec.2,
+            format!("v{i}").into_bytes(),
+            "payload corrupted/lost across restart at record {i}"
+        );
     }
     let _ = std::fs::remove_dir_all(&dt);
     let _ = std::fs::remove_dir_all(&dof);
@@ -80,8 +99,15 @@ fn record_survives_losing_m_shards_on_a_remote_blob_store() {
 
     let addr = serve_blob(MemBlob::new()).expect("serve blob");
     let mut store = ErasureStore::new(NetBlob::new(addr), 4, 2).expect("erasure store"); // k=4, m=2 → survives 2 losses
-    let data: Vec<u8> = b"datarail-replicated-record-payload-".iter().copied().cycle().take(4096).collect();
-    store.put("rec1", &data).expect("put shards to the remote store");
+    let data: Vec<u8> = b"datarail-replicated-record-payload-"
+        .iter()
+        .copied()
+        .cycle()
+        .take(4096)
+        .collect();
+    store
+        .put("rec1", &data)
+        .expect("put shards to the remote store");
 
     // A second client destroys m=2 of the 6 shards on the REMOTE store (simulating two node/disk losses).
     let mut killer = NetBlob::new(addr);
@@ -89,8 +115,14 @@ fn record_survives_losing_m_shards_on_a_remote_blob_store() {
     assert!(killer.delete("rec1/3").expect("delete shard 3"));
 
     // Reconstruct over the network from the 4 surviving shards.
-    let got = store.get("rec1").expect("get").expect("must reconstruct after losing m shards");
-    assert_eq!(got, data, "remote erasure failed to reconstruct after losing m shards");
+    let got = store
+        .get("rec1")
+        .expect("get")
+        .expect("must reconstruct after losing m shards");
+    assert_eq!(
+        got, data,
+        "remote erasure failed to reconstruct after losing m shards"
+    );
 }
 
 /// Tiered storage, end to end: a log's HOT segment stays on local disk while all sealed history offloads to a
@@ -116,9 +148,17 @@ fn tiered_log_offloads_cold_history_to_a_remote_server_and_replays_over_the_netw
     log.sync().expect("sync");
 
     // Local disk holds only the hot segment; all sealed history is on the REMOTE server.
-    assert_eq!(log.local_segment_count().expect("count"), 1, "local disk must hold only the hot segment");
+    assert_eq!(
+        log.local_segment_count().expect("count"),
+        1,
+        "local disk must hold only the hot segment"
+    );
     let remote_cold = NetBlob::new(cold_addr).list("seg/").expect("list remote");
-    assert!(remote_cold.len() >= 5, "cold segments must live on the remote server (got {})", remote_cold.len());
+    assert!(
+        remote_cold.len() >= 5,
+        "cold segments must live on the remote server (got {})",
+        remote_cold.len()
+    );
 
     // Replay fetches every cold segment back over the network + the hot local one.
     let got = log.replay_from(0).expect("replay over the network");

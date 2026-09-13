@@ -135,7 +135,11 @@ fn fetch_values(resp: &[u8]) -> Vec<Vec<u8>> {
     let record_set = r.nullable_bytes().unwrap();
     match record_set {
         None => Vec::new(),
-        Some(blob) => parse_record_batch(&blob).expect("parse fetched batch").values,
+        Some(blob) => {
+            parse_record_batch(&blob)
+                .expect("parse fetched batch")
+                .values
+        }
     }
 }
 
@@ -181,10 +185,15 @@ fn spawn_broker(rail: &std::path::Path, data_dir: &std::path::Path) -> (Daemon, 
         if let Ok(s) = TcpStream::connect(("127.0.0.1", PORT)) {
             break s;
         }
-        assert!(Instant::now() < deadline, "kafka-broker never started listening");
+        assert!(
+            Instant::now() < deadline,
+            "kafka-broker never started listening"
+        );
         std::thread::sleep(Duration::from_millis(100));
     };
-    stream.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
     (daemon, stream)
 }
 
@@ -215,7 +224,13 @@ fn produce_then_fetch_round_trips_and_survives_a_broker_restart() {
         let (_daemon, mut stream) = spawn_broker(&rail, &data_dir);
 
         // PRODUCE 3 records (sealed + durably stored by the broker).
-        stream.write_all(&produce_req(1, "events", &[b"evt:m0", b"evt:m1", b"evt:m2"])).unwrap();
+        stream
+            .write_all(&produce_req(
+                1,
+                "events",
+                &[b"evt:m0", b"evt:m1", b"evt:m2"],
+            ))
+            .unwrap();
         let _ = read_frame(&mut stream);
 
         // FETCH from offset 0 → the original plaintext back (un-sealed at the edge).
@@ -231,7 +246,10 @@ fn produce_then_fetch_round_trips_and_survives_a_broker_restart() {
         // FETCH a suffix (offset 1) → m1, m2.
         stream.write_all(&fetch_req(3, "events", 1)).unwrap();
         let resp = read_frame(&mut stream);
-        assert_eq!(fetch_values(&resp), vec![b"evt:m1".to_vec(), b"evt:m2".to_vec()]);
+        assert_eq!(
+            fetch_values(&resp),
+            vec![b"evt:m1".to_vec(), b"evt:m2".to_vec()]
+        );
 
         // LISTOFFSETS latest → 3.
         stream.write_all(&list_offsets_req(4, "events")).unwrap();
@@ -244,7 +262,9 @@ fn produce_then_fetch_round_trips_and_survives_a_broker_restart() {
     let on_disk = read_all_under(&data_dir);
     assert!(!on_disk.is_empty(), "the durable log persisted to disk");
     assert!(
-        !contains(&on_disk, b"evt:m0") && !contains(&on_disk, b"evt:m1") && !contains(&on_disk, b"evt:m2"),
+        !contains(&on_disk, b"evt:m0")
+            && !contains(&on_disk, b"evt:m1")
+            && !contains(&on_disk, b"evt:m2"),
         "on-disk bytes are sealed ciphertext, never plaintext (provider-blind across restart)"
     );
 
@@ -254,7 +274,11 @@ fn produce_then_fetch_round_trips_and_survives_a_broker_restart() {
 
         stream.write_all(&list_offsets_req(5, "events")).unwrap();
         let resp = read_frame(&mut stream);
-        assert_eq!(list_offset_latest(&resp), 3, "all acked records recovered after a real broker restart");
+        assert_eq!(
+            list_offset_latest(&resp),
+            3,
+            "all acked records recovered after a real broker restart"
+        );
 
         stream.write_all(&fetch_req(6, "events", 0)).unwrap();
         let resp = read_frame(&mut stream);

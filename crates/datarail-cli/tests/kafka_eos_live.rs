@@ -23,11 +23,17 @@ fn pg_env(var: &str, default: &str) -> String {
 fn psql(sql: &str) -> std::process::Output {
     Command::new("psql")
         .args([
-            "-h", &pg_env("DATARAIL_PG_HOST", "127.0.0.1"),
-            "-p", &pg_env("DATARAIL_PG_PORT", "5432"),
-            "-U", &pg_env("DATARAIL_PG_USER", "postgres"),
-            "-d", &pg_env("DATARAIL_PG_DB", "postgres"),
-            "-tA", "-c", sql,
+            "-h",
+            &pg_env("DATARAIL_PG_HOST", "127.0.0.1"),
+            "-p",
+            &pg_env("DATARAIL_PG_PORT", "5432"),
+            "-U",
+            &pg_env("DATARAIL_PG_USER", "postgres"),
+            "-d",
+            &pg_env("DATARAIL_PG_DB", "postgres"),
+            "-tA",
+            "-c",
+            sql,
         ])
         .output()
         .expect("psql")
@@ -96,7 +102,13 @@ fn idempotent_batch(producer_id: i64, base_sequence: i32, values: &[&[u8]]) -> V
     full.into_bytes()
 }
 
-fn produce_req(correlation_id: i32, topic: &str, producer_id: i64, base_sequence: i32, values: &[&[u8]]) -> Vec<u8> {
+fn produce_req(
+    correlation_id: i32,
+    topic: &str,
+    producer_id: i64,
+    base_sequence: i32,
+    values: &[&[u8]],
+) -> Vec<u8> {
     let batch = idempotent_batch(producer_id, base_sequence, values);
     let mut w = req_header(0, 7, correlation_id);
     w.nullable_string(None);
@@ -191,22 +203,45 @@ fn idempotent_produce_retry_lands_exactly_once_through_the_kafka_ingest_binary()
             if let Ok(s) = TcpStream::connect(("127.0.0.1", PORT)) {
                 break s;
             }
-            assert!(Instant::now() < deadline, "kafka-ingest never started listening");
+            assert!(
+                Instant::now() < deadline,
+                "kafka-ingest never started listening"
+            );
             std::thread::sleep(Duration::from_millis(100));
         }
     };
-    stream.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
 
     // Handshake: InitProducerId → producer_id.
     stream.write_all(&init_producer_id_req(1)).unwrap();
     let resp = read_frame(&mut stream);
-    let pid = i64::from_be_bytes([resp[10], resp[11], resp[12], resp[13], resp[14], resp[15], resp[16], resp[17]]);
+    let pid = i64::from_be_bytes([
+        resp[10], resp[11], resp[12], resp[13], resp[14], resp[15], resp[16], resp[17],
+    ]);
     assert!(pid >= 0, "granted producer_id");
 
     // Produce an idempotent batch [0,3), then RETRY the identical batch (same pid+sequence).
-    stream.write_all(&produce_req(2, "events", pid, 0, &[b"evt:k0", b"evt:k1", b"evt:k2"])).unwrap();
+    stream
+        .write_all(&produce_req(
+            2,
+            "events",
+            pid,
+            0,
+            &[b"evt:k0", b"evt:k1", b"evt:k2"],
+        ))
+        .unwrap();
     let _ = read_frame(&mut stream);
-    stream.write_all(&produce_req(3, "events", pid, 0, &[b"evt:k0", b"evt:k1", b"evt:k2"])).unwrap();
+    stream
+        .write_all(&produce_req(
+            3,
+            "events",
+            pid,
+            0,
+            &[b"evt:k0", b"evt:k1", b"evt:k2"],
+        ))
+        .unwrap();
     let _ = read_frame(&mut stream);
 
     // Poll: exactly 3 rows must land despite the retry (the watermark in Postgres no-ops the second send).
@@ -219,22 +254,42 @@ fn idempotent_produce_retry_lands_exactly_once_through_the_kafka_ingest_binary()
         }
         std::thread::sleep(Duration::from_millis(200));
     }
-    assert_eq!(rows, "3", "idempotent retry must land exactly once (3 rows), not 6");
+    assert_eq!(
+        rows, "3",
+        "idempotent retry must land exactly once (3 rows), not 6"
+    );
 
     // ---- audit A/E: ack-after-durable — a sink failure must NOT be a false NONE ack, and the daemon must survive.
     // Drop the data table out from under the ingest: the next produce's land fails inside commit_at_seq.
     let _ = psql(&format!("DROP TABLE {TABLE}"));
-    stream.write_all(&produce_req(4, "events", pid, 3, &[b"evt:k3", b"evt:k4"])).unwrap();
+    stream
+        .write_all(&produce_req(4, "events", pid, 3, &[b"evt:k3", b"evt:k4"]))
+        .unwrap();
     let resp = read_frame(&mut stream);
     let code = produce_error_code(&resp, "events".len());
-    assert_ne!(code, 0, "a failed durable land must return a retriable error, never a false NONE ack (audit A)");
+    assert_ne!(
+        code, 0,
+        "a failed durable land must return a retriable error, never a false NONE ack (audit A)"
+    );
 
     // The daemon must still be serving (audit E: one sink failure must not tear down ingest). Recreate the table
     // and produce a fresh range — it must succeed (error_code 0) and land, proving the loop survived.
     let _ = psql(&format!("CREATE TABLE {TABLE} (data text)"));
-    stream.write_all(&produce_req(5, "events", pid, 10, &[b"evt:k10", b"evt:k11"])).unwrap();
+    stream
+        .write_all(&produce_req(
+            5,
+            "events",
+            pid,
+            10,
+            &[b"evt:k10", b"evt:k11"],
+        ))
+        .unwrap();
     let resp2 = read_frame(&mut stream);
-    assert_eq!(produce_error_code(&resp2, "events".len()), 0, "the daemon must keep serving after a sink error (audit E)");
+    assert_eq!(
+        produce_error_code(&resp2, "events".len()),
+        0,
+        "the daemon must keep serving after a sink error (audit E)"
+    );
     let deadline = Instant::now() + Duration::from_secs(10);
     let mut after = String::new();
     while Instant::now() < deadline {
@@ -244,7 +299,10 @@ fn idempotent_produce_retry_lands_exactly_once_through_the_kafka_ingest_binary()
         }
         std::thread::sleep(Duration::from_millis(200));
     }
-    assert_eq!(after, "2", "after recovery the daemon lands the new batch (2 rows in the recreated table)");
+    assert_eq!(
+        after, "2",
+        "after recovery the daemon lands the new batch (2 rows in the recreated table)"
+    );
 
     let _ = std::fs::remove_file(&rail);
 }

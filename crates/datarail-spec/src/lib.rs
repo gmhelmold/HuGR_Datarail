@@ -118,11 +118,7 @@ impl core::fmt::Display for SpecError {
             Self::Syntax { line, msg } => write!(f, "line {line}: {msg}"),
             Self::Duplicate { line, key } => write!(f, "line {line}: duplicate key `{key}`"),
             Self::Missing { section, key } => write!(f, "missing key `{key}` in [{section}]"),
-            Self::BadType {
-                section,
-                key,
-                want,
-            } => write!(f, "[{section}].{key} must be a {want}"),
+            Self::BadType { section, key, want } => write!(f, "[{section}].{key} must be a {want}"),
             Self::BadHexLen { key, want, got } => {
                 write!(f, "`{key}` must be {want} bytes of hex, got {got}")
             }
@@ -226,12 +222,20 @@ fn from_hex(s: &str) -> Option<Vec<u8>> {
 // Typed extraction helpers.
 // ----------------------------------------------------------------------------------------------------------
 
-fn get<'a>(map: &'a RawMap, section: &'static str, key: &'static str) -> Result<&'a Value, SpecError> {
+fn get<'a>(
+    map: &'a RawMap,
+    section: &'static str,
+    key: &'static str,
+) -> Result<&'a Value, SpecError> {
     map.get(&(section.to_owned(), key.to_owned()))
         .ok_or(SpecError::Missing { section, key })
 }
 
-fn get_str<'a>(map: &'a RawMap, section: &'static str, key: &'static str) -> Result<&'a str, SpecError> {
+fn get_str<'a>(
+    map: &'a RawMap,
+    section: &'static str,
+    key: &'static str,
+) -> Result<&'a str, SpecError> {
     match get(map, section, key)? {
         Value::Str(s) => Ok(s),
         _ => Err(SpecError::BadType {
@@ -262,15 +266,17 @@ fn get_bytes<const N: usize>(
     let hex = s.strip_prefix("0x").unwrap_or(s);
     let bytes = from_hex(hex).ok_or(SpecError::BadHex { key })?;
     let got = bytes.len();
-    bytes.try_into().map_err(|_| SpecError::BadHexLen {
-        key,
-        want: N,
-        got,
-    })
+    bytes
+        .try_into()
+        .map_err(|_| SpecError::BadHexLen { key, want: N, got })
 }
 
 /// Bytes for a content prefix: a plain `"string"` becomes its UTF-8 bytes; a `"0x…"` value is decoded as hex.
-fn get_prefix(map: &RawMap, section: &'static str, key: &'static str) -> Result<Vec<u8>, SpecError> {
+fn get_prefix(
+    map: &RawMap,
+    section: &'static str,
+    key: &'static str,
+) -> Result<Vec<u8>, SpecError> {
     let s = get_str(map, section, key)?;
     if let Some(hex) = s.strip_prefix("0x") {
         from_hex(hex).ok_or(SpecError::BadHex { key })
@@ -338,12 +344,13 @@ pub struct RailSpec {
 
 fn contract_spec(map: &RawMap, section: &'static str) -> Result<ContractSpec, SpecError> {
     let raw = get_int(map, section, "max_record_len")?;
-    let max_record_len = usize::try_from(raw)
-        .ok()
-        .filter(|&n| n > 0)
-        .ok_or(SpecError::OutOfRange {
-            key: "max_record_len",
-        })?;
+    let max_record_len =
+        usize::try_from(raw)
+            .ok()
+            .filter(|&n| n > 0)
+            .ok_or(SpecError::OutOfRange {
+                key: "max_record_len",
+            })?;
     Ok(ContractSpec {
         max_record_len,
         required_prefix: get_prefix(map, section, "required_prefix")?,
@@ -481,9 +488,15 @@ mod tests {
 
     #[test]
     fn hex_prefix_for_required_prefix_is_decoded() {
-        let src = sample().replace("required_prefix = \"evt:\"", "required_prefix = \"0xdeadbeef\"");
+        let src = sample().replace(
+            "required_prefix = \"evt:\"",
+            "required_prefix = \"0xdeadbeef\"",
+        );
         let spec = RailSpec::parse(&src).expect("valid");
-        assert_eq!(spec.onboarding.required_prefix, vec![0xde, 0xad, 0xbe, 0xef]);
+        assert_eq!(
+            spec.onboarding.required_prefix,
+            vec![0xde, 0xad, 0xbe, 0xef]
+        );
     }
 
     #[test]
@@ -553,7 +566,10 @@ mod tests {
             "guarantee = \"exactly-once\"\n",
             "guarantee = \"exactly-once\"\nguarantee = \"at-least-once\"\n",
         );
-        assert!(matches!(RailSpec::parse(&src), Err(SpecError::Duplicate { .. })));
+        assert!(matches!(
+            RailSpec::parse(&src),
+            Err(SpecError::Duplicate { .. })
+        ));
     }
 
     #[test]

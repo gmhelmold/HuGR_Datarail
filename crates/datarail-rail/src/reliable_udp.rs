@@ -120,7 +120,10 @@ impl fmt::Display for FaspError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Io(e) => write!(f, "fasp io: {e}"),
-            Self::TooLarge(n) => write!(f, "fasp message {n} bytes exceeds the {MAX_FASP_PAYLOAD}-byte limit"),
+            Self::TooLarge(n) => write!(
+                f,
+                "fasp message {n} bytes exceeds the {MAX_FASP_PAYLOAD}-byte limit"
+            ),
         }
     }
 }
@@ -199,7 +202,12 @@ impl FaspLink {
     pub fn bind(local: SocketAddr, cfg: FaspCfg) -> Result<Self, FaspError> {
         let sock = UdpSocket::bind(local)?;
         sock.set_nonblocking(true)?;
-        let cc = DelayController::new(cfg.init_window, cfg.min_window, cfg.max_window, cfg.queue_threshold);
+        let cc = DelayController::new(
+            cfg.init_window,
+            cfg.min_window,
+            cfg.max_window,
+            cfg.queue_threshold,
+        );
         Ok(Self {
             sock,
             peer: None,
@@ -234,8 +242,12 @@ impl FaspLink {
     }
 
     fn peer(&self) -> Result<SocketAddr, FaspError> {
-        self.peer
-            .ok_or_else(|| FaspError::Io(std::io::Error::new(std::io::ErrorKind::NotConnected, "fasp peer unset")))
+        self.peer.ok_or_else(|| {
+            FaspError::Io(std::io::Error::new(
+                std::io::ErrorKind::NotConnected,
+                "fasp peer unset",
+            ))
+        })
     }
 
     /// Put one datagram on the wire, honoring the test/bench loss simulator: every Nth send is silently
@@ -291,7 +303,15 @@ impl FaspLink {
         let frame = encode_frame(seq, KIND_DATA, payload);
         self.wire_send(&frame, peer)?;
         let now = Instant::now();
-        self.inflight.insert(seq, InFlight { frame, sent_at: now, last_tx: now, retransmitted: false });
+        self.inflight.insert(
+            seq,
+            InFlight {
+                frame,
+                sent_at: now,
+                last_tx: now,
+                retransmitted: false,
+            },
+        );
         self.sent += 1;
         Ok(())
     }
@@ -537,13 +557,16 @@ mod s4_gates {
 
     #[test]
     fn f1_reorder_buffer_is_bounded_by_recv_window_under_hostile_gap_seqs() {
-        let cfg = FaspCfg { recv_window: 256, ..FaspCfg::default() };
+        let cfg = FaspCfg {
+            recv_window: 256,
+            ..FaspCfg::default()
+        };
         let mut b = FaspLink::bind(loopback(), cfg).expect("bind b");
         let b_addr = b.local_addr().expect("b addr");
         let attacker = UdpSocket::bind(loopback()).expect("attacker bind");
         b.set_peer(attacker.local_addr().expect("atk addr")); // pass the F4 source-check; isolate F1
-        // Flood seqs 1..10000 but never seq 0 → a permanent gap → all want to sit in `reorder`. Pre-fix this
-        // grew unbounded (OOM); post-fix only [base, base+recv_window) is accepted.
+                                                              // Flood seqs 1..10000 but never seq 0 → a permanent gap → all want to sit in `reorder`. Pre-fix this
+                                                              // grew unbounded (OOM); post-fix only [base, base+recv_window) is accepted.
         for seq in 1u64..10_000 {
             let f = encode_frame(seq, KIND_DATA, &[7, 7, 7]);
             attacker.send_to(&f, b_addr).expect("atk send");
@@ -572,7 +595,10 @@ mod s4_gates {
             b.pump().expect("pump");
         }
         assert_eq!(b.buffered_len(), 0, "off-peer forged DATA was accepted");
-        assert!(b.recv().expect("recv").is_none(), "off-peer forged DATA was delivered");
+        assert!(
+            b.recv().expect("recv").is_none(),
+            "off-peer forged DATA was delivered"
+        );
     }
 
     #[test]
@@ -595,7 +621,9 @@ mod s4_gates {
             }
         }
         match err {
-            Some(FaspError::Io(e)) => assert_eq!(e.kind(), std::io::ErrorKind::TimedOut, "wrong error kind"),
+            Some(FaspError::Io(e)) => {
+                assert_eq!(e.kind(), std::io::ErrorKind::TimedOut, "wrong error kind")
+            }
             other => panic!("send did not time out; got {other:?}"),
         }
     }

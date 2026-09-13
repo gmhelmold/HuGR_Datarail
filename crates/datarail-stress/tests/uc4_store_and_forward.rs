@@ -15,8 +15,8 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use datarail_core::{Cofre, Disposition, Substrate};
-use datarail_substrate_objectstore::ObjectStoreSubstrate;
 use datarail_stress::{conforming_record, record_key, Rig, Tally};
+use datarail_substrate_objectstore::ObjectStoreSubstrate;
 
 static UNIQ: AtomicU64 = AtomicU64::new(0);
 
@@ -58,21 +58,38 @@ fn uc4_offline_backlog_drains_once_then_replay_is_all_duplicate() {
         let mut dst_store = ObjectStoreSubstrate::open(&dir).expect("reopen as dest");
         let mut drained = 0usize;
         while drained < N {
-            let c = dst_store.recv().expect("GET from backlog").expect("a backlogged object");
+            let c = dst_store
+                .recv()
+                .expect("GET from backlog")
+                .expect("a backlogged object");
             let disp = rig.dest.offload(&c).expect("offload");
             tally.observe(disp);
-            assert_eq!(disp, Disposition::Delivered, "every backlogged record delivers exactly once");
+            assert_eq!(
+                disp,
+                Disposition::Delivered,
+                "every backlogged record delivers exactly once"
+            );
             dst_store.ack(c.etiqueta.cofre_id).expect("ack + GC");
             drained += 1;
         }
-        assert!(dst_store.recv().expect("drain").is_none(), "bucket fully drained + GC'd after the backlog");
+        assert!(
+            dst_store.recv().expect("drain").is_none(),
+            "bucket fully drained + GC'd after the backlog"
+        );
     }
 
     let after_drain = rig.dest.sink().len();
-    assert_eq!(after_drain, N, "0-loss: the entire offline backlog was delivered");
+    assert_eq!(
+        after_drain, N,
+        "0-loss: the entire offline backlog was delivered"
+    );
     let committed_snapshot: Vec<Vec<u8>> = rig.dest.sink().committed().to_vec();
     for (i, rec) in committed_snapshot.iter().enumerate() {
-        assert_eq!(rec.as_slice(), conforming_record(i).as_slice(), "backlog record {i} out of order");
+        assert_eq!(
+            rec.as_slice(),
+            conforming_record(i).as_slice(),
+            "backlog record {i} out of order"
+        );
     }
 
     // --- Phase 3: the source RE-SHIPS the identical range (at-least-once after a crash); a fresh dest drains
@@ -87,21 +104,44 @@ fn uc4_offline_backlog_drains_once_then_replay_is_all_duplicate() {
         let mut dst_again = ObjectStoreSubstrate::open(&dir).expect("reopen dest for replay");
         let mut replayed = 0usize;
         while replayed < N {
-            let c = dst_again.recv().expect("GET replay").expect("a replayed object");
+            let c = dst_again
+                .recv()
+                .expect("GET replay")
+                .expect("a replayed object");
             let disp = rig.dest.offload(&c).expect("offload replay");
             tally.observe(disp);
-            assert_eq!(disp, Disposition::Duplicate, "a replayed already-committed record must dedup");
+            assert_eq!(
+                disp,
+                Disposition::Duplicate,
+                "a replayed already-committed record must dedup"
+            );
             dst_again.ack(c.etiqueta.cofre_id).expect("ack + GC");
             replayed += 1;
         }
     }
 
     // 0-dup at the sink: the full replay committed nothing new.
-    assert_eq!(rig.dest.sink().len(), after_drain, "replay re-committed records (0-dup violation)");
-    assert!(rig.dest.dead_letters().is_empty(), "all cofres authentic — nothing dead-lettered (0-leak)");
-    assert_eq!(tally.delivered, N as u64, "exactly N first-time deliveries (the backlog)");
-    assert_eq!(tally.duplicate, N as u64, "exactly N duplicates (the replay)");
+    assert_eq!(
+        rig.dest.sink().len(),
+        after_drain,
+        "replay re-committed records (0-dup violation)"
+    );
+    assert!(
+        rig.dest.dead_letters().is_empty(),
+        "all cofres authentic — nothing dead-lettered (0-leak)"
+    );
+    assert_eq!(
+        tally.delivered, N as u64,
+        "exactly N first-time deliveries (the backlog)"
+    );
+    assert_eq!(
+        tally.duplicate, N as u64,
+        "exactly N duplicates (the replay)"
+    );
     assert_eq!(tally.lost, 0);
-    println!("{} (backlog=N={N}, replay=N={N})", tally.report("uc4 store-and-forward"));
+    println!(
+        "{} (backlog=N={N}, replay=N={N})",
+        tally.report("uc4 store-and-forward")
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }

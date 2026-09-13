@@ -46,7 +46,11 @@ pub struct WalConfig {
 
 impl Default for WalConfig {
     fn default() -> Self {
-        Self { flush_bytes: 1 << 20, flush_micros: 1000, segment_bytes: 256 << 20 }
+        Self {
+            flush_bytes: 1 << 20,
+            flush_micros: 1000,
+            segment_bytes: 256 << 20,
+        }
     }
 }
 
@@ -87,7 +91,11 @@ const CRC32_TABLE: [u32; 256] = {
         let mut c = i;
         let mut k = 0;
         while k < 8 {
-            c = if c & 1 != 0 { 0xEDB8_8320 ^ (c >> 1) } else { c >> 1 };
+            c = if c & 1 != 0 {
+                0xEDB8_8320 ^ (c >> 1)
+            } else {
+                c >> 1
+            };
             k += 1;
         }
         table[i as usize] = c;
@@ -151,10 +159,14 @@ impl DurableLog {
         let (_read_id, _read_off, ack_id, ack_off) = load_cursor(&dir);
         let active_id = highest_segment(&dir)?.unwrap_or(1);
         let path = seg_path(&dir, active_id);
-        let mut active =
-            OpenOptions::new().create(true).read(true).write(true).truncate(false).open(&path)?;
+        let mut active = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(&path)?;
         fsync_dir(&dir)?; // the active segment's dir-entry must be durable
-        // Recovery: scan the active segment, truncate any torn tail to the last intact frame.
+                          // Recovery: scan the active segment, truncate any torn tail to the last intact frame.
         let write_off = recover_segment_end(&mut active)?;
         active.set_len(write_off)?;
         active.seek(SeekFrom::Start(write_off))?;
@@ -232,7 +244,12 @@ impl DurableLog {
     fn rotate(&mut self) -> Result<(), WalError> {
         self.active_id += 1;
         let path = seg_path(&self.dir, self.active_id);
-        let active = OpenOptions::new().create(true).read(true).write(true).truncate(true).open(&path)?;
+        let active = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(true)
+            .open(&path)?;
         fsync_dir(&self.dir)?;
         self.active = active;
         self.write_off = 0;
@@ -245,7 +262,11 @@ impl DurableLog {
     fn checkpoint(&mut self) -> Result<(), WalError> {
         let ack_floor = self.ack_floor();
         let tmp = self.dir.join("cursor.tmp");
-        let mut f = OpenOptions::new().create(true).write(true).truncate(true).open(&tmp)?;
+        let mut f = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&tmp)?;
         let mut rec = Vec::with_capacity(32);
         rec.extend_from_slice(&self.read_id.to_be_bytes());
         rec.extend_from_slice(&self.read_off.to_be_bytes());
@@ -262,7 +283,12 @@ impl DurableLog {
     fn ack_floor(&self) -> (u64, u64) {
         // Conservative: the oldest segment that still has an in-flight (un-acked) cofre bounds GC; if none,
         // the read cursor is the floor (all delivered are acked).
-        let oldest = self.seg_inflight.iter().filter(|(_, &n)| n > 0).map(|(&s, _)| s).min();
+        let oldest = self
+            .seg_inflight
+            .iter()
+            .filter(|(_, &n)| n > 0)
+            .map(|(&s, _)| s)
+            .min();
         oldest.map_or((self.read_id, self.read_off), |s| (s, 0))
     }
 
@@ -293,7 +319,10 @@ impl Substrate for DurableLog {
     fn recv(&mut self) -> Result<Option<Cofre>, WalError> {
         loop {
             // Make sure anything buffered is durable before it can be read (read-your-writes within a process).
-            if self.read_id == self.active_id && self.read_off >= self.write_off && !self.buf.is_empty() {
+            if self.read_id == self.active_id
+                && self.read_off >= self.write_off
+                && !self.buf.is_empty()
+            {
                 self.flush()?;
             }
             if !self.ensure_read_file()? {
@@ -307,10 +336,14 @@ impl Substrate for DurableLog {
                 }
                 return Ok(None);
             }
-            let frame = read_frame(self.read_file.as_mut().expect("read_file set above"), self.read_id == self.active_id)?;
+            let frame = read_frame(
+                self.read_file.as_mut().expect("read_file set above"),
+                self.read_id == self.active_id,
+            )?;
             match frame {
                 FrameRead::Cofre { bytes, advance } => {
-                    let cofre = datarail_cofre::decode(&bytes).map_err(|e| WalError::Codec(e.to_string()))?;
+                    let cofre = datarail_cofre::decode(&bytes)
+                        .map_err(|e| WalError::Codec(e.to_string()))?;
                     self.read_off += advance;
                     let id = cofre.etiqueta.cofre_id;
                     self.inflight.insert(id, self.read_id);

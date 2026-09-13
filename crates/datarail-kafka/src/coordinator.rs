@@ -77,13 +77,18 @@ impl Group {
     /// or removes the leader mid-flight, reflect it. Returns true if anything was removed.
     fn expire_stale(&mut self, now: Instant) -> bool {
         let before = self.members.len();
-        self.members.retain(|_, m| now.duration_since(m.last_heartbeat) < m.session_timeout);
+        self.members
+            .retain(|_, m| now.duration_since(m.last_heartbeat) < m.session_timeout);
         let removed = self.members.len() != before;
         if removed {
             if self.members.is_empty() {
                 self.state = GroupState::Empty;
                 self.leader = None;
-            } else if self.leader.as_ref().is_some_and(|l| !self.members.contains_key(l)) {
+            } else if self
+                .leader
+                .as_ref()
+                .is_some_and(|l| !self.members.contains_key(l))
+            {
                 self.leader = self.members.keys().next().cloned();
             }
         }
@@ -95,7 +100,11 @@ impl Group {
     fn select_protocol(&self) -> Option<String> {
         let first = self.members.values().next()?;
         for name in &first.protocols {
-            if self.members.values().all(|m| m.protocols.iter().any(|p| p == name)) {
+            if self
+                .members
+                .values()
+                .all(|m| m.protocols.iter().any(|p| p == name))
+            {
                 return Some(name.clone());
             }
         }
@@ -142,7 +151,12 @@ impl GroupCoordinator {
     /// A coordinator with explicit timings.
     #[must_use]
     pub fn new(rebalance_delay: Duration, sync_timeout: Duration) -> Self {
-        Self { groups: Mutex::new(HashMap::new()), cond: Condvar::new(), rebalance_delay, sync_timeout }
+        Self {
+            groups: Mutex::new(HashMap::new()),
+            cond: Condvar::new(),
+            rebalance_delay,
+            sync_timeout,
+        }
     }
 
     /// A coordinator with Kafka-like defaults (3 s initial rebalance delay, 30 s sync wait).
@@ -179,9 +193,16 @@ impl GroupCoordinator {
             } else {
                 member_id.to_owned()
             };
-            let session = Duration::from_millis(u64::try_from(session_timeout_ms).unwrap_or(30_000).clamp(1, 3_600_000));
-            let rebalance =
-                Duration::from_millis(u64::try_from(rebalance_timeout_ms).unwrap_or(30_000).clamp(1, 3_600_000));
+            let session = Duration::from_millis(
+                u64::try_from(session_timeout_ms)
+                    .unwrap_or(30_000)
+                    .clamp(1, 3_600_000),
+            );
+            let rebalance = Duration::from_millis(
+                u64::try_from(rebalance_timeout_ms)
+                    .unwrap_or(30_000)
+                    .clamp(1, 3_600_000),
+            );
             let (proto_names, subscription) = split_protocols(protocols);
             g.members.insert(
                 mid.clone(),
@@ -231,7 +252,9 @@ impl GroupCoordinator {
                             g.protocol = g.select_protocol();
                             (true, Duration::ZERO)
                         } else {
-                            let wait = g.deadline.map_or(delay, |dl| dl.saturating_duration_since(now));
+                            let wait = g
+                                .deadline
+                                .map_or(delay, |dl| dl.saturating_duration_since(now));
                             (false, wait)
                         }
                     }
@@ -241,7 +264,11 @@ impl GroupCoordinator {
                 self.cond.notify_all();
                 break;
             }
-            guard = self.cond.wait_timeout(guard, wait).unwrap_or_else(PoisonError::into_inner).0;
+            guard = self
+                .cond
+                .wait_timeout(guard, wait)
+                .unwrap_or_else(PoisonError::into_inner)
+                .0;
         }
 
         let Some(g) = guard.get(group) else {
@@ -249,7 +276,10 @@ impl GroupCoordinator {
         };
         let is_leader = g.leader.as_deref() == Some(mid.as_str());
         let members = if is_leader {
-            g.members.iter().map(|(id, m)| (id.clone(), m.subscription.clone())).collect()
+            g.members
+                .iter()
+                .map(|(id, m)| (id.clone(), m.subscription.clone()))
+                .collect()
         } else {
             Vec::new()
         };
@@ -275,13 +305,22 @@ impl GroupCoordinator {
         let mut guard = self.lock();
         let park_for = {
             let Some(g) = guard.get_mut(group) else {
-                return SyncOutcome { error_code: UNKNOWN_MEMBER_ID, assignment: Vec::new() };
+                return SyncOutcome {
+                    error_code: UNKNOWN_MEMBER_ID,
+                    assignment: Vec::new(),
+                };
             };
             if !g.members.contains_key(member_id) {
-                return SyncOutcome { error_code: UNKNOWN_MEMBER_ID, assignment: Vec::new() };
+                return SyncOutcome {
+                    error_code: UNKNOWN_MEMBER_ID,
+                    assignment: Vec::new(),
+                };
             }
             if g.generation != generation {
-                return SyncOutcome { error_code: ILLEGAL_GENERATION, assignment: Vec::new() };
+                return SyncOutcome {
+                    error_code: ILLEGAL_GENERATION,
+                    assignment: Vec::new(),
+                };
             }
             // ONLY the leader's assignments are authoritative (audit 4b MEDIUM): a non-leader's `SyncGroup` must
             // not be able to drive the group to Stable or inject assignment bytes for other members. A follower's
@@ -299,7 +338,9 @@ impl GroupCoordinator {
             // Park bound = this member's OWN advertised rebalance timeout (already clamped to ≤1h at join), so a
             // client that declared a long patience for a slow leader is honored and they time out together — not
             // a fixed coordinator timeout that could give up early (audit 4b LOW).
-            g.members.get(member_id).map_or(self.sync_timeout, |m| m.rebalance_timeout)
+            g.members
+                .get(member_id)
+                .map_or(self.sync_timeout, |m| m.rebalance_timeout)
         };
 
         let deadline = Instant::now() + park_for;
@@ -307,28 +348,46 @@ impl GroupCoordinator {
             let now = Instant::now();
             let outcome = {
                 let Some(g) = guard.get(group) else {
-                    return SyncOutcome { error_code: UNKNOWN_MEMBER_ID, assignment: Vec::new() };
+                    return SyncOutcome {
+                        error_code: UNKNOWN_MEMBER_ID,
+                        assignment: Vec::new(),
+                    };
                 };
                 if g.generation != generation {
-                    Some(SyncOutcome { error_code: REBALANCE_IN_PROGRESS, assignment: Vec::new() })
+                    Some(SyncOutcome {
+                        error_code: REBALANCE_IN_PROGRESS,
+                        assignment: Vec::new(),
+                    })
                 } else if let Some(m) = g.members.get(member_id) {
                     if let Some(a) = &m.assignment {
-                        Some(SyncOutcome { error_code: NONE, assignment: a.clone() })
+                        Some(SyncOutcome {
+                            error_code: NONE,
+                            assignment: a.clone(),
+                        })
                     } else if g.state == GroupState::Stable {
                         // Stable but the leader assigned us nothing → empty assignment.
-                        Some(SyncOutcome { error_code: NONE, assignment: Vec::new() })
+                        Some(SyncOutcome {
+                            error_code: NONE,
+                            assignment: Vec::new(),
+                        })
                     } else {
                         None
                     }
                 } else {
-                    Some(SyncOutcome { error_code: UNKNOWN_MEMBER_ID, assignment: Vec::new() })
+                    Some(SyncOutcome {
+                        error_code: UNKNOWN_MEMBER_ID,
+                        assignment: Vec::new(),
+                    })
                 }
             };
             if let Some(o) = outcome {
                 return o;
             }
             if now >= deadline {
-                return SyncOutcome { error_code: REBALANCE_IN_PROGRESS, assignment: Vec::new() };
+                return SyncOutcome {
+                    error_code: REBALANCE_IN_PROGRESS,
+                    assignment: Vec::new(),
+                };
             }
             guard = self
                 .cond
@@ -356,7 +415,9 @@ impl GroupCoordinator {
         }
         match g.state {
             GroupState::Stable => NONE,
-            GroupState::PreparingRebalance | GroupState::CompletingRebalance => REBALANCE_IN_PROGRESS,
+            GroupState::PreparingRebalance | GroupState::CompletingRebalance => {
+                REBALANCE_IN_PROGRESS
+            }
             GroupState::Empty => UNKNOWN_MEMBER_ID,
         }
     }
@@ -395,7 +456,10 @@ impl GroupCoordinator {
 /// chosen subscription metadata (the first protocol's — what the leader needs). Empty if none.
 fn split_protocols(protocols: &[(String, Vec<u8>)]) -> (Vec<String>, Vec<u8>) {
     let names = protocols.iter().map(|(n, _)| n.clone()).collect();
-    let subscription = protocols.first().map(|(_, m)| m.clone()).unwrap_or_default();
+    let subscription = protocols
+        .first()
+        .map(|(_, m)| m.clone())
+        .unwrap_or_default();
     (names, subscription)
 }
 
@@ -434,7 +498,12 @@ mod tests {
         assert_eq!(j.members.len(), 1, "leader sees the full member list");
         assert_eq!(j.protocol, "range");
         // Leader assigns itself.
-        let s = c.sync("g", &j.member_id, j.generation, &[(j.member_id.clone(), b"assign-0".to_vec())]);
+        let s = c.sync(
+            "g",
+            &j.member_id,
+            j.generation,
+            &[(j.member_id.clone(), b"assign-0".to_vec())],
+        );
         assert_eq!(s.error_code, NONE);
         assert_eq!(s.assignment, b"assign-0");
         // Heartbeat at the live generation → NONE (stable).
@@ -452,10 +521,17 @@ mod tests {
         std::thread::sleep(Duration::from_millis(20));
         let a = c.join("g", "", 30_000, 30_000, "consumer", &proto());
         let b = h.join().expect("thread");
-        assert_eq!(a.generation, b.generation, "both joiners share one generation");
+        assert_eq!(
+            a.generation, b.generation,
+            "both joiners share one generation"
+        );
         assert_eq!(a.leader, b.leader, "agree on the leader");
         // Exactly one is the leader and sees both members.
-        let (leader, follower) = if a.member_id == a.leader { (a, b) } else { (b, a) };
+        let (leader, follower) = if a.member_id == a.leader {
+            (a, b)
+        } else {
+            (b, a)
+        };
         assert_eq!(leader.members.len(), 2, "leader sees both members");
         assert!(follower.members.is_empty(), "follower gets no member list");
         // Leader assigns disjoint work to both; follower's SyncGroup (empty) parks until then.
@@ -469,11 +545,17 @@ mod tests {
             "g",
             &lid,
             gen,
-            &[(lid.clone(), b"L".to_vec()), (follower.member_id.clone(), b"F".to_vec())],
+            &[
+                (lid.clone(), b"L".to_vec()),
+                (follower.member_id.clone(), b"F".to_vec()),
+            ],
         );
         let fs = fh.join().expect("thread");
         assert_eq!(ls.assignment, b"L");
-        assert_eq!(fs.assignment, b"F", "follower received the leader's assignment after parking");
+        assert_eq!(
+            fs.assignment, b"F",
+            "follower received the leader's assignment after parking"
+        );
     }
 
     #[test]
@@ -487,23 +569,48 @@ mod tests {
         let a = c.join("g", "", 30_000, 30_000, "consumer", &proto());
         let b = h.join().expect("thread");
         let gen = a.generation;
-        let (leader_id, follower_id) =
-            if a.member_id == a.leader { (a.member_id, b.member_id) } else { (b.member_id, a.member_id) };
+        let (leader_id, follower_id) = if a.member_id == a.leader {
+            (a.member_id, b.member_id)
+        } else {
+            (b.member_id, a.member_id)
+        };
 
         // The follower tries to inject assignments for everyone — these must be ignored, so it parks for the
         // leader's real sync (run in a thread).
         let cc = Arc::clone(&c);
         let (fid, lid) = (follower_id.clone(), leader_id.clone());
         let fh = std::thread::spawn(move || {
-            cc.sync("g", &fid, gen, &[(fid.clone(), b"INJECTED-F".to_vec()), (lid, b"INJECTED-L".to_vec())])
+            cc.sync(
+                "g",
+                &fid,
+                gen,
+                &[
+                    (fid.clone(), b"INJECTED-F".to_vec()),
+                    (lid, b"INJECTED-L".to_vec()),
+                ],
+            )
         });
         std::thread::sleep(Duration::from_millis(40));
         // The leader's legit sync is authoritative.
-        let ls = c.sync("g", &leader_id, gen, &[(leader_id.clone(), b"L".to_vec()), (follower_id.clone(), b"F".to_vec())]);
+        let ls = c.sync(
+            "g",
+            &leader_id,
+            gen,
+            &[
+                (leader_id.clone(), b"L".to_vec()),
+                (follower_id.clone(), b"F".to_vec()),
+            ],
+        );
         let fs = fh.join().expect("thread");
         assert_eq!(ls.assignment, b"L", "leader gets its own assignment");
-        assert_eq!(fs.assignment, b"F", "follower gets the LEADER's assignment, not its injected bytes");
-        assert_ne!(fs.assignment, b"INJECTED-F", "the follower's self-injected assignment was rejected");
+        assert_eq!(
+            fs.assignment, b"F",
+            "follower gets the LEADER's assignment, not its injected bytes"
+        );
+        assert_ne!(
+            fs.assignment, b"INJECTED-F",
+            "the follower's self-injected assignment was rejected"
+        );
     }
 
     #[test]
@@ -519,12 +626,28 @@ mod tests {
         assert_eq!(a.generation, b.generation);
         // Stabilize: the leader assigns both.
         let leader = a.leader.clone();
-        c.sync("g", &leader, gen, &[(a.member_id.clone(), b"A".to_vec()), (b.member_id.clone(), b"B".to_vec())]);
-        assert_eq!(c.heartbeat("g", &a.member_id, gen), NONE, "stable before the leave");
+        c.sync(
+            "g",
+            &leader,
+            gen,
+            &[
+                (a.member_id.clone(), b"A".to_vec()),
+                (b.member_id.clone(), b"B".to_vec()),
+            ],
+        );
+        assert_eq!(
+            c.heartbeat("g", &a.member_id, gen),
+            NONE,
+            "stable before the leave"
+        );
         // One leaves; the survivor must be told to rejoin (NOT NONE). leave() bumps the generation immediately, so
         // a heartbeat at the OLD generation returns ILLEGAL_GENERATION (a new-generation HB would be
         // REBALANCE_IN_PROGRESS) — either way, not stable.
         assert_eq!(c.leave("g", &a.member_id), NONE);
-        assert_ne!(c.heartbeat("g", &b.member_id, gen), NONE, "survivor told to rejoin (not stable)");
+        assert_ne!(
+            c.heartbeat("g", &b.member_id, gen),
+            NONE,
+            "survivor told to rejoin (not stable)"
+        );
     }
 }

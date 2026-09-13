@@ -10,9 +10,11 @@
 use std::hint::black_box;
 use std::time::Instant;
 
-use datarail_core::{AeadAlg, Cofre, Substrate};
 use datarail_cofre::{decode, encode};
-use datarail_crypto::{aead_open, aead_seal, blake3_256, open_key, seal_key, verifying_key, x25519_public};
+use datarail_core::{AeadAlg, Cofre, Substrate};
+use datarail_crypto::{
+    aead_open, aead_seal, blake3_256, open_key, seal_key, verifying_key, x25519_public,
+};
 use datarail_rail::{LoopbackSubstrate, TcpSubstrate};
 use datarail_terminal::{ContentContract, DestTerminal, SourceTerminal, TerminalConfig};
 
@@ -40,9 +42,16 @@ fn tput(name: &str, iters: u32, bytes: usize, mut f: impl FnMut()) {
     for _ in 0..iters {
         f();
     }
-    let total = u64::try_from(bytes).unwrap_or(u64::MAX).saturating_mul(u64::from(iters));
-    let micros = u64::try_from(t.elapsed().as_micros()).unwrap_or(u64::MAX).max(1);
-    println!("  {name:38} {:>6} MB/s   ({iters} iters x {bytes} B)", total / micros);
+    let total = u64::try_from(bytes)
+        .unwrap_or(u64::MAX)
+        .saturating_mul(u64::from(iters));
+    let micros = u64::try_from(t.elapsed().as_micros())
+        .unwrap_or(u64::MAX)
+        .max(1);
+    println!(
+        "  {name:38} {:>6} MB/s   ({iters} iters x {bytes} B)",
+        total / micros
+    );
 }
 
 /// Round-trip `n` cofres through a substrate (send → drain, **interleaved** so a real socket's bounded buffer
@@ -84,14 +93,28 @@ fn main() {
     });
     // Single-pass AES-256-GCM (AeadAlg::Gcm256). With `--features vaes` this is ring's VAES asm (line-rate);
     // default is RustCrypto AES-NI. Sound here under the per-cofre fresh-key invariant (no nonce reuse).
-    let backend = if cfg!(feature = "vaes") { "ring/VAES" } else { "RustCrypto/AES-NI" };
-    tput(&format!("aes-256-gcm   seal [{backend}]"), 3000, buf.len(), || {
-        black_box(aead_seal(AeadAlg::Gcm256, &key, &nonce, &[], black_box(&buf)).unwrap());
-    });
+    let backend = if cfg!(feature = "vaes") {
+        "ring/VAES"
+    } else {
+        "RustCrypto/AES-NI"
+    };
+    tput(
+        &format!("aes-256-gcm   seal [{backend}]"),
+        3000,
+        buf.len(),
+        || {
+            black_box(aead_seal(AeadAlg::Gcm256, &key, &nonce, &[], black_box(&buf)).unwrap());
+        },
+    );
     let ctg = aead_seal(AeadAlg::Gcm256, &key, &nonce, &[], &buf).unwrap();
-    tput(&format!("aes-256-gcm   open [{backend}]"), 3000, buf.len(), || {
-        black_box(aead_open(AeadAlg::Gcm256, &key, &nonce, &[], black_box(&ctg)).unwrap());
-    });
+    tput(
+        &format!("aes-256-gcm   open [{backend}]"),
+        3000,
+        buf.len(),
+        || {
+            black_box(aead_open(AeadAlg::Gcm256, &key, &nonce, &[], black_box(&ctg)).unwrap());
+        },
+    );
 
     // ---- key-wrap + wire-codec latency ----
     println!("\nkey-wrap + wire-codec latency:");
@@ -144,7 +167,12 @@ fn main() {
 
     // ---- substrate round-trip (real transports; DIRECTIONAL, loopback only — NOT a WAN measurement) ----
     println!("\nsubstrate round-trip (send+drain interleaved; DIRECTIONAL on loopback):");
-    roundtrip("in-process LoopbackSubstrate", LoopbackSubstrate::new(), &cofre, 20_000);
+    roundtrip(
+        "in-process LoopbackSubstrate",
+        LoopbackSubstrate::new(),
+        &cofre,
+        20_000,
+    );
     if let Ok(tcp) = TcpSubstrate::loopback_pair() {
         roundtrip("TCP loopback (real kernel hop)", tcp, &cofre, 5_000);
     }
@@ -194,7 +222,9 @@ fn head_to_head(
             }
         }
     }
-    let micros = u64::try_from(t.elapsed().as_micros()).unwrap_or(u64::MAX).max(1);
+    let micros = u64::try_from(t.elapsed().as_micros())
+        .unwrap_or(u64::MAX)
+        .max(1);
     let total = u64::from(iters).saturating_mul(u64::try_from(PER_COFRE).unwrap_or(1));
     let recs_per_s = total.saturating_mul(1_000_000) / micros;
     let mb_per_s = total.saturating_mul(u64::try_from(REC).unwrap_or(1)) / micros;

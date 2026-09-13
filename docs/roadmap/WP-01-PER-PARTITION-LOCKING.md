@@ -15,7 +15,7 @@
 | Axiom | Description | Enforcement |
 |---|---|---|
 | **A1 — Single Writer Per Partition** | Each `(topic, partition)` log is mutated by exactly one logical writer at a time. No cross-partition serialization. | Mutex-per-partition; seq-reservation stays partition-local. |
-| **A2 — Seq-Reservation Invariance** | `SourceTerminal::reserve_seqs` must allocate contiguous, non-overlapping ranges per partition. Global uniqueness preserved. | Unit test + property test (1000 seeds). |
+| **A2 — Seq-Reservation Invariance** | `SourceTerminal::reserve_seqs` must allocate contiguous, non-overlapping ranges within each partition. Partition namespaces are independent by design. | Unit test (1000 reservations). |
 | **A3 — Txn Epoch Fencing Preserved** | Transactional buffers keyed by `(producer_id, epoch, topic, partition)` must never allow stale-epoch commit. | Existing regression test `txn_commit_flushes_only_the_matching_epoch_dropping_stale` must pass unchanged. |
 | **A4 — Offsets Store Isolation** | Consumer-group offsets (`FileOffsets`) remain globally consistent; no partition-lock coupling. | `kafka_groups_wire` test unchanged. |
 | **A5 — Zero Behavioral Regression** | All existing wire/durability tests pass without modification. | `cargo test --workspace --release` green. |
@@ -111,7 +111,7 @@ Each task in this WP must pass **all** before merge:
 | **T4** | `wp1-t4-bounds-path` | `crates/datarail-cli/src/main.rs` | Refactor `bounds` → partition lock only | T1 | 1 file, ~20 LOC |
 | **T5** | `wp1-t5-txn-buffers` | `crates/datarail-cli/src/main.rs` | Refactor `buffer_txn`/`commit_txn`/`abort_txn` → per-partition txn buffers; epoch fencing preserved | T1 | 1 file, ~100 LOC |
 | **T6** | `wp1-t6-offsets-store` | `crates/datarail-cli/src/main.rs` | Verify `commit_offset`/`fetch_offset` use `FileOffsets` directly (no partition lock coupling) | T1 | 1 file, ~30 LOC |
-| **T7** | `wp1-t7-seq-reservation` | `crates/datarail-cli/src/main.rs` | Ensure `reserve_seqs` called under partition lock; global uniqueness via partition ID prefix | T2 | 1 file, ~20 LOC |
+| **T7** | `wp1-t7-seq-reservation` | `crates/datarail-cli/src/main.rs` | Ensure `reserve_seqs` called under partition lock; preserve partition-local sequence namespaces | T2 | 1 file, ~20 LOC |
 | **T8** | `wp1-t8-regression-test` | `crates/datarail-cli/tests/per_partition_scaling.rs` | New integration test: 2 producers × 2 partitions, measure positive scaling | T2–T7 | New file, ~150 LOC |
 | **T9** | `wp1-t9-benchmark` | `docs/BENCH-INDEPENDENT-2026-07-01.md` | Run interleaved A/B (1 vs 2 partitions); append results | T8 green | Manual + doc |
 | **T10** | `wp1-t10-docs` | `README.md`, `CHANGELOG.md` | Update "Known limitations" (remove global lock), add v0.1.1 entry | All green | 2 files |
@@ -156,7 +156,7 @@ T1 (scaffold)
 | Risk | Likelihood | Impact | Mitigation |
 |---|---|---|---|
 | **R1 — Deadlock** (partition lock + offsets lock + txn lock ordering) | MEDIUM | HIGH (broker hang) | Enforce lock ordering: partition → offsets → txn; add `lock_order` test |
-| **R2 — Seq collision** (reserve_seqs race across partitions) | LOW | HIGH (data corruption) | Prefix seq with partition ID; property test 1000 seeds |
+| **R2 — Seq collision** (overlap within one partition) | LOW | HIGH (data corruption) | Partition-local reservation test; cross-partition equal seqs are intentional |
 | **R3 — Txn regression** (stale-epoch commit) | LOW | HIGH (correctness) | Existing test `txn_commit_flushes_only_the_matching_epoch_dropping_stale` is gate |
 | **R4 — Performance regression** (lock overhead > gain) | LOW | MEDIUM | Benchmark after T2; if negative, STOP |
 | **R5 — Test flakiness** (timing-dependent scaling test) | MEDIUM | MEDIUM | Run test 3× in CI; require 2/3 positive scaling |

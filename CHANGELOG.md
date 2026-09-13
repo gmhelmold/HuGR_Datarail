@@ -5,6 +5,40 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added — Transaction Durability Foundation
+- Durable CRC-32C transaction journal with `Prepare`, `Commit`, and `Abort` records
+- Cross-partition transaction gate, participant rollback, offset snapshot/restore, and startup recovery
+- Restart tests for committed records/offsets and unresolved intent rollback
+- Deterministic in-process fault-point test covers main boundaries; process-level restart proof remains open
+
+### Fixed — ReplayLog Corruption Handling
+- **`read_sealed_from` now bypasses buggy `ReplayLog::replay_from` seek mechanism** — reads directly from segment files with manual seek + CRC-32C validation
+- Corrupt frames (oversize length or CRC mismatch) now halt replay cleanly, matching `ReplayLog` semantics
+- `fetch_halts_loud_at_a_corrupt_record_and_never_renumbers` test un-ignored and passing
+
+### Added — Per-Partition Locking (WP-01 Phase 1 In Review)
+- `PartitionLockMap` + `PartitionState` — per-partition `RwLock` eliminates global throughput serializer
+- `produce_into`, `fetch`, `bounds`, `buffer_txn`, `commit_txn`, `abort_txn` all use per-partition locks
+- `commit_txn` uses deterministic lock ordering (sort by `(topic, partition)`); reverse-order lock stress passes
+- `FileOffsets` extracted to dedicated `Arc<RwLock<FileOffsets>>` — decoupled from partition locks
+- `partition_log` lazy init fixed under partition lock (no global mutex race)
+- `EndTxn` completion now carries `(producer_id, epoch)` — stale completions cannot reset newer transaction epochs
+- Failed txn sealing restores unlanded buffers for retry; cross-partition crash atomicity remains explicitly unsupported
+- Added ignored 10k-operation contention stress (default and rollback builds pass)
+- Added per-partition sequence reservation regression test (1,000 reservations)
+- `BatchTooLarge` now maps to non-retriable Kafka `MESSAGE_TOO_LARGE` (10), not storage error 56
+
+### Changed — `abort_txn` Semantics
+- Now uses per-partition locks with deterministic ordering (was global map lock)
+- Only aborts specified partitions (was all partitions)
+- Matches `commit_txn` lock ordering for consistency
+
+### Changed — Known Limitations
+- Per-partition lock scaffolding is present; throughput scaling remains unmeasured pending Phase 2 A/B evidence
+- Cross-partition transaction commit is lock-ordered but not crash-atomic; Phase 1 remains blocked on failure-path evidence
+
 ## [0.1.0] - 2026-09-10
 
 ### Added — Rail Mode (Zero-Knowledge)
@@ -25,7 +59,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Restart survival verified: SIGKILL harness (4 rounds, every acked record at exact offset)
 - Multi-partition (independent logs + offset spaces)
 - Consumer groups: JoinGroup/SyncGroup/Heartbeat/LeaveGroup/OffsetCommit/OffsetFetch (durable)
-- Transactional producers: buffered until EndTxn, commit visible atomically, abort hidden, epoch-fenced
+- Transactional producers: buffered until EndTxn, successful commit visible, abort hidden, epoch-fenced; cross-partition crash atomicity unsupported
 - TLS (server), mTLS (client cert), SASL/PLAIN auth — all CI-gated vs real librdkafka (kcat)
 - Compressed producer batches (gzip/lz4/zstd/snappy, feature-gated) — decompress + seal
 - CRC-32C validation on produce, correct CRC-32C on fetch (real consumers accept)
@@ -65,7 +99,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Known Limitations (Honest Scope)
 - **Single-node** — no replication, failover, or cross-node coordination
-- **Global broker lock** — per-batch seal parallelized (~2.5×), but `Mutex<BrokerInner>` serializes across partitions (Issue #1)
+- **Per-partition broker locking** — implementation and local stress are present; independent scaling/p99/RSS evidence remains open (WP1-01)
 - **Transactions not crash-atomic** — in-memory coordinator, durable txn log is future work (Issue #4)
 - **Broker restarts at-least-once** for non-idempotent producers (dedup index not wired, Issue #6)
 - **QUIC substrate** — dev cert only, client accepts any server cert (Issue #8)

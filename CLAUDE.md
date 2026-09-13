@@ -71,17 +71,18 @@ This repo's whole credibility rests on claims matching reality. Before writing a
 - Benchmarks on shared/cloud hosts drift a lot between sessions (~4.5× observed). Never compare absolute
   numbers across sessions — always interleave an A/B in the same run and report the ratio.
 
-## What's next (leverage-ordered — full detail in docs/roadmap/ISSUES.md)
+## What's next (canonical backlog: `docs/roadmap/ISSUES.md`)
 
-1. **Per-partition locking** — the global `Mutex<BrokerInner>` still serializes whole batches; this is the last
-   throughput serializer and the highest-return change (the per-batch seal is already parallel, ~2.5×).
-2. **Power-loss durability test** — `kill9_crash.rs` proves SIGKILL survival, but the page cache survives a
-   killed process; a real fsync-reordering/crash-injection harness would demonstrate the dir-fsync fix.
-3. **Client conformance** — CI tests kcat/librdkafka only; Java client / franz-go / kafka-python / Sarama /
-   librdkafka 2.x are untracked (see `docs/design/KAFKA-COMPAT.md`).
-4. Txn `EndTxn` crash-atomicity (in-memory coordinator); broker-restart dedup; `BatchTooLarge`→MESSAGE_TOO_LARGE;
-   real key management; QUIC real cert verification; external crypto review; extract the Merkle receipt crate;
-   decide the replication tier (wire it or explicitly descope single-node).
+1. **WP1 evidence/release decision** — implementation and local stress are done; independent A/B, p99/RSS, CI-scale
+   evidence, and `v0.1.1` release gates remain.
+2. **ReplayLog seek + power-loss durability** — direct-read mitigation exists; fix internal seek semantics and add
+   fsync/rename fault injection beyond `kill9_crash.rs`.
+3. **Durable transaction protocol** — `EndTxn` remains non-crash-atomic across partitions; add intent/commit journal,
+   recovery, offset atomicity, and kill-during-commit proof.
+4. **Broker restart dedup + real Kafka clients** — wire restart dedup; test Java, franz-go, kafka-python, Sarama,
+   librdkafka 2.x, and real-client transactions.
+5. **Security/architecture** — key references, QUIC certificate verification, external crypto review, replication
+   decision, Merkle extraction, and real FASP transport; owner/external queue tracked in canonical backlog.
 
 ## Owner-reserved files
 

@@ -20,6 +20,7 @@
 mod kafka_store;
 #[cfg(feature = "tls")]
 mod tls;
+mod txn_journal;
 
 /// Build the Kafka serve-loop connection wrapper: plaintext [`PlainConn`], or — with `--tls` and the `tls`
 /// feature — a rustls TLS terminator ([`tls::TlsConn`]). Shared by `kafka-ingest` and `kafka-broker`.
@@ -34,7 +35,8 @@ fn build_conn(
         let cert = cert.ok_or_else(|| CliError::Arg("--tls requires --tls-cert <pem>".into()))?;
         let key = key.ok_or_else(|| CliError::Arg("--tls requires --tls-key <pem>".into()))?;
         // client_ca = Some → mutual TLS (require + verify a client cert chaining to that CA).
-        let conn = tls::TlsConn::from_pem(&cert, &key, client_ca).map_err(|e| CliError::Io(e.to_string()))?;
+        let conn = tls::TlsConn::from_pem(&cert, &key, client_ca)
+            .map_err(|e| CliError::Io(e.to_string()))?;
         Ok(std::sync::Arc::new(conn))
     } else {
         Ok(std::sync::Arc::new(datarail_kafka::serve::PlainConn))
@@ -50,11 +52,14 @@ fn build_conn(
     _client_ca: Option<String>,
 ) -> Result<std::sync::Arc<dyn datarail_kafka::serve::ConnWrap>, CliError> {
     if enable_tls {
-        return Err(CliError::Arg("--tls requires building the binary with `--features tls`".into()));
+        return Err(CliError::Arg(
+            "--tls requires building the binary with `--features tls`".into(),
+        ));
     }
     Ok(std::sync::Arc::new(datarail_kafka::serve::PlainConn))
 }
 
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::io::Read;
 use std::net::{TcpListener, TcpStream};
@@ -64,15 +69,37 @@ use std::sync::{Arc, RwLock, RwLockWriteGuard};
 use std::time::{Duration, Instant};
 
 use datarail_connectors::{
-    HttpSource, LineFileSink, LineFileSource, PgConfig, PostgresSink, Sink, SliceSource, Source, VecSink,
-    WebhookSink,
+    HttpSource, LineFileSink, LineFileSource, PgConfig, PostgresSink, Sink, SliceSource, Source,
+    VecSink, WebhookSink,
 };
 use datarail_core::{Cofre, Disposition, Substrate};
 use datarail_crypto::{blake3_256, ctx, sign_domain, verifying_key};
 use datarail_identity::{NoiseSubstrate, Pairing, ShortCode, StaticKeypair};
+use datarail_offsets::OffsetStore as _;
 use datarail_rail::{LoopbackSubstrate, TcpSubstrate};
 use datarail_spec::{RailSpec, SpecError};
 use datarail_terminal::{DestTerminal, SourceTerminal, TerminalError};
+
+thread_local! {
+    static TXN_FAULT_POINT: Cell<u8> = const { Cell::new(0) };
+}
+
+fn txn_fault(point: u8) {
+    let armed = TXN_FAULT_POINT.with(|fault| {
+        if fault.get() == point {
+            fault.set(0);
+            true
+        } else {
+            false
+        }
+    });
+    assert!(!armed, "injected transaction crash at point {point}");
+}
+
+#[cfg(test)]
+fn arm_txn_fault(point: u8) {
+    TXN_FAULT_POINT.with(|fault| fault.set(point));
+}
 
 const USAGE: &str = "\
 datarail — provider-blind data rail (SPEC 09)
@@ -189,7 +216,10 @@ impl core::fmt::Display for CliError {
             Self::Terminal(e) => write!(f, "terminal: {e}"),
             Self::Rail(e) => write!(f, "rail: {e}"),
             Self::NoCofre => write!(f, "no cofre came off the rail"),
-            Self::BadRange(r) => write!(f, "bad range `{r}` (expected start..end, start..=end, or all)"),
+            Self::BadRange(r) => write!(
+                f,
+                "bad range `{r}` (expected start..end, start..=end, or all)"
+            ),
             Self::Identity(e) => write!(f, "identity: {e}"),
         }
     }
@@ -272,8 +302,7 @@ fn cmd_keygen(rest: &[String]) -> Result<String, CliError> {
 }
 
 fn random_seed() -> Result<[u8; 32], CliError> {
-    let mut file =
-        std::fs::File::open("/dev/urandom").map_err(|e| CliError::Io(e.to_string()))?;
+    let mut file = std::fs::File::open("/dev/urandom").map_err(|e| CliError::Io(e.to_string()))?;
     let mut seed = [0u8; 32];
     file.read_exact(&mut seed)
         .map_err(|e| CliError::Io(e.to_string()))?;
@@ -348,7 +377,13 @@ fn cmd_run(rest: &[String]) -> Result<String, CliError> {
 
     // Sink connector: `--sink-postgres` (Tier A exactly-once for an append-ordered source unless
     // `--at-least-once`) > `--sink-webhook` (POST batches) > `--sink-file` > in-memory.
-    let mut sink = select_sink(sink_pg, sink_webhook, sink_file, at_least_once, source_ordered)?;
+    let mut sink = select_sink(
+        sink_pg,
+        sink_webhook,
+        sink_file,
+        at_least_once,
+        source_ordered,
+    )?;
 
     run_pipe(&spec, source.as_mut(), &mut sink, watch)
 }
@@ -382,9 +417,9 @@ fn parse_pg_conn(conn: &str) -> Result<PgConfig, CliError> {
     let mut port: u16 = 5432;
     let mut password = None;
     for pair in conn.split(',').filter(|p| !p.is_empty()) {
-        let (key, value) = pair
-            .split_once('=')
-            .ok_or_else(|| CliError::Arg(format!("--sink-postgres: expected key=value, got `{pair}`")))?;
+        let (key, value) = pair.split_once('=').ok_or_else(|| {
+            CliError::Arg(format!("--sink-postgres: expected key=value, got `{pair}`"))
+        })?;
         match key.trim() {
             "host" => host = Some(value.to_owned()),
             "user" => user = Some(value.to_owned()),
@@ -397,7 +432,11 @@ fn parse_pg_conn(conn: &str) -> Result<PgConfig, CliError> {
                     .parse()
                     .map_err(|_| CliError::Arg(format!("--sink-postgres: bad port `{value}`")))?;
             }
-            other => return Err(CliError::Arg(format!("--sink-postgres: unknown key `{other}`"))),
+            other => {
+                return Err(CliError::Arg(format!(
+                    "--sink-postgres: unknown key `{other}`"
+                )))
+            }
         }
     }
     let need = |opt: Option<String>, name: &str| {
@@ -508,7 +547,10 @@ fn cmd_replay(rest: &[String]) -> Result<String, CliError> {
     let record_key = format!("datarail-replay-{}..{}", range.start, range.end);
     let mut delivered = 0usize;
     let mut duplicate = 0usize;
-    while let Some(batch) = source.next_batch().map_err(|e| CliError::Rail(e.to_string()))? {
+    while let Some(batch) = source
+        .next_batch()
+        .map_err(|e| CliError::Rail(e.to_string()))?
+    {
         if let Some(outcome) = pipe.ship_batch(&batch, record_key.as_bytes(), &mut sink)? {
             match outcome.disposition {
                 Disposition::Delivered => delivered += outcome.fresh_committed,
@@ -543,12 +585,19 @@ impl AnyRail {
     fn from_spec(substrate: &str) -> Result<Self, CliError> {
         match substrate {
             "auto" | "loopback" => Ok(Self::Loopback(LoopbackSubstrate::new())),
-            "tcp" => Ok(Self::Tcp(TcpSubstrate::loopback_pair().map_err(|e| CliError::Rail(e.to_string()))?)),
-            "shmem" => Ok(Self::Shmem(datarail_substrate_shmem::ShmemRing::pair().map_err(|e| CliError::Rail(e.to_string()))?)),
+            "tcp" => Ok(Self::Tcp(
+                TcpSubstrate::loopback_pair().map_err(|e| CliError::Rail(e.to_string()))?,
+            )),
+            "shmem" => Ok(Self::Shmem(
+                datarail_substrate_shmem::ShmemRing::pair()
+                    .map_err(|e| CliError::Rail(e.to_string()))?,
+            )),
             s if s == "s3" || s == "object-store" || s.starts_with("s3://") => {
-                let dir = std::env::temp_dir().join(format!("datarail-run-{}.store", std::process::id()));
+                let dir =
+                    std::env::temp_dir().join(format!("datarail-run-{}.store", std::process::id()));
                 Ok(Self::ObjectStore(
-                    datarail_substrate_objectstore::ObjectStoreSubstrate::open(&dir).map_err(|e| CliError::Rail(e.to_string()))?,
+                    datarail_substrate_objectstore::ObjectStoreSubstrate::open(&dir)
+                        .map_err(|e| CliError::Rail(e.to_string()))?,
                 ))
             }
             #[cfg(feature = "quic")]
@@ -636,7 +685,12 @@ impl AnySink {
     /// Commit `fresh` for a Kafka-EOS **sequence** substream, setting the durable watermark to `watermark` (the
     /// producer's `base_sequence + count`). Tier A → `commit_at_seq` (whole-batch idempotent exactly-once);
     /// Tier C → plain `commit` (at-least-once). See `KAFKA-EOS-DESIGN.md`.
-    fn commit_seq(&mut self, fresh: &[Vec<u8>], stream: &[u8], watermark: u64) -> std::io::Result<()> {
+    fn commit_seq(
+        &mut self,
+        fresh: &[Vec<u8>],
+        stream: &[u8],
+        watermark: u64,
+    ) -> std::io::Result<()> {
         match self {
             Self::Plain(s) => s.commit(fresh),
             Self::Txn(pg) => {
@@ -701,7 +755,8 @@ fn select_sink(
     source_ordered: bool,
 ) -> Result<AnySink, CliError> {
     if let Some(conn) = sink_pg {
-        let pg = PostgresSink::connect(parse_pg_conn(&conn)?).map_err(|e| CliError::Io(e.to_string()))?;
+        let pg = PostgresSink::connect(parse_pg_conn(&conn)?)
+            .map_err(|e| CliError::Io(e.to_string()))?;
         return Ok(if wants_tier_a(at_least_once, source_ordered) {
             AnySink::Txn(Box::new(pg))
         } else {
@@ -760,8 +815,11 @@ impl Pipeline {
     fn from_spec(spec: &RailSpec) -> Result<Self, CliError> {
         let cfg = spec.terminal_config();
         let source_vk = verifying_key(&spec.keys.source_seed);
-        let src_term =
-            SourceTerminal::new(cfg.clone(), spec.onboarding_contract(), spec.keys.source_seed);
+        let src_term = SourceTerminal::new(
+            cfg.clone(),
+            spec.onboarding_contract(),
+            spec.keys.source_seed,
+        );
         let dst_term = DestTerminal::new(
             cfg,
             spec.offloading_contract(),
@@ -793,7 +851,8 @@ impl Pipeline {
         record_key: &[u8],
         sink: &mut AnySink,
     ) -> Result<Option<BatchOutcome>, CliError> {
-        let Some((disposition, fresh, landed_total)) = self.deliver_batch(batch, record_key)? else {
+        let Some((disposition, fresh, landed_total)) = self.deliver_batch(batch, record_key)?
+        else {
             return Ok(None);
         };
         // Tier-A (file/replay) landed-count model: the watermark is `landed_total` — the cumulative count of
@@ -802,9 +861,13 @@ impl Pipeline {
         let fresh_committed = fresh.len();
         if !fresh.is_empty() {
             let watermark = u64::try_from(landed_total).unwrap_or(u64::MAX);
-            sink.commit(&fresh, &self.stream, watermark).map_err(|e| CliError::Rail(e.to_string()))?;
+            sink.commit(&fresh, &self.stream, watermark)
+                .map_err(|e| CliError::Rail(e.to_string()))?;
         }
-        Ok(Some(BatchOutcome { disposition, fresh_committed }))
+        Ok(Some(BatchOutcome {
+            disposition,
+            fresh_committed,
+        }))
     }
 
     /// Like [`Pipeline::ship_batch`], but for a Kafka-EOS **sequence** substream: the dedup `stream` and the
@@ -820,14 +883,19 @@ impl Pipeline {
         stream: &[u8],
         high: u64,
     ) -> Result<Option<BatchOutcome>, CliError> {
-        let Some((disposition, fresh, _landed_total)) = self.deliver_batch(batch, record_key)? else {
+        let Some((disposition, fresh, _landed_total)) = self.deliver_batch(batch, record_key)?
+        else {
             return Ok(None);
         };
         let fresh_committed = fresh.len();
         // Always advance the watermark for a processed range, even with 0 fresh records (all dead-lettered) — a
         // replay must then no-op. `commit_seq` itself no-ops when `high <= stored`, so a retry is safe.
-        sink.commit_seq(&fresh, stream, high).map_err(|e| CliError::Rail(e.to_string()))?;
-        Ok(Some(BatchOutcome { disposition, fresh_committed }))
+        sink.commit_seq(&fresh, stream, high)
+            .map_err(|e| CliError::Rail(e.to_string()))?;
+        Ok(Some(BatchOutcome {
+            disposition,
+            fresh_committed,
+        }))
     }
 
     /// Like [`Pipeline::ship_batch_seq`] but plain at-least-once (no watermark) — for a Kafka batch with no
@@ -838,14 +906,19 @@ impl Pipeline {
         record_key: &[u8],
         sink: &mut AnySink,
     ) -> Result<Option<BatchOutcome>, CliError> {
-        let Some((disposition, fresh, _landed_total)) = self.deliver_batch(batch, record_key)? else {
+        let Some((disposition, fresh, _landed_total)) = self.deliver_batch(batch, record_key)?
+        else {
             return Ok(None);
         };
         let fresh_committed = fresh.len();
         if !fresh.is_empty() {
-            sink.commit_plain(&fresh).map_err(|e| CliError::Rail(e.to_string()))?;
+            sink.commit_plain(&fresh)
+                .map_err(|e| CliError::Rail(e.to_string()))?;
         }
-        Ok(Some(BatchOutcome { disposition, fresh_committed }))
+        Ok(Some(BatchOutcome {
+            disposition,
+            fresh_committed,
+        }))
     }
 
     /// Board `batch` under `record_key`, move it over the substrate, offload it, and return the offload
@@ -880,7 +953,10 @@ impl Pipeline {
             }
         }
         let received = received.ok_or(CliError::NoCofre)?;
-        let disposition = self.dst_term.offload(&received).map_err(CliError::Terminal)?;
+        let disposition = self
+            .dst_term
+            .offload(&received)
+            .map_err(CliError::Terminal)?;
         self.rail.ack(received.etiqueta.cofre_id)?;
 
         // DRAIN the terminal sink: only a `Delivered` offload appended to it, and the sink was emptied by the
@@ -965,10 +1041,18 @@ fn cmd_kafka_ingest(rest: &[String]) -> Result<String, CliError> {
                 tls_key = Some(require(rest, i + 1, "pem")?.to_string());
                 i += 2;
             }
-            other => return Err(CliError::Arg(format!("kafka-ingest: unexpected arg `{other}`"))),
+            other => {
+                return Err(CliError::Arg(format!(
+                    "kafka-ingest: unexpected arg `{other}`"
+                )))
+            }
         }
     }
-    let port: i32 = listen.rsplit(':').next().and_then(|p| p.parse().ok()).unwrap_or(9092);
+    let port: i32 = listen
+        .rsplit(':')
+        .next()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(9092);
     let listener = TcpListener::bind(&listen).map_err(|e| CliError::Io(e.to_string()))?;
     let (tx, rx) = std::sync::mpsc::channel::<datarail_kafka::serve::ProducedBatch>();
     let adv = advertised.clone();
@@ -980,7 +1064,13 @@ fn cmd_kafka_ingest(rest: &[String]) -> Result<String, CliError> {
     // Kafka ingest delivers EXACTLY-ONCE for an idempotent producer (per (producer_id, partition) sequence —
     // KAFKA-EOS-DESIGN.md) and AT-LEAST-ONCE for a non-idempotent one, decided PER BATCH below. Allow a
     // Tier-A-capable (Txn) sink unless `--at-least-once` forces the plain path.
-    let mut sink = select_sink(sink_pg, sink_webhook, sink_file, at_least_once, /* source_ordered */ true)?;
+    let mut sink = select_sink(
+        sink_pg,
+        sink_webhook,
+        sink_file,
+        at_least_once,
+        /* source_ordered */ true,
+    )?;
     eprintln!(
         "datarail kafka-ingest on {listen} (advertised {advertised}:{port}) -> sealed rail -> sink \
          (exactly-once for idempotent producers, else at-least-once)"
@@ -991,7 +1081,13 @@ fn cmd_kafka_ingest(rest: &[String]) -> Result<String, CliError> {
     // Drain produced batches until the endpoint closes. Each carries a `done` channel: we report the DURABLE
     // landing result so the serve loop acks only after the records are committed (ack-after-durable, audit A).
     for batch in rx {
-        let datarail_kafka::serve::ProducedBatch { topic, partition, values, eos, done } = batch;
+        let datarail_kafka::serve::ProducedBatch {
+            topic,
+            partition,
+            values,
+            eos,
+            done,
+        } = batch;
         if values.is_empty() {
             let _ = done.send(Ok(()));
             continue;
@@ -1000,14 +1096,23 @@ fn cmd_kafka_ingest(rest: &[String]) -> Result<String, CliError> {
         // circuits a producer RETRY — the sink's durable watermark (`commit_at_seq`) is the SOLE EOS authority,
         // so a retry re-delivers and is idempotently no-op'd at the sink (and a prior commit FAILURE re-commits).
         let result: Result<(), CliError> = if let Some(c) = eos {
-            let stream = eos_stream_id(&route_id, &topic, partition, c.producer_id, c.producer_epoch);
-            let high = u64::try_from(i64::from(c.base_sequence) + i64::from(c.count)).unwrap_or(u64::MAX);
+            let stream = eos_stream_id(
+                &route_id,
+                &topic,
+                partition,
+                c.producer_id,
+                c.producer_epoch,
+            );
+            let high =
+                u64::try_from(i64::from(c.base_sequence) + i64::from(c.count)).unwrap_or(u64::MAX);
             let key = format!("kafka-eos-{batch_no}");
-            pipe.ship_batch_seq(&values, key.as_bytes(), &mut sink, &stream, high).map(|_| ())
+            pipe.ship_batch_seq(&values, key.as_bytes(), &mut sink, &stream, high)
+                .map(|_| ())
         } else {
             // No stable idempotent identity → honest at-least-once (plain commit, even on a Txn sink).
             let key = format!("kafka-{topic}-{partition}-n{batch_no}");
-            pipe.ship_batch_plain(&values, key.as_bytes(), &mut sink).map(|_| ())
+            pipe.ship_batch_plain(&values, key.as_bytes(), &mut sink)
+                .map(|_| ())
         };
         // Signal the result back: Ok ⇒ the broker acks NONE; Err ⇒ an error code (producer retries, or — for a
         // permanent rejection — stops). The daemon KEEPS SERVING on a sink error — one failure must not tear down
@@ -1051,7 +1156,7 @@ type OffsetsStore = Arc<RwLock<datarail_offsets::FileOffsets>>;
 /// durable log (logical offset = contiguous record index, `fsync`-before-ack); Fetch un-seals at the edge. The log
 /// holds only ciphertext on disk → provider-blind even against a disk snapshot, and records survive a restart.
 /// Per-partition `RwLock` eliminates the global throughput serializer; read-heavy paths run in parallel.
-struct KafkaBrokerStore {
+struct PartitionBrokerStore {
     /// Source terminal wrapped in `RwLock` for interior mutability (`reserve_seqs` takes `&mut self`).
     src: RwLock<SourceTerminal>,
     dst: DestTerminal,
@@ -1066,9 +1171,14 @@ struct KafkaBrokerStore {
     /// Durable consumer-group committed offsets (`OffsetCommit`/`OffsetFetch`), opened lazily under `data_dir`.
     /// Own lock — decoupled from partition locks (F4 fix).
     offsets: OffsetsStore,
+    /// Serializes transaction boundaries against fetches and offset reads, while ordinary partition operations stay
+    /// parallel.
+    txn_gate: std::sync::Mutex<()>,
+    /// Append-only prepare/commit/abort records used to recover cross-partition boundaries.
+    txn_journal: std::sync::Mutex<txn_journal::TxnJournal>,
 }
 
-impl KafkaBrokerStore {
+impl PartitionBrokerStore {
     /// Get or create the `RwLock<PartitionState>` for a `(topic, partition)`.
     /// Acquires map mutex only briefly to clone the `Arc`; then releases it.
     fn partition_lock(&self, topic: &str, partition: i32) -> Arc<RwLock<PartitionState>> {
@@ -1098,14 +1208,24 @@ impl KafkaBrokerStore {
     }
 
     /// Execute a read operation on a partition's state.
-    fn with_read_partition<R>(&self, topic: &str, partition: i32, f: impl FnOnce(&PartitionState) -> R) -> R {
+    fn with_read_partition<R>(
+        &self,
+        topic: &str,
+        partition: i32,
+        f: impl FnOnce(&PartitionState) -> R,
+    ) -> R {
         let lock = self.partition_lock(topic, partition);
         let guard = lock.read().unwrap();
         f(&guard)
     }
 
     /// Execute a write operation on a partition's state.
-    fn with_write_partition<R>(&self, topic: &str, partition: i32, f: impl FnOnce(&mut PartitionState) -> R) -> R {
+    fn with_write_partition<R>(
+        &self,
+        topic: &str,
+        partition: i32,
+        f: impl FnOnce(&mut PartitionState) -> R,
+    ) -> R {
         let lock = self.partition_lock(topic, partition);
         let mut guard = lock.write().unwrap();
         f(&mut guard)
@@ -1120,11 +1240,18 @@ impl KafkaBrokerStore {
         // Deterministic lock ordering: sort by (topic, partition)
         let mut sorted: Vec<_> = partitions.to_vec();
         sorted.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+        sorted.dedup();
 
         // Acquire all locks upfront in deterministic order
         let locks: Vec<_> = sorted
             .iter()
-            .map(|(topic, partition)| (topic.clone(), *partition, self.partition_lock(topic, *partition)))
+            .map(|(topic, partition)| {
+                (
+                    topic.clone(),
+                    *partition,
+                    self.partition_lock(topic, *partition),
+                )
+            })
             .collect();
 
         let mut guards: Vec<_> = locks
@@ -1139,7 +1266,11 @@ impl KafkaBrokerStore {
 /// The injective durable-store key for a consumer group's committed offset on a `(topic, partition)`. Length-
 /// prefixed so arbitrary group/topic bytes can never alias (`"a/b"+"c"` vs `"a"+"b/c"` map to distinct keys).
 fn offset_key(group: &str, topic: &str, partition: i32) -> String {
-    format!("{}:{group}:{}:{topic}:{partition}", group.len(), topic.len())
+    format!(
+        "{}:{group}:{}:{topic}:{partition}",
+        group.len(),
+        topic.len()
+    )
 }
 
 /// The on-disk directory for a `(topic, partition)`'s durable log. The topic is **hex-encoded** so an arbitrary
@@ -1165,9 +1296,8 @@ fn partition_dir(data_dir: &Path, topic: &str, partition: i32) -> PathBuf {
 /// per-cofre X25519 ephemeral + data key from the per-thread CSPRNG, so parallelism never shares key material.
 ///
 /// # Errors
-/// `InvalidData` for a contract violation (→ `INVALID_RECORD` 87, non-retriable — pre-checked by the caller, but
-/// mapped here too); any other seal failure as `Other` (→ `KAFKA_STORAGE_ERROR` 56, retriable). The extreme
-/// `BatchTooLarge` framing edge (>u32) also lands on 56 today — tracked for a `MESSAGE_TOO_LARGE` (10) mapping.
+/// `InvalidData` for a contract violation (→ `INVALID_RECORD` 87, non-retriable); `InvalidInput` for a framing
+/// overflow (→ `MESSAGE_TOO_LARGE` 10, non-retriable); any other seal failure as `Other` (→ storage error 56).
 fn seal_batch(
     src: &SourceTerminal,
     topic: &str,
@@ -1182,14 +1312,17 @@ fn seal_batch(
         let rkey = format!("kbroker-{topic}-{partition}-{}", base + i);
         let refs = [rec];
         let seq = start_seq.saturating_add(u64::try_from(i).unwrap_or(u64::MAX));
-        let cofre = src.board_at(&refs, rkey.as_bytes(), seq).map_err(|e| match e {
-            TerminalError::ContractViolation => std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()),
-            _ => std::io::Error::other(e.to_string()),
-        })?;
+        let cofre = src
+            .board_at(&refs, rkey.as_bytes(), seq)
+            .map_err(seal_error)?;
         Ok(datarail_cofre::encode(&cofre))
     };
     if records.len() < PARALLEL_THRESHOLD {
-        return records.iter().enumerate().map(|(i, r)| seal_one(i, r)).collect();
+        return records
+            .iter()
+            .enumerate()
+            .map(|(i, r)| seal_one(i, r))
+            .collect();
     }
     // Leave one core for the broker's IO thread + the client on the same box: N-1 seal workers measured
     // faster end-to-end than N on a small host (the join barrier waits for the slowest, starved worker).
@@ -1215,7 +1348,10 @@ fn seal_batch(
             })
             .collect();
         for h in handles {
-            parts.push(h.join().unwrap_or_else(|_| Err(std::io::Error::other("seal worker panicked"))));
+            parts.push(
+                h.join()
+                    .unwrap_or_else(|_| Err(std::io::Error::other("seal worker panicked"))),
+            );
         }
     });
     let mut sealed = Vec::with_capacity(records.len());
@@ -1225,7 +1361,16 @@ fn seal_batch(
     Ok(sealed)
 }
 
-impl KafkaBrokerStore {
+fn seal_error(error: TerminalError) -> std::io::Error {
+    let kind = match error {
+        TerminalError::ContractViolation => std::io::ErrorKind::InvalidData,
+        TerminalError::BatchTooLarge => std::io::ErrorKind::InvalidInput,
+        _ => std::io::ErrorKind::Other,
+    };
+    std::io::Error::new(kind, error.to_string())
+}
+
+impl PartitionBrokerStore {
     fn from_spec(spec: &RailSpec, data_dir: PathBuf) -> Self {
         let cfg = spec.terminal_config();
         let source_vk = verifying_key(&spec.keys.source_seed);
@@ -1239,22 +1384,102 @@ impl KafkaBrokerStore {
             spec.keys.dest_x25519_secret,
         );
         let offsets = Arc::new(RwLock::new(
-            datarail_offsets::FileOffsets::open(data_dir.join("consumer-offsets")).expect("offsets open")
+            datarail_offsets::FileOffsets::open(data_dir.join("consumer-offsets"))
+                .expect("offsets open"),
         ));
-        Self {
+        let journal_path = data_dir.join("txn-journal.log");
+        let store = Self {
             src: RwLock::new(src),
             dst,
             onboarding,
             partitions: std::sync::Mutex::new(HashMap::new()),
             data_dir,
             offsets,
+            txn_gate: std::sync::Mutex::new(()),
+            txn_journal: std::sync::Mutex::new(
+                txn_journal::TxnJournal::open(journal_path).expect("transaction journal open"),
+            ),
+        };
+        store.recover_transactions().expect("transaction recovery");
+        store
+    }
+
+    fn recover_transactions(&self) -> std::io::Result<()> {
+        let states = self.txn_journal.lock().unwrap().states()?;
+        for state in states {
+            match state {
+                txn_journal::JournalState::Prepared(prepared) => {
+                    for participant in &prepared.participants {
+                        self.with_write_partition(
+                            &participant.topic,
+                            participant.partition,
+                            |state| {
+                                state.log.truncate_to(
+                                    participant.byte_end,
+                                    usize::try_from(participant.logical_end).unwrap_or(usize::MAX),
+                                )
+                            },
+                        )?;
+                    }
+                    let snapshots: Vec<_> = prepared
+                        .offsets
+                        .iter()
+                        .map(|offset| datarail_offsets::OffsetSnapshot {
+                            group: offset.group.clone(),
+                            offset: offset.before,
+                        })
+                        .collect();
+                    self.offsets.write().unwrap().restore_many(&snapshots)?;
+                }
+                txn_journal::JournalState::Committed {
+                    prepared,
+                    participants,
+                } => {
+                    for participant in &participants {
+                        self.with_read_partition(
+                            &participant.topic,
+                            participant.partition,
+                            |state| {
+                                if state.log.byte_end() < participant.byte_end
+                                    || state.log.len()
+                                        < usize::try_from(participant.logical_end)
+                                            .unwrap_or(usize::MAX)
+                                {
+                                    Err(std::io::Error::new(
+                                        std::io::ErrorKind::InvalidData,
+                                        "committed transaction participant is incomplete",
+                                    ))
+                                } else {
+                                    Ok(())
+                                }
+                            },
+                        )?;
+                    }
+                    let values: Vec<_> = prepared
+                        .offsets
+                        .iter()
+                        .map(|offset| (offset.group.clone(), offset.after))
+                        .collect();
+                    self.offsets.write().unwrap().commit_many(&values)?;
+                }
+                // Abort is appended only after rollback completed; no replay mutation remains.
+                txn_journal::JournalState::Aborted(_) => {}
+            }
         }
+        Ok(())
     }
 
     /// Seal each record into a cofre and durably append it to `(topic, partition)`'s log; return the base offset.
     /// Takes the partition's write lock.
-    fn produce_into(&self, topic: &str, partition: i32, records: &[Vec<u8>]) -> std::io::Result<i64> {
-        self.with_write_partition(topic, partition, |state| self.produce_into_with_guard(state, topic, partition, records))
+    fn produce_into(
+        &self,
+        topic: &str,
+        partition: i32,
+        records: &[Vec<u8>],
+    ) -> std::io::Result<i64> {
+        self.with_write_partition(topic, partition, |state| {
+            self.produce_into_with_guard(state, topic, partition, records)
+        })
     }
 
     fn produce_into_with_guard(
@@ -1272,13 +1497,155 @@ impl KafkaBrokerStore {
             ));
         }
         let partition_id = u64::try_from(partition).expect("partition index must be non-negative");
-        let start_seq = self.src.write().unwrap().reserve_seqs(partition_id, u64::try_from(records.len()).unwrap_or(u64::MAX));
-        let sealed = seal_batch(&self.src.read().unwrap(), topic, partition, base, start_seq, records)?;
+        let start_seq = self.src.write().unwrap().reserve_seqs(
+            partition_id,
+            u64::try_from(records.len()).unwrap_or(u64::MAX),
+        );
+        let sealed = seal_batch(
+            &self.src.read().unwrap(),
+            topic,
+            partition,
+            base,
+            start_seq,
+            records,
+        )?;
         state.log.append_durable(&sealed)
+    }
+
+    fn commit_txn_durable(
+        &self,
+        transactional_id: &str,
+        producer_id: i64,
+        epoch: i16,
+        partitions: &[(String, i32)],
+        group: Option<&str>,
+        offsets: &[(String, i32, i64)],
+    ) -> std::io::Result<()> {
+        let _gate = self.txn_gate.lock().unwrap();
+        self.with_write_partitions(partitions, |guards| {
+            let pre: Vec<_> = guards
+                .iter()
+                .map(
+                    |(topic, partition, state)| txn_journal::ParticipantBoundary {
+                        topic: (*topic).to_owned(),
+                        partition: *partition,
+                        byte_end: state.log.byte_end(),
+                        logical_end: u64::try_from(state.log.len()).unwrap_or(u64::MAX),
+                    },
+                )
+                .collect();
+            let offset_changes: Vec<_> = if let Some(group) = group {
+                let keys: Vec<_> = offsets
+                    .iter()
+                    .map(|(topic, partition, _)| offset_key(group, topic, *partition))
+                    .collect();
+                let snapshots = self.offsets.read().unwrap().snapshot(&keys);
+                offsets
+                    .iter()
+                    .zip(snapshots)
+                    .map(
+                        |((_topic, _partition, offset), snapshot)| txn_journal::OffsetChange {
+                            group: snapshot.group,
+                            before: snapshot.offset,
+                            after: u64::try_from(*offset).unwrap_or(0),
+                        },
+                    )
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            let prepared = self.txn_journal.lock().unwrap().prepare(
+                transactional_id,
+                producer_id,
+                epoch,
+                pre.clone(),
+                offset_changes,
+            )?;
+            txn_fault(1); // after Prepare fsync
+
+            let mut failed = None;
+            let last_participant = guards.len().saturating_sub(1);
+            for (index, (topic, partition, state)) in guards.iter_mut().enumerate() {
+                let records = state
+                    .txn_buffers
+                    .get(&(producer_id, epoch))
+                    .cloned()
+                    .unwrap_or_default();
+                if !records.is_empty() {
+                    if let Err(error) =
+                        self.produce_into_with_guard(state, topic, *partition, &records)
+                    {
+                        failed = Some(error);
+                        break;
+                    }
+                    txn_fault(if index == last_participant { 3 } else { 2 }); // after participant append+fsync
+                }
+            }
+            if let Some(error) = failed {
+                return rollback_transaction(self, guards, &prepared, error);
+            }
+
+            let post: Vec<_> = guards
+                .iter()
+                .map(
+                    |(topic, partition, state)| txn_journal::ParticipantBoundary {
+                        topic: (*topic).to_owned(),
+                        partition: *partition,
+                        byte_end: state.log.byte_end(),
+                        logical_end: u64::try_from(state.log.len()).unwrap_or(u64::MAX),
+                    },
+                )
+                .collect();
+            let values: Vec<_> = prepared
+                .offsets
+                .iter()
+                .map(|offset| (offset.group.clone(), offset.after))
+                .collect();
+            if let Err(error) = self.offsets.write().unwrap().commit_many(&values) {
+                return rollback_transaction(self, guards, &prepared, error);
+            }
+            txn_fault(4); // after offsets fsync
+            if let Err(error) = self.txn_journal.lock().unwrap().commit(&prepared, &post) {
+                return rollback_transaction(self, guards, &prepared, error);
+            }
+            txn_fault(5); // after Commit fsync
+            for (_, _, state) in guards.iter_mut() {
+                state.txn_buffers.remove(&(producer_id, epoch));
+                state
+                    .txn_buffers
+                    .retain(|(pid, old_epoch), _| !(*pid == producer_id && *old_epoch < epoch));
+            }
+            Ok(())
+        })
     }
 }
 
-impl datarail_kafka::serve::KafkaBroker for KafkaBrokerStore {
+fn rollback_transaction(
+    store: &PartitionBrokerStore,
+    guards: &mut [(&str, i32, RwLockWriteGuard<'_, PartitionState>)],
+    prepared: &txn_journal::PreparedTxn,
+    error: std::io::Error,
+) -> std::io::Result<()> {
+    for ((_, _, state), boundary) in guards.iter_mut().zip(prepared.participants.iter()) {
+        state.log.truncate_to(
+            boundary.byte_end,
+            usize::try_from(boundary.logical_end).unwrap_or(usize::MAX),
+        )?;
+    }
+    let snapshots: Vec<_> = prepared
+        .offsets
+        .iter()
+        .map(|offset| datarail_offsets::OffsetSnapshot {
+            group: offset.group.clone(),
+            offset: offset.before,
+        })
+        .collect();
+    store.offsets.write().unwrap().restore_many(&snapshots)?;
+    store.txn_journal.lock().unwrap().abort(prepared)?;
+    Err(error)
+}
+
+impl datarail_kafka::serve::KafkaBroker for PartitionBrokerStore {
     fn produce(&self, topic: &str, partition: i32, records: &[Vec<u8>]) -> std::io::Result<i64> {
         self.produce_into(topic, partition, records)
     }
@@ -1307,36 +1674,57 @@ impl datarail_kafka::serve::KafkaBroker for KafkaBrokerStore {
         })
     }
 
-    fn commit_txn(&self, producer_id: i64, epoch: i16, partitions: &[(String, i32)]) -> std::io::Result<()> {
-        self.with_write_partitions(partitions, |guards| -> std::io::Result<()> {
-            for (topic, partition, guard) in guards {
-                let key = (producer_id, epoch);
-                let records = guard.txn_buffers.entry(key).or_default();
-                let records = std::mem::take(records);
-                if !records.is_empty() {
-                    self.produce_into_with_guard(guard, topic, *partition, &records)?;
-                }
-                guard.txn_buffers.retain(|(pid, e), _| !(*pid == producer_id && *e < epoch));
+    fn commit_txn(
+        &self,
+        producer_id: i64,
+        epoch: i16,
+        partitions: &[(String, i32)],
+    ) -> std::io::Result<()> {
+        self.commit_txn_durable("", producer_id, epoch, partitions, None, &[])
+    }
+
+    fn commit_txn_with_offsets(
+        &self,
+        transactional_id: &str,
+        producer_id: i64,
+        epoch: i16,
+        partitions: &[(String, i32)],
+        group: Option<&str>,
+        offsets: &[(String, i32, i64)],
+    ) -> std::io::Result<()> {
+        self.commit_txn_durable(
+            transactional_id,
+            producer_id,
+            epoch,
+            partitions,
+            group,
+            offsets,
+        )
+    }
+
+    fn abort_txn(&self, producer_id: i64, epoch: i16, partitions: &[(String, i32)]) {
+        self.with_write_partitions(partitions, |guards| {
+            for (_, _, guard) in guards {
+                guard
+                    .txn_buffers
+                    .retain(|(pid, e), _| !(*pid == producer_id && *e <= epoch));
             }
-            Ok(())
-        })
+        });
     }
 
-    fn abort_txn(&self, producer_id: i64, epoch: i16, _partitions: &[(String, i32)]) {
-        let map = self.partitions.lock().unwrap();
-        for lock in map.values() {
-            let mut guard = lock.write().unwrap();
-            guard.txn_buffers.retain(|(pid, e), _| !(*pid == producer_id && *e <= epoch));
-        }
-    }
-
-fn fetch(&self, topic: &str, partition: i32, offset: i64, max_bytes: i32) -> std::io::Result<Vec<Vec<u8>>> {
+    fn fetch(
+        &self,
+        topic: &str,
+        partition: i32,
+        offset: i64,
+        max_bytes: i32,
+    ) -> std::io::Result<Vec<Vec<u8>>> {
+        let _gate = self.txn_gate.lock().unwrap();
         let t = topic.to_owned();
         let p = partition;
         self.with_read_partition(topic, partition, move |partition| {
             let start = usize::try_from(offset).unwrap_or(usize::MAX);
             let sealed = partition.log.read_sealed_from(start, i64::from(max_bytes))?;
-            eprintln!("DEBUG fetch: offset={}, sealed.len()={}", offset, sealed.len());
             let mut out = Vec::new();
             for (i, bytes) in sealed.iter().enumerate() {
                 let opened = datarail_cofre::decode(bytes).ok().and_then(|cofre| self.dst.open(&cofre));
@@ -1354,6 +1742,7 @@ fn fetch(&self, topic: &str, partition: i32, offset: i64, max_bytes: i32) -> std
                             format!("unreadable sealed record at offset {bad} (store corruption)"),
                         ));
                     }
+                    break; // halt the batch at the first corrupt record after valid prefix
                 }
             }
             Ok(out)
@@ -1361,25 +1750,222 @@ fn fetch(&self, topic: &str, partition: i32, offset: i64, max_bytes: i32) -> std
     }
 
     fn bounds(&self, topic: &str, partition: i32) -> (i64, i64) {
+        let _gate = self.txn_gate.lock().unwrap();
         self.with_read_partition(topic, partition, |partition| {
             let len = partition.log.len();
             (0, i64::try_from(len).unwrap_or(i64::MAX))
         })
     }
 
-    fn commit_offset(&self, group: &str, topic: &str, partition: i32, offset: i64) -> std::io::Result<()> {
-        use datarail_offsets::OffsetStore as _;
+    fn commit_offset(
+        &self,
+        group: &str,
+        topic: &str,
+        partition: i32,
+        offset: i64,
+    ) -> std::io::Result<()> {
+        let _gate = self.txn_gate.lock().unwrap();
         let key = offset_key(group, topic, partition);
         let value = u64::try_from(offset).unwrap_or(0);
         self.offsets.write().unwrap().commit(&key, value)
     }
 
-    fn fetch_offset(&self, group: &str, topic: &str, partition: i32) -> std::io::Result<Option<i64>> {
-        use datarail_offsets::OffsetStore as _;
+    fn fetch_offset(
+        &self,
+        group: &str,
+        topic: &str,
+        partition: i32,
+    ) -> std::io::Result<Option<i64>> {
+        let _gate = self.txn_gate.lock().unwrap();
         let key = offset_key(group, topic, partition);
-        Ok(self.offsets.read().unwrap().fetch(&key).map(|o| i64::try_from(o).unwrap_or(i64::MAX)))
+        Ok(self
+            .offsets
+            .read()
+            .unwrap()
+            .fetch(&key)
+            .map(|o| i64::try_from(o).unwrap_or(i64::MAX)))
     }
 }
+
+#[cfg(feature = "per_partition_locking")]
+type KafkaBrokerStore = PartitionBrokerStore;
+
+#[cfg(not(feature = "per_partition_locking"))]
+struct KafkaBrokerStore {
+    /// Compatibility rollback path: one outer mutex serializes all broker operations.
+    inner: std::sync::Mutex<PartitionBrokerStore>,
+}
+
+#[cfg(not(feature = "per_partition_locking"))]
+impl KafkaBrokerStore {
+    fn from_spec(spec: &RailSpec, data_dir: PathBuf) -> Self {
+        Self {
+            inner: std::sync::Mutex::new(PartitionBrokerStore::from_spec(spec, data_dir)),
+        }
+    }
+
+    #[cfg(test)]
+    fn with_write_partition<R>(
+        &self,
+        topic: &str,
+        partition: i32,
+        f: impl FnOnce(&mut PartitionState) -> R,
+    ) -> R {
+        let guard = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        guard.with_write_partition(topic, partition, f)
+    }
+}
+
+#[cfg(not(feature = "per_partition_locking"))]
+impl datarail_kafka::serve::KafkaBroker for KafkaBrokerStore {
+    fn produce(&self, topic: &str, partition: i32, records: &[Vec<u8>]) -> std::io::Result<i64> {
+        let guard = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        <PartitionBrokerStore as datarail_kafka::serve::KafkaBroker>::produce(
+            &guard, topic, partition, records,
+        )
+    }
+
+    fn buffer_txn(
+        &self,
+        producer_id: i64,
+        epoch: i16,
+        topic: &str,
+        partition: i32,
+        records: &[Vec<u8>],
+    ) -> std::io::Result<i64> {
+        let guard = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        <PartitionBrokerStore as datarail_kafka::serve::KafkaBroker>::buffer_txn(
+            &guard,
+            producer_id,
+            epoch,
+            topic,
+            partition,
+            records,
+        )
+    }
+
+    fn commit_txn(
+        &self,
+        producer_id: i64,
+        epoch: i16,
+        partitions: &[(String, i32)],
+    ) -> std::io::Result<()> {
+        let guard = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        <PartitionBrokerStore as datarail_kafka::serve::KafkaBroker>::commit_txn(
+            &guard,
+            producer_id,
+            epoch,
+            partitions,
+        )
+    }
+
+    fn commit_txn_with_offsets(
+        &self,
+        transactional_id: &str,
+        producer_id: i64,
+        epoch: i16,
+        partitions: &[(String, i32)],
+        group: Option<&str>,
+        offsets: &[(String, i32, i64)],
+    ) -> std::io::Result<()> {
+        let guard = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        <PartitionBrokerStore as datarail_kafka::serve::KafkaBroker>::commit_txn_with_offsets(
+            &guard,
+            transactional_id,
+            producer_id,
+            epoch,
+            partitions,
+            group,
+            offsets,
+        )
+    }
+
+    fn abort_txn(&self, producer_id: i64, epoch: i16, partitions: &[(String, i32)]) {
+        let guard = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        <PartitionBrokerStore as datarail_kafka::serve::KafkaBroker>::abort_txn(
+            &guard,
+            producer_id,
+            epoch,
+            partitions,
+        );
+    }
+
+    fn fetch(
+        &self,
+        topic: &str,
+        partition: i32,
+        offset: i64,
+        max_bytes: i32,
+    ) -> std::io::Result<Vec<Vec<u8>>> {
+        let guard = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        <PartitionBrokerStore as datarail_kafka::serve::KafkaBroker>::fetch(
+            &guard, topic, partition, offset, max_bytes,
+        )
+    }
+
+    fn bounds(&self, topic: &str, partition: i32) -> (i64, i64) {
+        let guard = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        <PartitionBrokerStore as datarail_kafka::serve::KafkaBroker>::bounds(
+            &guard, topic, partition,
+        )
+    }
+
+    fn commit_offset(
+        &self,
+        group: &str,
+        topic: &str,
+        partition: i32,
+        offset: i64,
+    ) -> std::io::Result<()> {
+        let guard = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        <PartitionBrokerStore as datarail_kafka::serve::KafkaBroker>::commit_offset(
+            &guard, group, topic, partition, offset,
+        )
+    }
+
+    fn fetch_offset(
+        &self,
+        group: &str,
+        topic: &str,
+        partition: i32,
+    ) -> std::io::Result<Option<i64>> {
+        let guard = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        <PartitionBrokerStore as datarail_kafka::serve::KafkaBroker>::fetch_offset(
+            &guard, group, topic, partition,
+        )
+    }
+}
+
 /// Kafka producer writes, an unmodified Kafka consumer reads back, and datarail's storage holds only sealed cofres
 /// (provider-blind; un-sealed only at the Fetch edge). Blocks as a daemon until killed. See `KAFKA-FETCH-DESIGN.md`.
 fn cmd_kafka_broker(rest: &[String]) -> Result<String, CliError> {
@@ -1414,7 +2000,11 @@ fn cmd_kafka_broker(rest: &[String]) -> Result<String, CliError> {
                     .parse::<i32>()
                     .ok()
                     .filter(|&n| n >= 1)
-                    .ok_or_else(|| CliError::Arg("kafka-broker: --partitions must be a positive integer".into()))?;
+                    .ok_or_else(|| {
+                        CliError::Arg(
+                            "kafka-broker: --partitions must be a positive integer".into(),
+                        )
+                    })?;
                 i += 2;
             }
             "--tls" => {
@@ -1441,7 +2031,11 @@ fn cmd_kafka_broker(rest: &[String]) -> Result<String, CliError> {
                 sasl_pass = Some(require(rest, i + 1, "pass")?.to_string());
                 i += 2;
             }
-            other => return Err(CliError::Arg(format!("kafka-broker: unexpected arg `{other}`"))),
+            other => {
+                return Err(CliError::Arg(format!(
+                    "kafka-broker: unexpected arg `{other}`"
+                )))
+            }
         }
     }
     // SASL/PLAIN: both flags or neither. Without --tls the password is on the wire in the clear — warn.
@@ -1455,9 +2049,17 @@ fn cmd_kafka_broker(rest: &[String]) -> Result<String, CliError> {
             Some(datarail_kafka::serve::SaslCreds { user, pass })
         }
         (None, None) => None,
-        _ => return Err(CliError::Arg("kafka-broker: --sasl-user and --sasl-pass must be given together".into())),
+        _ => {
+            return Err(CliError::Arg(
+                "kafka-broker: --sasl-user and --sasl-pass must be given together".into(),
+            ))
+        }
     };
-    let port: i32 = listen.rsplit(':').next().and_then(|p| p.parse().ok()).unwrap_or(9092);
+    let port: i32 = listen
+        .rsplit(':')
+        .next()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(9092);
     let listener = TcpListener::bind(&listen).map_err(|e| CliError::Io(e.to_string()))?;
     let store = std::sync::Arc::new(KafkaBrokerStore::from_spec(&spec, data_dir.clone()));
     eprintln!(
@@ -1468,11 +2070,21 @@ fn cmd_kafka_broker(rest: &[String]) -> Result<String, CliError> {
         if sasl_creds.is_some() { " [SASL/PLAIN]" } else { "" }
     );
     if tls_client_ca.is_some() && !tls {
-        return Err(CliError::Arg("kafka-broker: --tls-client-ca (mutual TLS) requires --tls".into()));
+        return Err(CliError::Arg(
+            "kafka-broker: --tls-client-ca (mutual TLS) requires --tls".into(),
+        ));
     }
     let conn_wrap = build_conn(tls, tls_cert, tls_key, tls_client_ca)?;
-    datarail_kafka::serve::serve_broker(&listener, &advertised, port, partitions, &store, &conn_wrap, sasl_creds)
-        .map_err(|e| CliError::Io(e.to_string()))?;
+    datarail_kafka::serve::serve_broker(
+        &listener,
+        &advertised,
+        port,
+        partitions,
+        &store,
+        &conn_wrap,
+        sasl_creds,
+    )
+    .map_err(|e| CliError::Io(e.to_string()))?;
     Ok(String::new())
 }
 
@@ -1481,7 +2093,13 @@ fn cmd_kafka_broker(rest: &[String]) -> Result<String, CliError> {
 /// sink's watermark table; the same substream is stable across producer retries and broker/daemon restarts. The
 /// **epoch is included** (audit D): on an epoch bump the producer's sequence resets to 0, so a new-epoch batch
 /// must form a fresh substream rather than be wrongly no-op'd against the old epoch's higher watermark (loss).
-fn eos_stream_id(route_id: &[u8], topic: &str, partition: i32, producer_id: i64, producer_epoch: i16) -> Vec<u8> {
+fn eos_stream_id(
+    route_id: &[u8],
+    topic: &str,
+    partition: i32,
+    producer_id: i64,
+    producer_epoch: i16,
+) -> Vec<u8> {
     let mut s = Vec::with_capacity(route_id.len() + topic.len() + 14);
     s.extend_from_slice(route_id);
     s.extend_from_slice(topic.as_bytes());
@@ -1504,7 +2122,10 @@ fn run_pipe(
     let mut pipe = Pipeline::from_spec(spec)?;
     let started = Instant::now();
     let mut batch_no = 0u64;
-    while let Some(batch) = source.next_batch().map_err(|e| CliError::Rail(e.to_string()))? {
+    while let Some(batch) = source
+        .next_batch()
+        .map_err(|e| CliError::Rail(e.to_string()))?
+    {
         // Each streamed batch is a distinct effectively-once identity (`datarail-run-<n>`).
         let record_key = format!("datarail-run-{batch_no}");
         pipe.ship_batch(&batch, record_key.as_bytes(), sink)?;
@@ -1575,7 +2196,9 @@ fn cmd_pair(rest: &[String]) -> Result<String, CliError> {
         (None, None) => cmd_pair_local(),
         (Some(addr), None) => cmd_pair_remote(&r2, PairRole::Initiator, &addr),
         (None, Some(addr)) => cmd_pair_remote(&r2, PairRole::Responder, &addr),
-        (Some(_), Some(_)) => Err(CliError::Rail("give --connect OR --listen, not both".to_owned())),
+        (Some(_), Some(_)) => Err(CliError::Rail(
+            "give --connect OR --listen, not both".to_owned(),
+        )),
     }
 }
 
@@ -1602,7 +2225,9 @@ fn cmd_pair_remote(rest: &[String], role: PairRole, addr: &str) -> Result<String
     let (my_static, _r2) = take_flag(&r1, "--my-static");
     let local = match my_static {
         Some(h) => {
-            let s: [u8; 32] = from_hex(&h).and_then(|v| v.try_into().ok()).ok_or(CliError::BadHex)?;
+            let s: [u8; 32] = from_hex(&h)
+                .and_then(|v| v.try_into().ok())
+                .ok_or(CliError::BadHex)?;
             StaticKeypair::from_secret(s)
         }
         None => StaticKeypair::generate().map_err(|e| CliError::Identity(e.to_string()))?,
@@ -1641,11 +2266,15 @@ fn cmd_pair_remote(rest: &[String], role: PairRole, addr: &str) -> Result<String
     let peer_msg = exchange(&mut stream, role, &my_msg)?;
 
     // (2) Derive (always succeeds for a well-formed message); exchange the confirmation tags.
-    let my_tag = pairing.derive(&peer_msg).map_err(|e| CliError::Identity(e.to_string()))?;
+    let my_tag = pairing
+        .derive(&peer_msg)
+        .map_err(|e| CliError::Identity(e.to_string()))?;
     let peer_tag = exchange(&mut stream, role, &my_tag)?;
 
     // (3) Confirm: a wrong code or a swapped (MITM) static makes the tags disagree → failure.
-    let secret = pairing.confirm(&peer_tag).map_err(|e| CliError::Identity(e.to_string()))?;
+    let secret = pairing
+        .confirm(&peer_tag)
+        .map_err(|e| CliError::Identity(e.to_string()))?;
 
     let (role_name, peer_pub) = match role {
         PairRole::Initiator => ("initiator", b_pub),
@@ -1690,25 +2319,49 @@ fn cmd_pair_local() -> Result<String, CliError> {
         .map_err(|e| CliError::Identity(e.to_string()))?;
     let (mut pb, msg_b) = Pairing::start_responder(&code, a.public(), b.public())
         .map_err(|e| CliError::Identity(e.to_string()))?;
-    let tag_a = pa.derive(&msg_b).map_err(|e| CliError::Identity(e.to_string()))?;
-    let tag_b = pb.derive(&msg_a).map_err(|e| CliError::Identity(e.to_string()))?;
-    let secret_a = pa.confirm(&tag_b).map_err(|e| CliError::Identity(e.to_string()))?;
-    let secret_b = pb.confirm(&tag_a).map_err(|e| CliError::Identity(e.to_string()))?;
+    let tag_a = pa
+        .derive(&msg_b)
+        .map_err(|e| CliError::Identity(e.to_string()))?;
+    let tag_b = pb
+        .derive(&msg_a)
+        .map_err(|e| CliError::Identity(e.to_string()))?;
+    let secret_a = pa
+        .confirm(&tag_b)
+        .map_err(|e| CliError::Identity(e.to_string()))?;
+    let secret_b = pb
+        .confirm(&tag_a)
+        .map_err(|e| CliError::Identity(e.to_string()))?;
     if secret_a != secret_b {
         return Err(CliError::Identity("pairing secrets disagreed".to_owned()));
     }
 
     // --- F2: Noise_KK handshake between the two pinned statics + a sealed round-trip. ---
-    let mut init = KkSession::initiator(&a, b.public()).map_err(|e| CliError::Identity(e.to_string()))?;
-    let mut resp = KkSession::responder(&b, a.public()).map_err(|e| CliError::Identity(e.to_string()))?;
-    let h1 = init.write_handshake(&[]).map_err(|e| CliError::Identity(e.to_string()))?;
-    resp.read_handshake(&h1).map_err(|e| CliError::Identity(e.to_string()))?;
-    let h2 = resp.write_handshake(&[]).map_err(|e| CliError::Identity(e.to_string()))?;
-    init.read_handshake(&h2).map_err(|e| CliError::Identity(e.to_string()))?;
-    let mut at = init.into_transport().map_err(|e| CliError::Identity(e.to_string()))?;
-    let mut bt = resp.into_transport().map_err(|e| CliError::Identity(e.to_string()))?;
-    let ct = at.encrypt(b"datarail-noise-roundtrip").map_err(|e| CliError::Identity(e.to_string()))?;
-    let pt = bt.decrypt(&ct).map_err(|e| CliError::Identity(e.to_string()))?;
+    let mut init =
+        KkSession::initiator(&a, b.public()).map_err(|e| CliError::Identity(e.to_string()))?;
+    let mut resp =
+        KkSession::responder(&b, a.public()).map_err(|e| CliError::Identity(e.to_string()))?;
+    let h1 = init
+        .write_handshake(&[])
+        .map_err(|e| CliError::Identity(e.to_string()))?;
+    resp.read_handshake(&h1)
+        .map_err(|e| CliError::Identity(e.to_string()))?;
+    let h2 = resp
+        .write_handshake(&[])
+        .map_err(|e| CliError::Identity(e.to_string()))?;
+    init.read_handshake(&h2)
+        .map_err(|e| CliError::Identity(e.to_string()))?;
+    let mut at = init
+        .into_transport()
+        .map_err(|e| CliError::Identity(e.to_string()))?;
+    let mut bt = resp
+        .into_transport()
+        .map_err(|e| CliError::Identity(e.to_string()))?;
+    let ct = at
+        .encrypt(b"datarail-noise-roundtrip")
+        .map_err(|e| CliError::Identity(e.to_string()))?;
+    let pt = bt
+        .decrypt(&ct)
+        .map_err(|e| CliError::Identity(e.to_string()))?;
     if pt != b"datarail-noise-roundtrip" {
         return Err(CliError::Identity("noise round-trip mismatch".to_owned()));
     }
@@ -1756,7 +2409,10 @@ fn cmd_send(rest: &[String]) -> Result<String, CliError> {
 
     let records: Vec<Vec<u8>> = if let Some(path) = source_file {
         let raw = std::fs::read(&path).map_err(|e| CliError::Io(format!("{path}: {e}")))?;
-        raw.split(|&b| b == b'\n').filter(|l| !l.is_empty()).map(<[u8]>::to_vec).collect()
+        raw.split(|&b| b == b'\n')
+            .filter(|l| !l.is_empty())
+            .map(<[u8]>::to_vec)
+            .collect()
     } else {
         resolve_inline_or_stdin(positionals.iter().map(|s| s.as_bytes().to_vec()).collect())?
     };
@@ -1764,16 +2420,23 @@ fn cmd_send(rest: &[String]) -> Result<String, CliError> {
         return Err(CliError::Rail("nothing to send (empty source)".to_owned()));
     }
 
-    let mut src = SourceTerminal::new(spec.terminal_config(), spec.onboarding_contract(), spec.keys.source_seed);
+    let mut src = SourceTerminal::new(
+        spec.terminal_config(),
+        spec.onboarding_contract(),
+        spec.keys.source_seed,
+    );
     let refs: Vec<&[u8]> = records.iter().map(Vec::as_slice).collect();
-    let cofre = src.board(&refs, b"datarail-send").map_err(CliError::Terminal)?;
+    let cofre = src
+        .board(&refs, b"datarail-send")
+        .map_err(CliError::Terminal)?;
 
     // Connect with a short retry window so `send` can be launched ~concurrently with `recv`; then build the hop
     // (a Noise_KK-protected channel when --noise-secret/--peer-public are given, else plain TCP).
     let stream = connect_with_retry(&addr)?;
     let hop = if noise.is_some() { "noise" } else { "tcp" };
     let mut rail = build_hop(stream, noise, true)?;
-    rail.send(&cofre).map_err(|e| CliError::Rail(e.to_string()))?;
+    rail.send(&cofre)
+        .map_err(|e| CliError::Rail(e.to_string()))?;
     // Hold the connection briefly so the kernel flushes the framed cofre before the socket closes.
     std::thread::sleep(std::time::Duration::from_millis(100));
 
@@ -1793,8 +2456,12 @@ fn parse_noise(
     match (secret, peer) {
         (None, None) => Ok(None),
         (Some(s), Some(p)) => {
-            let sk: [u8; 32] = from_hex(&s).and_then(|v| v.try_into().ok()).ok_or(CliError::BadHex)?;
-            let pk: [u8; 32] = from_hex(&p).and_then(|v| v.try_into().ok()).ok_or(CliError::BadHex)?;
+            let sk: [u8; 32] = from_hex(&s)
+                .and_then(|v| v.try_into().ok())
+                .ok_or(CliError::BadHex)?;
+            let pk: [u8; 32] = from_hex(&p)
+                .and_then(|v| v.try_into().ok())
+                .ok_or(CliError::BadHex)?;
             Ok(Some((StaticKeypair::from_secret(sk), pk)))
         }
         _ => Err(CliError::Rail(
@@ -1839,7 +2506,9 @@ fn connect_with_retry(addr: &str) -> Result<TcpStream, CliError> {
             }
         }
     }
-    Err(CliError::Rail(format!("could not connect to {addr}: {last}")))
+    Err(CliError::Rail(format!(
+        "could not connect to {addr}: {last}"
+    )))
 }
 
 /// Bind `listen`, announce the bound address (`DATARAIL-LISTENING <addr>`, flushed, so a peer/orchestrator can
@@ -1847,11 +2516,18 @@ fn connect_with_retry(addr: &str) -> Result<TcpStream, CliError> {
 /// never hangs). Shared by `datarail recv` and `datarail pair --listen`.
 fn bind_announce_accept(listen: &str) -> Result<(TcpStream, std::net::SocketAddr), CliError> {
     use std::io::Write as _;
-    let listener = TcpListener::bind(listen).map_err(|e| CliError::Rail(format!("{listen}: {e}")))?;
-    let bound = listener.local_addr().map_err(|e| CliError::Rail(e.to_string()))?;
+    let listener =
+        TcpListener::bind(listen).map_err(|e| CliError::Rail(format!("{listen}: {e}")))?;
+    let bound = listener
+        .local_addr()
+        .map_err(|e| CliError::Rail(e.to_string()))?;
     println!("DATARAIL-LISTENING {bound}");
-    std::io::stdout().flush().map_err(|e| CliError::Io(e.to_string()))?;
-    listener.set_nonblocking(true).map_err(|e| CliError::Rail(e.to_string()))?;
+    std::io::stdout()
+        .flush()
+        .map_err(|e| CliError::Io(e.to_string()))?;
+    listener
+        .set_nonblocking(true)
+        .map_err(|e| CliError::Rail(e.to_string()))?;
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         match listener.accept() {
@@ -1870,7 +2546,8 @@ fn bind_announce_accept(listen: &str) -> Result<(TcpStream, std::net::SocketAddr
 /// Write a `u32`-length-prefixed frame to a pairing socket.
 fn write_framed_stream(s: &mut TcpStream, bytes: &[u8]) -> Result<(), CliError> {
     use std::io::Write as _;
-    let len = u32::try_from(bytes.len()).map_err(|_| CliError::Rail("frame too large".to_owned()))?;
+    let len =
+        u32::try_from(bytes.len()).map_err(|_| CliError::Rail("frame too large".to_owned()))?;
     s.write_all(&len.to_le_bytes())
         .and_then(|()| s.write_all(bytes))
         .and_then(|()| s.flush())
@@ -1950,7 +2627,9 @@ fn cmd_recv(rest: &[String]) -> Result<String, CliError> {
         spec.keys.dest_x25519_secret,
     );
     let mut sink: Box<dyn Sink> = match sink_file {
-        Some(path) => Box::new(LineFileSink::create(path).map_err(|e| CliError::Io(e.to_string()))?),
+        Some(path) => {
+            Box::new(LineFileSink::create(path).map_err(|e| CliError::Io(e.to_string()))?)
+        }
         None => Box::new(VecSink::new()),
     };
 
@@ -1965,12 +2644,14 @@ fn cmd_recv(rest: &[String]) -> Result<String, CliError> {
         match rail.recv().map_err(|e| CliError::Rail(e.to_string()))? {
             Some(cofre) => {
                 let _ = dst.offload(&cofre).map_err(CliError::Terminal)?;
-                rail.ack(cofre.etiqueta.cofre_id).map_err(|e| CliError::Rail(e.to_string()))?;
+                rail.ack(cofre.etiqueta.cofre_id)
+                    .map_err(|e| CliError::Rail(e.to_string()))?;
                 received += 1;
                 let total = dst.sink().committed().len();
                 if total > committed_to_sink {
                     let fresh: Vec<Vec<u8>> = dst.sink().committed()[committed_to_sink..].to_vec();
-                    sink.commit(&fresh).map_err(|e| CliError::Rail(e.to_string()))?;
+                    sink.commit(&fresh)
+                        .map_err(|e| CliError::Rail(e.to_string()))?;
                     committed_to_sink = total;
                 }
             }
@@ -2004,7 +2685,7 @@ mod tests {
     use datarail_core::Disposition;
     use datarail_crypto::verifying_key;
     use datarail_spec::RailSpec;
-    use datarail_terminal::SourceTerminal;
+    use datarail_terminal::{SourceTerminal, TerminalError};
 
     const K32: &str = "0x1111111111111111111111111111111111111111111111111111111111111111";
 
@@ -2049,22 +2730,40 @@ mod tests {
         assert!(out.contains("committed   = 2"), "{out}");
         assert!(out.contains("dead-letter = 0"), "{out}");
         // An in-memory sink reports Tier C (at-least-once) — exactly-once needs a transactional sink.
-        assert!(out.contains("guarantee   = at-least-once (Tier C)"), "{out}");
+        assert!(
+            out.contains("guarantee   = at-least-once (Tier C)"),
+            "{out}"
+        );
         // The records actually landed in the sink connector (end-to-end through board→rail→offload→commit).
-        assert_eq!(sink.committed_view().unwrap(), &[b"evt:a".to_vec(), b"evt:b".to_vec()]);
+        assert_eq!(
+            sink.committed_view().unwrap(),
+            &[b"evt:a".to_vec(), b"evt:b".to_vec()]
+        );
     }
 
     #[test]
     fn tier_a_requires_an_append_ordered_source_and_opt_in() {
         use super::wants_tier_a;
         // Tier A only when NOT --at-least-once AND the source is append-ordered (file/replay/inline).
-        assert!(wants_tier_a(false, true), "ordered source, default => Tier A exactly-once");
+        assert!(
+            wants_tier_a(false, true),
+            "ordered source, default => Tier A exactly-once"
+        );
         // A non-ordered source (HTTP / Kafka ingest) is NEVER Tier A — a positional watermark would be unsound
         // (audit F1/F2): it must fall back to at-least-once (Tier C never loses a record).
-        assert!(!wants_tier_a(false, false), "non-ordered source => at-least-once even by default");
+        assert!(
+            !wants_tier_a(false, false),
+            "non-ordered source => at-least-once even by default"
+        );
         // --at-least-once always forces Tier C, even for an ordered source.
         assert!(!wants_tier_a(true, true), "--at-least-once opts out");
         assert!(!wants_tier_a(true, false));
+    }
+
+    #[test]
+    fn batch_too_large_maps_to_non_retriable_input_error() {
+        let error = super::seal_error(TerminalError::BatchTooLarge);
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
     }
 
     #[test]
@@ -2078,9 +2777,13 @@ mod tests {
         let _ = std::fs::remove_dir_all(&data_dir);
         let store = super::KafkaBrokerStore::from_spec(&spec, data_dir.clone());
         // A stale-epoch (epoch 0) record gets buffered under producer 7.
-        store.buffer_txn(7, 0, "events", 0, &[b"evt:zombie".to_vec()]).unwrap();
+        store
+            .buffer_txn(7, 0, "events", 0, &[b"evt:zombie".to_vec()])
+            .unwrap();
         // The live incarnation (epoch 1) buffers + commits at epoch 1.
-        store.buffer_txn(7, 1, "events", 0, &[b"evt:fresh".to_vec()]).unwrap();
+        store
+            .buffer_txn(7, 1, "events", 0, &[b"evt:fresh".to_vec()])
+            .unwrap();
         store.commit_txn(7, 1, &[("events".to_owned(), 0)]).unwrap();
         // Only the epoch-1 record is durable/visible; the stale epoch-0 buffer was DROPPED, never committed.
         assert_eq!(
@@ -2088,6 +2791,383 @@ mod tests {
             vec![b"evt:fresh".to_vec()],
             "the stale-epoch zombie must not be committed"
         );
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    #[test]
+    fn abort_txn_only_discards_enrolled_partitions() {
+        use datarail_kafka::serve::KafkaBroker as _;
+        let spec = RailSpec::parse(&sample()).unwrap();
+        let data_dir =
+            std::env::temp_dir().join(format!("datarail-txn-abort-scope-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&data_dir);
+        let store = super::KafkaBrokerStore::from_spec(&spec, data_dir.clone());
+
+        store
+            .buffer_txn(12, 0, "events", 0, &[b"evt:aborted".to_vec()])
+            .unwrap();
+        store
+            .buffer_txn(12, 0, "events", 1, &[b"evt:committed".to_vec()])
+            .unwrap();
+        store.abort_txn(12, 0, &[("events".to_owned(), 0)]);
+        store
+            .commit_txn(12, 0, &[("events".to_owned(), 1)])
+            .unwrap();
+
+        assert!(store.fetch("events", 0, 0, 1_000_000).unwrap().is_empty());
+        assert_eq!(
+            store.fetch("events", 1, 0, 1_000_000).unwrap(),
+            vec![b"evt:committed".to_vec()]
+        );
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    #[test]
+    fn reverse_order_txn_commits_do_not_deadlock_with_partition_io() {
+        use datarail_kafka::serve::KafkaBroker as _;
+        use std::sync::{Arc, Barrier};
+        use std::thread;
+
+        let spec = RailSpec::parse(&sample()).unwrap();
+        let mut data_dir = std::env::temp_dir();
+        data_dir.push(format!("datarail-lock-order-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&data_dir);
+        let store = Arc::new(super::PartitionBrokerStore::from_spec(
+            &spec,
+            data_dir.clone(),
+        ));
+        for (pid, value) in [
+            (101, b"evt:txn-a".as_slice()),
+            (202, b"evt:txn-b".as_slice()),
+        ] {
+            store
+                .buffer_txn(pid, 0, "events", 0, &[value.to_vec()])
+                .unwrap();
+            store
+                .buffer_txn(pid, 0, "events", 1, &[value.to_vec()])
+                .unwrap();
+        }
+
+        let start = Arc::new(Barrier::new(5));
+        let commit_a = {
+            let store = Arc::clone(&store);
+            let start = Arc::clone(&start);
+            thread::spawn(move || {
+                start.wait();
+                store.commit_txn(
+                    101,
+                    0,
+                    &[("events".to_owned(), 0), ("events".to_owned(), 1)],
+                )
+            })
+        };
+        let commit_b = {
+            let store = Arc::clone(&store);
+            let start = Arc::clone(&start);
+            thread::spawn(move || {
+                start.wait();
+                store.commit_txn(
+                    202,
+                    0,
+                    &[("events".to_owned(), 1), ("events".to_owned(), 0)],
+                )
+            })
+        };
+        let producer = {
+            let store = Arc::clone(&store);
+            let start = Arc::clone(&start);
+            thread::spawn(move || {
+                start.wait();
+                for _ in 0..20 {
+                    store.produce("events", 0, &[b"evt:produce".to_vec()])?;
+                }
+                Ok::<(), std::io::Error>(())
+            })
+        };
+        let fetcher = {
+            let store = Arc::clone(&store);
+            let start = Arc::clone(&start);
+            thread::spawn(move || {
+                start.wait();
+                for _ in 0..20 {
+                    let _ = store.fetch("events", 1, 0, 1_000_000)?;
+                }
+                Ok::<(), std::io::Error>(())
+            })
+        };
+        start.wait();
+
+        commit_a.join().unwrap().unwrap();
+        commit_b.join().unwrap().unwrap();
+        producer.join().unwrap().unwrap();
+        fetcher.join().unwrap().unwrap();
+        assert!(store.bounds("events", 0).1 >= 22);
+        assert!(store.bounds("events", 1).1 >= 2);
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    #[test]
+    fn failed_txn_commit_restores_unlanded_buffer_for_retry() {
+        use datarail_kafka::serve::KafkaBroker as _;
+
+        let spec = RailSpec::parse(&sample()).unwrap();
+        let mut data_dir = std::env::temp_dir();
+        data_dir.push(format!("datarail-txn-restore-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&data_dir);
+        let store = super::PartitionBrokerStore::from_spec(&spec, data_dir.clone());
+        store.with_write_partition("events", 0, |state| {
+            state
+                .txn_buffers
+                .insert((303, 0), vec![b"evt:good".to_vec(), b"no-prefix".to_vec()]);
+        });
+
+        let error = store
+            .commit_txn(303, 0, &[("events".to_owned(), 0)])
+            .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        let retained = store.with_read_partition("events", 0, |state| {
+            state.txn_buffers.get(&(303, 0)).cloned()
+        });
+        assert_eq!(
+            retained,
+            Some(vec![b"evt:good".to_vec(), b"no-prefix".to_vec()])
+        );
+
+        store.abort_txn(303, 0, &[("events".to_owned(), 0)]);
+        assert!(store.with_read_partition("events", 0, |state| state.txn_buffers.is_empty()));
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    #[test]
+    fn committed_txn_records_and_offsets_survive_restart() {
+        use datarail_kafka::serve::KafkaBroker as _;
+
+        let spec = RailSpec::parse(&sample()).unwrap();
+        let data_dir =
+            std::env::temp_dir().join(format!("datarail-txn-restart-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&data_dir);
+        {
+            let store = super::PartitionBrokerStore::from_spec(&spec, data_dir.clone());
+            store
+                .buffer_txn(77, 0, "events", 0, &[b"evt:p0".to_vec()])
+                .unwrap();
+            store
+                .buffer_txn(77, 0, "events", 1, &[b"evt:p1".to_vec()])
+                .unwrap();
+            store
+                .commit_txn_with_offsets(
+                    "transaction-77",
+                    77,
+                    0,
+                    &[("events".to_owned(), 0), ("events".to_owned(), 1)],
+                    Some("group"),
+                    &[("events".to_owned(), 0, 1), ("events".to_owned(), 1, 1)],
+                )
+                .unwrap();
+        }
+        let reopened = super::PartitionBrokerStore::from_spec(&spec, data_dir.clone());
+        assert_eq!(
+            reopened.fetch("events", 0, 0, 1_000_000).unwrap(),
+            vec![b"evt:p0".to_vec()]
+        );
+        assert_eq!(
+            reopened.fetch("events", 1, 0, 1_000_000).unwrap(),
+            vec![b"evt:p1".to_vec()]
+        );
+        assert_eq!(
+            reopened.fetch_offset("group", "events", 0).unwrap(),
+            Some(1)
+        );
+        assert_eq!(
+            reopened.fetch_offset("group", "events", 1).unwrap(),
+            Some(1)
+        );
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    #[test]
+    fn transaction_fault_points_recover_all_or_none() {
+        use datarail_kafka::serve::KafkaBroker as _;
+        use std::panic::{catch_unwind, AssertUnwindSafe};
+
+        let spec = RailSpec::parse(&sample()).unwrap();
+        for point in 1..=5 {
+            let data_dir = std::env::temp_dir()
+                .join(format!("datarail-txn-fault-{point}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&data_dir);
+            let store = super::PartitionBrokerStore::from_spec(&spec, data_dir.clone());
+            store
+                .buffer_txn(99, 0, "events", 0, &[b"evt:fault-0".to_vec()])
+                .unwrap();
+            store
+                .buffer_txn(99, 0, "events", 1, &[b"evt:fault-1".to_vec()])
+                .unwrap();
+            super::arm_txn_fault(point);
+            let result = catch_unwind(AssertUnwindSafe(|| {
+                store.commit_txn_with_offsets(
+                    "fault-transaction",
+                    99,
+                    0,
+                    &[("events".to_owned(), 0), ("events".to_owned(), 1)],
+                    Some("fault-group"),
+                    &[("events".to_owned(), 0, 1), ("events".to_owned(), 1, 1)],
+                )
+            }));
+            assert!(
+                result.is_err(),
+                "fault point {point} did not fire: {result:?}"
+            );
+            drop(store);
+
+            let reopened = super::PartitionBrokerStore::from_spec(&spec, data_dir.clone());
+            let p0 = reopened.fetch("events", 0, 0, 1_000_000).unwrap();
+            let p1 = reopened.fetch("events", 1, 0, 1_000_000).unwrap();
+            if point == 5 {
+                assert_eq!(p0, vec![b"evt:fault-0".to_vec()]);
+                assert_eq!(p1, vec![b"evt:fault-1".to_vec()]);
+                assert_eq!(
+                    reopened.fetch_offset("fault-group", "events", 0).unwrap(),
+                    Some(1)
+                );
+                assert_eq!(
+                    reopened.fetch_offset("fault-group", "events", 1).unwrap(),
+                    Some(1)
+                );
+            } else {
+                assert!(p0.is_empty(), "fault point {point} left partition 0 data");
+                assert!(p1.is_empty(), "fault point {point} left partition 1 data");
+                assert_eq!(
+                    reopened.fetch_offset("fault-group", "events", 0).unwrap(),
+                    None
+                );
+                assert_eq!(
+                    reopened.fetch_offset("fault-group", "events", 1).unwrap(),
+                    None
+                );
+            }
+            let _ = std::fs::remove_dir_all(&data_dir);
+        }
+    }
+
+    #[test]
+    fn pending_txn_intent_rolls_back_durable_participant_on_restart() {
+        use datarail_kafka::serve::KafkaBroker as _;
+
+        let spec = RailSpec::parse(&sample()).unwrap();
+        let data_dir =
+            std::env::temp_dir().join(format!("datarail-txn-recovery-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&data_dir);
+        {
+            let store = super::PartitionBrokerStore::from_spec(&spec, data_dir.clone());
+            let prepared = store
+                .txn_journal
+                .lock()
+                .unwrap()
+                .prepare(
+                    "pending",
+                    88,
+                    0,
+                    vec![super::txn_journal::ParticipantBoundary {
+                        topic: "events".to_owned(),
+                        partition: 0,
+                        byte_end: 0,
+                        logical_end: 0,
+                    }],
+                    Vec::new(),
+                )
+                .unwrap();
+            store.with_write_partition("events", 0, |state| {
+                store
+                    .produce_into_with_guard(state, "events", 0, &[b"evt:orphan".to_vec()])
+                    .unwrap();
+            });
+            assert_eq!(prepared.participants[0].logical_end, 0);
+        }
+        let reopened = super::PartitionBrokerStore::from_spec(&spec, data_dir.clone());
+        assert!(reopened
+            .fetch("events", 0, 0, 1_000_000)
+            .unwrap()
+            .is_empty());
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    #[test]
+    #[ignore = "manual 10k-operation contention stress"]
+    fn ten_thousand_concurrent_partition_operations_complete() {
+        use datarail_kafka::serve::KafkaBroker as _;
+        use std::sync::{Arc, Barrier};
+        use std::thread;
+
+        const OPS: usize = 2_500;
+        let spec = RailSpec::parse(&sample()).unwrap();
+        let mut data_dir = std::env::temp_dir();
+        data_dir.push(format!("datarail-10k-lock-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&data_dir);
+        let store = Arc::new(super::PartitionBrokerStore::from_spec(
+            &spec,
+            data_dir.clone(),
+        ));
+        store
+            .buffer_txn(404, 0, "events", 0, &[b"evt:txn".to_vec()])
+            .unwrap();
+        store
+            .buffer_txn(404, 0, "events", 1, &[b"evt:txn".to_vec()])
+            .unwrap();
+
+        let start = Arc::new(Barrier::new(5));
+        let producer_zero = {
+            let store = Arc::clone(&store);
+            let start = Arc::clone(&start);
+            thread::spawn(move || {
+                start.wait();
+                for _ in 0..OPS {
+                    store.produce("events", 0, &[b"evt:p0".to_vec()])?;
+                }
+                Ok::<(), std::io::Error>(())
+            })
+        };
+        let producer_one = {
+            let store = Arc::clone(&store);
+            let start = Arc::clone(&start);
+            thread::spawn(move || {
+                start.wait();
+                for _ in 0..OPS {
+                    store.produce("events", 1, &[b"evt:p1".to_vec()])?;
+                }
+                Ok::<(), std::io::Error>(())
+            })
+        };
+        let fetcher = {
+            let store = Arc::clone(&store);
+            let start = Arc::clone(&start);
+            thread::spawn(move || {
+                start.wait();
+                for offset in 0..OPS {
+                    let _ = store.fetch("events", 0, i64::try_from(offset).unwrap(), 1)?;
+                }
+                Ok::<(), std::io::Error>(())
+            })
+        };
+        let committer = {
+            let store = Arc::clone(&store);
+            let start = Arc::clone(&start);
+            thread::spawn(move || {
+                start.wait();
+                let partitions = [("events".to_owned(), 1), ("events".to_owned(), 0)];
+                for _ in 0..OPS {
+                    store.commit_txn(404, 0, &partitions)?;
+                }
+                Ok::<(), std::io::Error>(())
+            })
+        };
+        start.wait();
+
+        producer_zero.join().unwrap().unwrap();
+        producer_one.join().unwrap().unwrap();
+        fetcher.join().unwrap().unwrap();
+        committer.join().unwrap().unwrap();
+        assert!(store.bounds("events", 0).1 >= i64::try_from(OPS).unwrap());
+        assert!(store.bounds("events", 1).1 >= i64::try_from(OPS).unwrap());
         let _ = std::fs::remove_dir_all(&data_dir);
     }
 
@@ -2102,16 +3182,23 @@ mod tests {
         data_dir.push(format!("datarail-txn-contract-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&data_dir);
         let store = super::KafkaBrokerStore::from_spec(&spec, data_dir.clone());
-        let err = store.buffer_txn(9, 0, "events", 0, &[b"no-prefix".to_vec()]).unwrap_err();
+        let err = store
+            .buffer_txn(9, 0, "events", 0, &[b"no-prefix".to_vec()])
+            .unwrap_err();
         assert_eq!(
             err.kind(),
             std::io::ErrorKind::InvalidData,
             "a contract violation must be InvalidData (maps to non-retriable INVALID_RECORD 87)"
         );
         // A conforming record still buffers and commits normally.
-        store.buffer_txn(9, 0, "events", 0, &[b"evt:ok".to_vec()]).unwrap();
+        store
+            .buffer_txn(9, 0, "events", 0, &[b"evt:ok".to_vec()])
+            .unwrap();
         store.commit_txn(9, 0, &[("events".to_owned(), 0)]).unwrap();
-        assert_eq!(store.fetch("events", 0, 0, 1_000_000).unwrap(), vec![b"evt:ok".to_vec()]);
+        assert_eq!(
+            store.fetch("events", 0, 0, 1_000_000).unwrap(),
+            vec![b"evt:ok".to_vec()]
+        );
         let _ = std::fs::remove_dir_all(&data_dir);
     }
 
@@ -2123,24 +3210,40 @@ mod tests {
         use datarail_kafka::serve::KafkaBroker as _;
         let spec = RailSpec::parse(&sample()).unwrap();
         let mut data_dir = std::env::temp_dir();
-        data_dir.push(format!("datarail-corrupt-fetch-test-{}", std::process::id()));
+        data_dir.push(format!(
+            "datarail-corrupt-fetch-test-{}",
+            std::process::id()
+        ));
         let _ = std::fs::remove_dir_all(&data_dir);
         let store = super::KafkaBrokerStore::from_spec(&spec, data_dir.clone());
-        store.produce("events", 0, &[b"evt:first".to_vec()]).unwrap();
+        store
+            .produce("events", 0, &[b"evt:first".to_vec()])
+            .unwrap();
         {
             // Inject a VALID log frame whose payload is NOT a decodable cofre (store-level corruption).
             store.with_write_partition("events", 0, |state| {
-                state.log.append_durable(&[b"not-a-cofre".to_vec()]).unwrap();
+                state
+                    .log
+                    .append_durable(&[b"not-a-cofre".to_vec()])
+                    .unwrap();
             });
         }
-        store.produce("events", 0, &[b"evt:third".to_vec()]).unwrap();
+        store
+            .produce("events", 0, &[b"evt:third".to_vec()])
+            .unwrap();
         // The prefix before the corruption returns with correct offsets; nothing is renumbered.
-        assert_eq!(store.fetch("events", 0, 0, 1_000_000).unwrap(), vec![b"evt:first".to_vec()]);
+        assert_eq!(
+            store.fetch("events", 0, 0, 1_000_000).unwrap(),
+            vec![b"evt:first".to_vec()]
+        );
         // Fetching AT the corrupt offset is a loud InvalidData error, not a silent skip.
         let err = store.fetch("events", 0, 1, 1_000_000).unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
         // The record AFTER the corruption is still addressable at its ORIGINAL offset.
-        assert_eq!(store.fetch("events", 0, 2, 1_000_000).unwrap(), vec![b"evt:third".to_vec()]);
+        assert_eq!(
+            store.fetch("events", 0, 2, 1_000_000).unwrap(),
+            vec![b"evt:third".to_vec()]
+        );
         let _ = std::fs::remove_dir_all(&data_dir);
     }
 
@@ -2151,10 +3254,15 @@ mod tests {
         use datarail_kafka::serve::KafkaBroker as _;
         let spec = RailSpec::parse(&sample()).unwrap();
         let mut data_dir = std::env::temp_dir();
-        data_dir.push(format!("datarail-parallel-seal-test-{}", std::process::id()));
+        data_dir.push(format!(
+            "datarail-parallel-seal-test-{}",
+            std::process::id()
+        ));
         let _ = std::fs::remove_dir_all(&data_dir);
         let store = super::KafkaBrokerStore::from_spec(&spec, data_dir.clone());
-        let recs: Vec<Vec<u8>> = (0..100).map(|i| format!("evt:r{i:03}").into_bytes()).collect();
+        let recs: Vec<Vec<u8>> = (0..100)
+            .map(|i| format!("evt:r{i:03}").into_bytes())
+            .collect();
         assert_eq!(store.produce("events", 0, &recs).unwrap(), 0);
         assert_eq!(
             store.fetch("events", 0, 0, 10_000_000).unwrap(),
@@ -2180,7 +3288,10 @@ mod tests {
         // Provider-blind: the bytes ON DISK are sealed cofres — they must NOT contain the plaintext payload.
         // (A disk snapshot of the broker's data dir reveals nothing — the moat vs a plaintext Kafka segment.)
         let on_disk = read_all_under(&data_dir);
-        assert!(!on_disk.is_empty(), "the durable log wrote something to disk");
+        assert!(
+            !on_disk.is_empty(),
+            "the durable log wrote something to disk"
+        );
         assert!(
             !contains(&on_disk, b"secret-a") && !contains(&on_disk, b"secret-b"),
             "on-disk bytes must be sealed ciphertext, never plaintext (provider-blind across restart)"
@@ -2191,22 +3302,38 @@ mod tests {
         // Re-fetching the SAME offset is idempotent (no dedup) — a consumer may re-read.
         assert_eq!(store.fetch("events", 0, 0, 1_000_000).unwrap(), recs);
         // A partial fetch from offset 1 returns the suffix.
-        assert_eq!(store.fetch("events", 0, 1, 1_000_000).unwrap(), vec![b"evt:secret-b".to_vec()]);
+        assert_eq!(
+            store.fetch("events", 0, 1, 1_000_000).unwrap(),
+            vec![b"evt:secret-b".to_vec()]
+        );
         // Fetch past the end → empty (the consumer waits / retries), never a panic.
         assert!(store.fetch("events", 0, 5, 1_000_000).unwrap().is_empty());
         // ListOffsets bounds: earliest 0, latest = record count.
         assert_eq!(store.bounds("events", 0), (0, 2));
         // A second produce appends (logical offset continues).
-        assert_eq!(store.produce("events", 0, &[b"evt:secret-c".to_vec()]).unwrap(), 2);
+        assert_eq!(
+            store
+                .produce("events", 0, &[b"evt:secret-c".to_vec()])
+                .unwrap(),
+            2
+        );
         assert_eq!(store.bounds("events", 0), (0, 3));
 
         // DURABILITY: a fresh store over the SAME data dir (simulating a restart) recovers every acked record.
         drop(store);
         let reopened = super::KafkaBrokerStore::from_spec(&spec, data_dir.clone());
-        assert_eq!(reopened.bounds("events", 0), (0, 3), "all acked records recovered after restart");
+        assert_eq!(
+            reopened.bounds("events", 0),
+            (0, 3),
+            "all acked records recovered after restart"
+        );
         assert_eq!(
             reopened.fetch("events", 0, 0, 1_000_000).unwrap(),
-            vec![b"evt:secret-a".to_vec(), b"evt:secret-b".to_vec(), b"evt:secret-c".to_vec()]
+            vec![
+                b"evt:secret-a".to_vec(),
+                b"evt:secret-b".to_vec(),
+                b"evt:secret-c".to_vec()
+            ]
         );
         let _ = std::fs::remove_dir_all(&data_dir);
     }
@@ -2238,11 +3365,31 @@ mod tests {
         let route = [1u8; 16];
         let base = eos_stream_id(&route, "events", 0, 7, 0);
         // Different partition, producer, topic, route, or epoch ⇒ a different stream id (no watermark collision).
-        assert_ne!(base, eos_stream_id(&route, "events", 1, 7, 0), "partition must matter");
-        assert_ne!(base, eos_stream_id(&route, "events", 0, 8, 0), "producer_id must matter");
-        assert_ne!(base, eos_stream_id(&route, "orders", 0, 7, 0), "topic must matter");
-        assert_ne!(base, eos_stream_id(&[2u8; 16], "events", 0, 7, 0), "route_id must matter");
-        assert_ne!(base, eos_stream_id(&route, "events", 0, 7, 1), "producer_epoch must matter (audit D)");
+        assert_ne!(
+            base,
+            eos_stream_id(&route, "events", 1, 7, 0),
+            "partition must matter"
+        );
+        assert_ne!(
+            base,
+            eos_stream_id(&route, "events", 0, 8, 0),
+            "producer_id must matter"
+        );
+        assert_ne!(
+            base,
+            eos_stream_id(&route, "orders", 0, 7, 0),
+            "topic must matter"
+        );
+        assert_ne!(
+            base,
+            eos_stream_id(&[2u8; 16], "events", 0, 7, 0),
+            "route_id must matter"
+        );
+        assert_ne!(
+            base,
+            eos_stream_id(&route, "events", 0, 7, 1),
+            "producer_epoch must matter (audit D)"
+        );
         // Same coordinates ⇒ same id (stable across retries / restarts).
         assert_eq!(base, eos_stream_id(&route, "events", 0, 7, 0));
     }
@@ -2258,11 +3405,26 @@ mod tests {
 
     #[test]
     fn substrate_field_selects_the_real_substrate() {
-        assert!(matches!(AnyRail::from_spec("loopback").unwrap(), AnyRail::Loopback(_)));
-        assert!(matches!(AnyRail::from_spec("auto").unwrap(), AnyRail::Loopback(_)));
-        assert!(matches!(AnyRail::from_spec("tcp").unwrap(), AnyRail::Tcp(_)));
-        assert!(matches!(AnyRail::from_spec("shmem").unwrap(), AnyRail::Shmem(_)));
-        assert!(matches!(AnyRail::from_spec("s3").unwrap(), AnyRail::ObjectStore(_)));
+        assert!(matches!(
+            AnyRail::from_spec("loopback").unwrap(),
+            AnyRail::Loopback(_)
+        ));
+        assert!(matches!(
+            AnyRail::from_spec("auto").unwrap(),
+            AnyRail::Loopback(_)
+        ));
+        assert!(matches!(
+            AnyRail::from_spec("tcp").unwrap(),
+            AnyRail::Tcp(_)
+        ));
+        assert!(matches!(
+            AnyRail::from_spec("shmem").unwrap(),
+            AnyRail::Shmem(_)
+        ));
+        assert!(matches!(
+            AnyRail::from_spec("s3").unwrap(),
+            AnyRail::ObjectStore(_)
+        ));
         assert!(AnyRail::from_spec("bogus").is_err());
     }
 
@@ -2284,7 +3446,10 @@ mod tests {
 
     #[test]
     fn hex_round_trips() {
-        assert_eq!(from_hex("0xdeadbeef").unwrap(), vec![0xde, 0xad, 0xbe, 0xef]);
+        assert_eq!(
+            from_hex("0xdeadbeef").unwrap(),
+            vec![0xde, 0xad, 0xbe, 0xef]
+        );
         assert_eq!(to_hex(&[0xde, 0xad, 0xbe, 0xef]), "deadbeef");
         assert!(from_hex("xyz").is_none());
         assert!(from_hex("0d0").is_none());
@@ -2298,19 +3463,39 @@ mod tests {
     }
 
     /// Ship one batch of `records` under `key` through `pipe`/`sink` and return its disposition.
-    fn ship_once(pipe: &mut Pipeline, sink: &mut AnySink, records: Vec<Vec<u8>>, key: &[u8]) -> Disposition {
+    fn ship_once(
+        pipe: &mut Pipeline,
+        sink: &mut AnySink,
+        records: Vec<Vec<u8>>,
+        key: &[u8],
+    ) -> Disposition {
         let mut source = SliceSource::one(records);
         let batch = source.next_batch().unwrap().unwrap();
-        pipe.ship_batch(&batch, key, sink).unwrap().unwrap().disposition
+        pipe.ship_batch(&batch, key, sink)
+            .unwrap()
+            .unwrap()
+            .disposition
     }
 
     #[test]
     fn parse_range_accepts_exclusive_inclusive_and_all() {
-        assert!(matches!(parse_range("1..3", 5).unwrap(), super::RecordRange { start: 1, end: 3 }));
-        assert!(matches!(parse_range("1..=3", 5).unwrap(), super::RecordRange { start: 1, end: 4 }));
-        assert!(matches!(parse_range("all", 5).unwrap(), super::RecordRange { start: 0, end: 5 }));
+        assert!(matches!(
+            parse_range("1..3", 5).unwrap(),
+            super::RecordRange { start: 1, end: 3 }
+        ));
+        assert!(matches!(
+            parse_range("1..=3", 5).unwrap(),
+            super::RecordRange { start: 1, end: 4 }
+        ));
+        assert!(matches!(
+            parse_range("all", 5).unwrap(),
+            super::RecordRange { start: 0, end: 5 }
+        ));
         // Empty range is valid (start == end).
-        assert!(matches!(parse_range("2..2", 5).unwrap(), super::RecordRange { start: 2, end: 2 }));
+        assert!(matches!(
+            parse_range("2..2", 5).unwrap(),
+            super::RecordRange { start: 2, end: 2 }
+        ));
     }
 
     #[test]
@@ -2337,7 +3522,10 @@ mod tests {
         let disp = ship_once(&mut pipe, &mut sink, slice, b"datarail-replay-1..3");
 
         assert_eq!(disp, Disposition::Delivered);
-        assert_eq!(sink.committed_view().unwrap(), &[b"evt:r1".to_vec(), b"evt:r2".to_vec()]);
+        assert_eq!(
+            sink.committed_view().unwrap(),
+            &[b"evt:r1".to_vec(), b"evt:r2".to_vec()]
+        );
         assert_eq!(pipe.landed_total(), 2); // the terminal sink is drained each batch; the counter is authoritative
         assert_eq!(pipe.dst_term.dead_letters().len(), 0);
     }
@@ -2368,10 +3556,16 @@ mod tests {
     #[test]
     fn cmd_replay_malformed_range_errors() {
         // Inline records so `replay` does not block on stdin; the bad range must surface as Err, not a panic.
-        let toml = std::env::temp_dir().join(format!("datarail-replay-bad-{}.toml", std::process::id()));
+        let toml =
+            std::env::temp_dir().join(format!("datarail-replay-bad-{}.toml", std::process::id()));
         std::fs::write(&toml, sample()).unwrap();
         let path = toml.to_string_lossy().into_owned();
-        let args = vec![path.clone(), "not-a-range".to_owned(), "evt:a".to_owned(), "evt:b".to_owned()];
+        let args = vec![
+            path.clone(),
+            "not-a-range".to_owned(),
+            "evt:a".to_owned(),
+            "evt:b".to_owned(),
+        ];
         assert!(super::cmd_replay(&args).is_err());
         let _ = std::fs::remove_file(&toml);
     }
@@ -2379,7 +3573,8 @@ mod tests {
     #[test]
     fn cmd_replay_subrange_through_the_real_command() {
         // End-to-end through `cmd_replay`: inline 4 records, replay [1..3), report must show 2 re-committed.
-        let toml = std::env::temp_dir().join(format!("datarail-replay-ok-{}.toml", std::process::id()));
+        let toml =
+            std::env::temp_dir().join(format!("datarail-replay-ok-{}.toml", std::process::id()));
         std::fs::write(&toml, sample()).unwrap();
         let path = toml.to_string_lossy().into_owned();
         let args = vec![
@@ -2413,6 +3608,9 @@ mod tests {
 
         assert!(watched.contains("committed   = 3"), "{watched}");
         assert_eq!(watch_sink.committed_view().unwrap().len(), 3);
-        assert_eq!(watch_sink.committed_view().unwrap(), plain_sink.committed_view().unwrap());
+        assert_eq!(
+            watch_sink.committed_view().unwrap(),
+            plain_sink.committed_view().unwrap()
+        );
     }
 }

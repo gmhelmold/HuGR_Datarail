@@ -140,7 +140,8 @@ impl Config {
     /// Parse a config from a TOML file at `path`, layering over [`Config::default`]. Only the documented flat
     /// `key = value` keys are recognised; any unknown key is a hard error (typo safety). All values optional.
     fn from_path(path: &str) -> Result<Self, ShimError> {
-        let text = std::fs::read_to_string(path).map_err(|e| ShimError::Config(format!("{path}: {e}")))?;
+        let text =
+            std::fs::read_to_string(path).map_err(|e| ShimError::Config(format!("{path}: {e}")))?;
         Self::from_str(&text)
     }
 
@@ -169,7 +170,9 @@ impl Config {
             }
         }
         if cfg.batch_max_records == 0 {
-            return Err(ShimError::Config("batch_max_records must be >= 1".to_owned()));
+            return Err(ShimError::Config(
+                "batch_max_records must be >= 1".to_owned(),
+            ));
         }
         Ok(cfg)
     }
@@ -324,9 +327,16 @@ async fn serve(cfg: Config) -> Result<(), ShimError> {
 
     // Report the actually-bound addresses (an OS-assigned `:0` port resolves here) so a test/orchestrator can
     // discover them; flush so the line is observable before the accept loops block.
-    let ingress_bound = ingress.local_addr().map_err(|e| ShimError::Bind(e.to_string()))?;
-    let egress_bound = egress.local_addr().map_err(|e| ShimError::Bind(e.to_string()))?;
-    println!("DATARAIL-OMB-SHIM ingress={ingress_bound} egress={egress_bound} substrate={:?}", cfg.substrate);
+    let ingress_bound = ingress
+        .local_addr()
+        .map_err(|e| ShimError::Bind(e.to_string()))?;
+    let egress_bound = egress
+        .local_addr()
+        .map_err(|e| ShimError::Bind(e.to_string()))?;
+    println!(
+        "DATARAIL-OMB-SHIM ingress={ingress_bound} egress={egress_bound} substrate={:?}",
+        cfg.substrate
+    );
     flush_stdout();
 
     let registry: Registry = Arc::new(Mutex::new(HashMap::new()));
@@ -336,8 +346,9 @@ async fn serve(cfg: Config) -> Result<(), ShimError> {
     // silently serving on one port.
     let ingress_registry = Arc::clone(&registry);
     let ingress_cfg = cfg.clone();
-    let ingress_task =
-        tokio::spawn(async move { accept_loop(ingress, ingress_registry, ingress_cfg, ConnKind::Ingress).await });
+    let ingress_task = tokio::spawn(async move {
+        accept_loop(ingress, ingress_registry, ingress_cfg, ConnKind::Ingress).await
+    });
     let egress_task =
         tokio::spawn(async move { accept_loop(egress, registry, cfg, ConnKind::Egress).await });
 
@@ -403,7 +414,10 @@ fn topic_handle(registry: &Registry, cfg: &Config, topic: &str) -> Option<TopicH
     let depth = cfg.batch_max_records.saturating_mul(16).clamp(256, 65_536);
     let (ingress_tx, ingress_rx) = mpsc::channel::<Ingested>(depth);
     let subscribers: Arc<Mutex<Vec<mpsc::Sender<Delivered>>>> = Arc::new(Mutex::new(Vec::new()));
-    let handle = TopicHandle { ingress_tx, subscribers: Arc::clone(&subscribers) };
+    let handle = TopicHandle {
+        ingress_tx,
+        subscribers: Arc::clone(&subscribers),
+    };
     let worker_cfg = cfg.clone();
     let topic_name = topic.to_owned();
     let runtime = Handle::current();
@@ -499,7 +513,10 @@ impl TopicEngine {
         let cofre = match self.source.board(&refs, &record_key) {
             Ok(c) => c,
             Err(e) => {
-                eprintln!("datarail-omb-shim[{topic}]: board failed ({e}); dropping {} record(s)", batch.len());
+                eprintln!(
+                    "datarail-omb-shim[{topic}]: board failed ({e}); dropping {} record(s)",
+                    batch.len()
+                );
                 return;
             }
         };
@@ -507,7 +524,9 @@ impl TopicEngine {
         let received = match self.transport.relay(&cofre) {
             Ok(c) => c,
             Err(e) => {
-                eprintln!("datarail-omb-shim[{topic}]: substrate relay failed ({e}); dropping batch");
+                eprintln!(
+                    "datarail-omb-shim[{topic}]: substrate relay failed ({e}); dropping batch"
+                );
                 return;
             }
         };
@@ -531,7 +550,12 @@ impl TopicEngine {
         // the egress writer emits `[len][record]` directly, so there is no per-message split/clone of the payload.
         for record in self.dest.sink_mut().take_committed() {
             if record.len() >= 8 {
-                fan_out(subscribers, &Delivered { record: Arc::new(record) });
+                fan_out(
+                    subscribers,
+                    &Delivered {
+                        record: Arc::new(record),
+                    },
+                );
             } else {
                 eprintln!("datarail-omb-shim[{topic}]: committed record shorter than 8-byte ts header; skip");
             }
@@ -595,7 +619,11 @@ enum BatchRecv {
 /// Receive the next ingested record, waiting at most until `deadline`. Drives the async
 /// [`tokio::sync::mpsc::Receiver`] from the blocking worker thread via `handle.block_on(timeout(..))` — so the
 /// batch time window is honoured without busy-spinning and without blocking a runtime worker.
-fn recv_until(handle: &Handle, ingress_rx: &mut mpsc::Receiver<Ingested>, deadline: Instant) -> BatchRecv {
+fn recv_until(
+    handle: &Handle,
+    ingress_rx: &mut mpsc::Receiver<Ingested>,
+    deadline: Instant,
+) -> BatchRecv {
     let now = Instant::now();
     if now >= deadline {
         return BatchRecv::WindowElapsed;
@@ -712,7 +740,8 @@ where
     loop {
         match sub.recv() {
             Ok(Some(received)) => {
-                sub.ack(received.etiqueta.cofre_id).map_err(|e| format!("ack: {e}"))?;
+                sub.ack(received.etiqueta.cofre_id)
+                    .map_err(|e| format!("ack: {e}"))?;
                 return Ok(received);
             }
             Ok(None) => {
@@ -739,7 +768,9 @@ where
 async fn serve_ingress(stream: TcpStream, registry: &Registry, cfg: &Config) {
     if let Err(e) = serve_ingress_inner(stream, registry, cfg).await {
         // EOF/peer-close is the normal end of a producer; only note genuinely unexpected errors.
-        if e.kind() != std::io::ErrorKind::UnexpectedEof && e.kind() != std::io::ErrorKind::ConnectionReset {
+        if e.kind() != std::io::ErrorKind::UnexpectedEof
+            && e.kind() != std::io::ErrorKind::ConnectionReset
+        {
             eprintln!("datarail-omb-shim: ingress connection ended: {e}");
         }
     }
@@ -747,7 +778,11 @@ async fn serve_ingress(stream: TcpStream, registry: &Registry, cfg: &Config) {
 
 /// The fallible body of [`serve_ingress`]; every framing/socket error bubbles up as `io::Error` to end the
 /// connection task without panicking.
-async fn serve_ingress_inner(stream: TcpStream, registry: &Registry, cfg: &Config) -> std::io::Result<()> {
+async fn serve_ingress_inner(
+    stream: TcpStream,
+    registry: &Registry,
+    cfg: &Config,
+) -> std::io::Result<()> {
     // Buffered async I/O on BOTH directions: an unbuffered per-message read+ack is ~3 syscalls/msg, which caps
     // throughput at the syscall rate (the real bottleneck, not the crypto). A BufReader coalesces frame reads
     // and a BufWriter coalesces acks; acks flush when we have caught up to the socket (so a streaming producer
@@ -775,7 +810,9 @@ async fn serve_ingress_inner(stream: TcpStream, registry: &Registry, cfg: &Confi
             ReadEnd::Full => {}
         }
         let payload_len = u32::from_be_bytes([hdr[0], hdr[1], hdr[2], hdr[3]]) as usize;
-        let publish_ts = u64::from_be_bytes([hdr[4], hdr[5], hdr[6], hdr[7], hdr[8], hdr[9], hdr[10], hdr[11]]);
+        let publish_ts = u64::from_be_bytes([
+            hdr[4], hdr[5], hdr[6], hdr[7], hdr[8], hdr[9], hdr[10], hdr[11],
+        ]);
         if payload_len > cfg.max_record_bytes {
             return Err(std::io::Error::other(format!(
                 "frame payload_len {payload_len} exceeds max_record_bytes {}",
@@ -827,7 +864,11 @@ async fn serve_egress(stream: TcpStream, registry: &Registry, cfg: &Config) {
 /// The fallible body of [`serve_egress`]: register a subscriber channel, then write each delivered frame to
 /// the socket. The `sub` name is read per the protocol and (intentionally) used only to model an independent
 /// delivery copy — every subscription receives every message (OMB consumer-group semantics, v1).
-async fn serve_egress_inner(stream: TcpStream, registry: &Registry, cfg: &Config) -> std::io::Result<()> {
+async fn serve_egress_inner(
+    stream: TcpStream,
+    registry: &Registry,
+    cfg: &Config,
+) -> std::io::Result<()> {
     let (read_half, write_half) = stream.into_split();
     let mut reader = BufReader::new(read_half);
     let topic = read_topic_header(&mut reader).await?;
@@ -866,7 +907,10 @@ async fn serve_egress_inner(stream: TcpStream, registry: &Registry, cfg: &Config
 /// Write one egress frame `[u32 payload_len][u64 publish_ts][payload]` into the buffered writer. Because a
 /// committed record is exactly `publish_ts || payload`, the frame body after the length prefix IS the record
 /// bytes — write the length then the record slice directly. No split, no per-message payload copy.
-async fn write_egress_frame<W: AsyncWriteExt + Unpin>(out: &mut W, d: &Delivered) -> std::io::Result<()> {
+async fn write_egress_frame<W: AsyncWriteExt + Unpin>(
+    out: &mut W,
+    d: &Delivered,
+) -> std::io::Result<()> {
     let payload_len = u32::try_from(d.record.len() - 8)
         .map_err(|_| std::io::Error::other("delivered payload exceeds u32"))?;
     out.write_all(&payload_len.to_be_bytes()).await?;
@@ -910,7 +954,9 @@ async fn read_exact_or_eof<R: AsyncReadExt + Unpin>(
 }
 
 /// Read a `[u16 len][utf8]` length-prefixed string (big-endian). Used for the topic and the subscription name.
-async fn read_len_prefixed_string<R: AsyncReadExt + Unpin>(stream: &mut R) -> std::io::Result<String> {
+async fn read_len_prefixed_string<R: AsyncReadExt + Unpin>(
+    stream: &mut R,
+) -> std::io::Result<String> {
     let mut len_bytes = [0u8; 2];
     stream.read_exact(&mut len_bytes).await?;
     let len = u16::from_be_bytes(len_bytes) as usize;

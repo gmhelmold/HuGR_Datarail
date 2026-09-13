@@ -93,7 +93,11 @@ fn seg_name(start: u64) -> String {
 }
 
 fn seg_start(path: &Path) -> Option<u64> {
-    path.file_name()?.to_str()?.strip_suffix(".seg")?.parse().ok()
+    path.file_name()?
+        .to_str()?
+        .strip_suffix(".seg")?
+        .parse()
+        .ok()
 }
 
 /// fsync the directory itself so a newly-created entry (a segment file) survives a power loss — an fsync of
@@ -130,10 +134,15 @@ impl ReplayLog {
         let path = dir.join(seg_name(active_start));
         // Recover the valid length of the active segment (scan frames; stop at a torn/short tail).
         let valid_len = scan_valid_len(&path)?;
-        let active = OpenOptions::new().create(true).read(true).write(true).truncate(false).open(&path)?;
+        let active = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(&path)?;
         active.set_len(valid_len)?; // drop any torn tail
-        // Persist the directory entries we may have just created (the log dir + the first segment): without a
-        // dir fsync, a power loss could erase the dentries of a log whose records were already acked durable.
+                                    // Persist the directory entries we may have just created (the log dir + the first segment): without a
+                                    // dir fsync, a power loss could erase the dentries of a log whose records were already acked durable.
         fsync_dir(&dir)?;
         if let Some(parent) = dir.parent().filter(|p| !p.as_os_str().is_empty()) {
             fsync_dir(parent)?;
@@ -153,6 +162,12 @@ impl ReplayLog {
     #[must_use]
     pub fn end_offset(&self) -> u64 {
         self.write_offset
+    }
+
+    /// The directory path where segment files are stored.
+    #[must_use]
+    pub fn dir(&self) -> &Path {
+        &self.dir
     }
 
     /// Append one record, returning its logical offset (a valid `replay_from` seek point). Rotates to a new
@@ -186,6 +201,54 @@ impl ReplayLog {
         self.active.flush()?;
         self.active.sync_all()?;
         // Persist the directory entry so new file handles see the latest data.
+        fsync_dir(&self.dir)?;
+        Ok(())
+    }
+
+    /// Truncate the retained log to a previously returned record boundary.
+    ///
+    /// Removes every later segment, truncates the target segment when needed, and reopens the active handle at the
+    /// new end. Intended for transaction recovery before the broker accepts connections; callers must exclude readers.
+    ///
+    /// # Errors
+    /// [`ReplayError::BadOffset`] if `end_offset` is past the current end or not a valid frame boundary; filesystem
+    /// failures are returned as [`ReplayError::Io`].
+    pub fn truncate_to(&mut self, end_offset: u64) -> Result<(), ReplayError> {
+        if end_offset > self.write_offset {
+            return Err(ReplayError::BadOffset(end_offset));
+        }
+        if end_offset == self.write_offset {
+            return Ok(());
+        }
+
+        let starts = segment_starts(&self.dir)?;
+        let target_index = starts
+            .partition_point(|&start| start <= end_offset)
+            .saturating_sub(1);
+        let target_start = starts.get(target_index).copied().unwrap_or(0);
+        let target_path = self.dir.join(seg_name(target_start));
+        let relative = end_offset.saturating_sub(target_start);
+        if !is_frame_boundary(&target_path, relative)? {
+            return Err(ReplayError::BadOffset(end_offset));
+        }
+
+        self.active.flush()?;
+        self.active.sync_all()?;
+        let active = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(&target_path)?;
+        drop(std::mem::replace(&mut self.active, active));
+
+        for &start in starts.iter().skip(target_index + 1) {
+            std::fs::remove_file(self.dir.join(seg_name(start)))?;
+        }
+        self.active.set_len(relative)?;
+        self.active.seek(SeekFrom::Start(relative))?;
+        self.active_start = target_start;
+        self.write_offset = end_offset;
         fsync_dir(&self.dir)?;
         Ok(())
     }
@@ -227,8 +290,16 @@ impl ReplayLog {
             return Err(ReplayError::BadOffset(start_offset));
         }
         let starts = segment_starts(&self.dir)?;
-        let seg_idx = starts.partition_point(|&s| s <= start_offset).saturating_sub(1);
-        Replay::open(self.dir.clone(), starts, seg_idx, start_offset, self.write_offset)
+        let seg_idx = starts
+            .partition_point(|&s| s <= start_offset)
+            .saturating_sub(1);
+        Replay::open(
+            self.dir.clone(),
+            starts,
+            seg_idx,
+            start_offset,
+            self.write_offset,
+        )
     }
 }
 
@@ -247,7 +318,8 @@ fn scan_valid_len(path: &Path) -> Result<u64, ReplayError> {
         if pos + 4 > bytes.len() {
             break;
         }
-        let len = u32::from_le_bytes([bytes[pos], bytes[pos + 1], bytes[pos + 2], bytes[pos + 3]]) as usize;
+        let len = u32::from_le_bytes([bytes[pos], bytes[pos + 1], bytes[pos + 2], bytes[pos + 3]])
+            as usize;
         if len > MAX_RECORD {
             break;
         }
@@ -255,13 +327,55 @@ fn scan_valid_len(path: &Path) -> Result<u64, ReplayError> {
         if end > bytes.len() {
             break;
         }
-        let stored = u32::from_le_bytes([bytes[end - 4], bytes[end - 3], bytes[end - 2], bytes[end - 1]]);
+        let stored = u32::from_le_bytes([
+            bytes[end - 4],
+            bytes[end - 3],
+            bytes[end - 2],
+            bytes[end - 1],
+        ]);
         if stored != crc32(&[&bytes[pos..pos + 4], &bytes[pos + 4..pos + 4 + len]]) {
             break;
         }
         pos = end;
     }
     Ok(pos as u64)
+}
+
+fn is_frame_boundary(path: &Path, target: u64) -> Result<bool, ReplayError> {
+    let mut file = File::open(path)?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+    let target = usize::try_from(target).map_err(|_| ReplayError::BadOffset(target))?;
+    if target > bytes.len() {
+        return Ok(false);
+    }
+    let mut pos = 0usize;
+    while pos < target {
+        let Some(len_bytes) = bytes.get(pos..pos + 4) else {
+            return Ok(false);
+        };
+        let len = u32::from_le_bytes(
+            len_bytes
+                .try_into()
+                .map_err(|_| ReplayError::BadOffset(target as u64))?,
+        ) as usize;
+        let Some(end) = pos.checked_add(4 + len + 4) else {
+            return Ok(false);
+        };
+        if end > target || end > bytes.len() {
+            return Ok(false);
+        }
+        let stored = u32::from_le_bytes(
+            bytes[end - 4..end]
+                .try_into()
+                .map_err(|_| ReplayError::BadOffset(target as u64))?,
+        );
+        if stored != crc32(&[&bytes[pos..pos + 4], &bytes[pos + 4..pos + 4 + len]]) {
+            return Ok(false);
+        }
+        pos = end;
+    }
+    Ok(pos == target)
 }
 
 /// A streaming, flat-RAM replay cursor over the retained log. Yields `(offset, record)` in order.
@@ -388,7 +502,12 @@ impl Replay {
                 continue;
             }
             let p = self.cursor;
-            let len = u32::from_le_bytes([self.buf[p], self.buf[p + 1], self.buf[p + 2], self.buf[p + 3]]) as usize;
+            let len = u32::from_le_bytes([
+                self.buf[p],
+                self.buf[p + 1],
+                self.buf[p + 2],
+                self.buf[p + 3],
+            ]) as usize;
             if len > MAX_RECORD {
                 // Corruption: resync to the next segment if one exists, else (final segment) stop — a torn tail.
                 if self.resync_or_stop(self.buf_base + self.cursor as u64)? {
@@ -432,7 +551,7 @@ impl Replay {
 
 #[cfg(test)]
 mod tests {
-    use super::{ReplayLog, MAX_RECORD, REFILL_CHUNK};
+    use super::{ReplayError, ReplayLog, MAX_RECORD, REFILL_CHUNK};
 
     fn tmpdir(tag: &str) -> std::path::PathBuf {
         let mut d = std::env::temp_dir();
@@ -498,7 +617,10 @@ mod tests {
         log.sync().expect("sync");
         let first = drain(&log, 0);
         let second = drain(&log, 0); // read AGAIN — Kafka-style; unlike the WAL, nothing was consumed/GC'd
-        assert_eq!(first, second, "replay was not repeatable — history was not retained");
+        assert_eq!(
+            first, second,
+            "replay was not repeatable — history was not retained"
+        );
         assert_eq!(first.len(), 300);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -524,6 +646,38 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[test]
+    fn truncate_to_boundary_removes_later_segments_and_survives_reopen() {
+        let dir = tmpdir("truncate");
+        let mut log = ReplayLog::open(&dir, 1024).expect("open");
+        let mut offsets = Vec::new();
+        for i in 0u32..100 {
+            offsets.push(
+                log.append(format!("record-{i}").as_bytes())
+                    .expect("append"),
+            );
+        }
+        log.sync().expect("sync");
+
+        let keep_before = offsets[37];
+        assert!(matches!(
+            log.truncate_to(keep_before + 1),
+            Err(ReplayError::BadOffset(_))
+        ));
+        log.truncate_to(keep_before)
+            .expect("truncate at record boundary");
+        assert_eq!(drain(&log, 0).len(), 37);
+        log.append(b"replacement").expect("append after truncate");
+        log.sync().expect("sync replacement");
+
+        let reopened = ReplayLog::open(&dir, 1024).expect("reopen");
+        let got = drain(&reopened, 0);
+        assert_eq!(got.len(), 38);
+        assert_eq!(got[36].1, b"record-36");
+        assert_eq!(got[37].1, b"replacement");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// The ledger #2 gate: replay a retained volume MANY times the read buffer, and prove the in-RAM read buffer
     /// stays bounded by `REFILL_CHUNK + one record` the whole way — RAM flat, independent of total volume.
     #[test]
@@ -531,7 +685,7 @@ mod tests {
         let dir = tmpdir("flatram");
         let mut log = ReplayLog::open(&dir, 1 << 20).expect("open"); // 1 MiB segments
         let rec = vec![0xABu8; 1024]; // 1 KiB records
-        // ~40 MiB of retained history — ~640× the 64 KiB read buffer.
+                                      // ~40 MiB of retained history — ~640× the 64 KiB read buffer.
         let target = 40 * 1024 * 1024u64;
         while log.end_offset() < target {
             log.append(&rec).expect("append");
@@ -552,10 +706,19 @@ mod tests {
                 r.bytes_buffered()
             );
         }
-        assert!(count >= 30_000, "did not replay the full volume ({count} records)");
+        assert!(
+            count >= 30_000,
+            "did not replay the full volume ({count} records)"
+        );
         // The witness: peak buffered RAM is O(read buffer), NOT O(total retained volume).
-        assert!(peak <= bound, "peak {peak} exceeded the flat-RAM bound {bound}");
-        assert!(total >= 40 * 1024 * 1024, "sanity: retained volume was large ({total} bytes)");
+        assert!(
+            peak <= bound,
+            "peak {peak} exceeded the flat-RAM bound {bound}"
+        );
+        assert!(
+            total >= 40 * 1024 * 1024,
+            "sanity: retained volume was large ({total} bytes)"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -567,7 +730,8 @@ mod tests {
         let n = 2000u32;
         let mut log = ReplayLog::open(&dir, 4096).expect("open"); // small segments → many of them
         for i in 0..n {
-            log.append(format!("resync-record-{i:05}").as_bytes()).expect("append");
+            log.append(format!("resync-record-{i:05}").as_bytes())
+                .expect("append");
         }
         log.sync().expect("sync");
 
@@ -578,7 +742,11 @@ mod tests {
             .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("seg"))
             .collect();
         segs.sort();
-        assert!(segs.len() >= 3, "test needs >=3 segments, got {}", segs.len());
+        assert!(
+            segs.len() >= 3,
+            "test needs >=3 segments, got {}",
+            segs.len()
+        );
 
         // Corrupt a body byte in the MIDDLE of a non-final segment so its CRC fails.
         let victim = &segs[segs.len() / 2];
@@ -596,7 +764,10 @@ mod tests {
             "later intact segments were unreachable — resync did not happen"
         );
         // The corrupt segment's tail is dropped, so we never deliver all n records, but we DO reach the end.
-        assert!(got.len() < n as usize, "expected to lose the corrupt segment's tail");
+        assert!(
+            got.len() < n as usize,
+            "expected to lose the corrupt segment's tail"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -607,7 +778,8 @@ mod tests {
         let n = 2000u32;
         let mut log = ReplayLog::open(&dir, 4096).expect("open");
         for i in 0..n {
-            log.append(format!("tail-record-{i:05}").as_bytes()).expect("append");
+            log.append(format!("tail-record-{i:05}").as_bytes())
+                .expect("append");
         }
         log.sync().expect("sync");
 
@@ -617,7 +789,11 @@ mod tests {
             .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("seg"))
             .collect();
         segs.sort();
-        assert!(segs.len() >= 3, "test needs >=3 segments, got {}", segs.len());
+        assert!(
+            segs.len() >= 3,
+            "test needs >=3 segments, got {}",
+            segs.len()
+        );
 
         // Corrupt a body byte in the MIDDLE of the FINAL segment → no later segment → clean truncation.
         let victim = segs.last().expect("final segment");
@@ -628,8 +804,14 @@ mod tests {
 
         let got = drain(&log, 0);
         // Some records survive (everything before the torn tail), but not all — and no error/panic.
-        assert!(!got.is_empty(), "clean records before the tear should still replay");
-        assert!(got.len() < n as usize, "the torn tail should have been truncated");
+        assert!(
+            !got.is_empty(),
+            "clean records before the tear should still replay"
+        );
+        assert!(
+            got.len() < n as usize,
+            "the torn tail should have been truncated"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

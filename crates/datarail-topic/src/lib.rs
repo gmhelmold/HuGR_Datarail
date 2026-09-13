@@ -78,7 +78,9 @@ impl Topic {
     /// # Errors
     /// [`TopicError::Log`] on a filesystem error.
     pub fn open(dir: impl AsRef<Path>, segment_bytes: u64) -> Result<Self, TopicError> {
-        Ok(Self { log: ReplayLog::open(dir, segment_bytes)? })
+        Ok(Self {
+            log: ReplayLog::open(dir, segment_bytes)?,
+        })
     }
 
     /// Append one `(key, payload)` record; returns its durable offset.
@@ -135,7 +137,12 @@ impl Topic {
         // Advance the cursor to just past this record (its frame is 8 overhead + body).
         group.cursor = offset + 8 + rec.len() as u64;
         let member = group.router.route(key).ok_or(TopicError::Corrupt)?;
-        Ok(Some(Dispatched { member, offset, key: key.to_vec(), payload: payload.to_vec() }))
+        Ok(Some(Dispatched {
+            member,
+            offset,
+            key: key.to_vec(),
+            payload: payload.to_vec(),
+        }))
     }
 }
 
@@ -164,7 +171,11 @@ impl Group {
     /// A group starting at offset 0 with the given member ids.
     #[must_use]
     pub fn new(members: &[u64]) -> Self {
-        Self { router: Router::from_nodes(members), cursor: 0, replay: None }
+        Self {
+            router: Router::from_nodes(members),
+            cursor: 0,
+            replay: None,
+        }
     }
 
     /// Add a member. Future records route through the larger set; already-dispatched records are untouched (no
@@ -226,7 +237,9 @@ mod tests {
         let dir = tmpdir("multigroup");
         let mut topic = Topic::open(&dir, 1 << 16).expect("open");
         for i in 0..3000u32 {
-            topic.produce(&key_of(i), format!("val-{i}").as_bytes()).expect("produce");
+            topic
+                .produce(&key_of(i), format!("val-{i}").as_bytes())
+                .expect("produce");
         }
         topic.sync().expect("sync");
 
@@ -237,7 +250,11 @@ mod tests {
         let got_b = drain_all(&topic, &mut b);
 
         assert_eq!(got_a.len(), 3000, "group A did not see all records");
-        assert_eq!(got_b.len(), 3000, "group B did not independently replay all records");
+        assert_eq!(
+            got_b.len(),
+            3000,
+            "group B did not independently replay all records"
+        );
         // Same payloads, in the same log order, regardless of group membership.
         let pa: Vec<&Vec<u8>> = got_a.iter().map(|d| &d.payload).collect();
         let pb: Vec<&Vec<u8>> = got_b.iter().map(|d| &d.payload).collect();
@@ -252,7 +269,9 @@ mod tests {
         let dir = tmpdir("dist");
         let mut topic = Topic::open(&dir, 1 << 16).expect("open");
         for i in 0..4000u32 {
-            topic.produce(&key_of(i), format!("{i}").as_bytes()).expect("produce");
+            topic
+                .produce(&key_of(i), format!("{i}").as_bytes())
+                .expect("produce");
         }
         topic.sync().expect("sync");
 
@@ -265,7 +284,10 @@ mod tests {
         let mut last_seq: HashMap<Vec<u8>, i64> = HashMap::new();
         for d in &got {
             let o = owner.entry(d.key.clone()).or_insert(d.member);
-            assert_eq!(*o, d.member, "key routed to two different members (order broken)");
+            assert_eq!(
+                *o, d.member,
+                "key routed to two different members (order broken)"
+            );
             let seq: i64 = String::from_utf8_lossy(&d.payload).parse().expect("num");
             let prev = last_seq.entry(d.key.clone()).or_insert(-1);
             assert!(seq > *prev, "per-key order violated");
@@ -284,7 +306,9 @@ mod tests {
         let dir = tmpdir("join");
         let mut topic = Topic::open(&dir, 1 << 16).expect("open");
         for i in 0..2000u32 {
-            topic.produce(&key_of(i), format!("{i}").as_bytes()).expect("produce");
+            topic
+                .produce(&key_of(i), format!("{i}").as_bytes())
+                .expect("produce");
         }
         topic.sync().expect("sync");
 
@@ -300,10 +324,20 @@ mod tests {
         while let Some(d) = topic.dispatch_next(&mut g).expect("d") {
             second.push(d);
         }
-        assert_eq!(first.len() + second.len(), 2000, "lost records across the join");
+        assert_eq!(
+            first.len() + second.len(),
+            2000,
+            "lost records across the join"
+        );
         // The new member can only appear AFTER the join (never retroactively).
-        assert!(first.iter().all(|d| d.member != 4), "new member got pre-join work — that's a reshuffle");
-        assert!(second.iter().any(|d| d.member == 4), "new member never received post-join work");
+        assert!(
+            first.iter().all(|d| d.member != 4),
+            "new member got pre-join work — that's a reshuffle"
+        );
+        assert!(
+            second.iter().any(|d| d.member == 4),
+            "new member never received post-join work"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -314,7 +348,11 @@ mod tests {
         let mut topic = Topic::open(&dir, 1 << 16).expect("open");
         let mut offsets = Vec::new();
         for i in 0..1000u32 {
-            offsets.push(topic.produce(&key_of(i), format!("{i}").as_bytes()).expect("produce"));
+            offsets.push(
+                topic
+                    .produce(&key_of(i), format!("{i}").as_bytes())
+                    .expect("produce"),
+            );
         }
         topic.sync().expect("sync");
 
@@ -324,7 +362,11 @@ mod tests {
         // Rewind to the 600th record and replay the tail.
         g.seek(offsets[600]);
         let replayed = drain_all(&topic, &mut g);
-        assert_eq!(replayed.len(), 400, "rewind+replay did not re-yield the retained tail");
+        assert_eq!(
+            replayed.len(),
+            400,
+            "rewind+replay did not re-yield the retained tail"
+        );
         assert_eq!(replayed[0].offset, offsets[600]);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -336,7 +378,9 @@ mod tests {
         let dir = tmpdir("nomembers");
         let mut topic = Topic::open(&dir, 1 << 16).expect("open");
         for i in 0..50u32 {
-            topic.produce(&key_of(i), format!("{i}").as_bytes()).expect("produce");
+            topic
+                .produce(&key_of(i), format!("{i}").as_bytes())
+                .expect("produce");
         }
         topic.sync().expect("sync");
 
@@ -353,7 +397,11 @@ mod tests {
         // A member rejoins; the 11th record (never consumed) must be the next one dispatched.
         assert!(g.add_member(2));
         let rest = drain_all(&topic, &mut g);
-        assert_eq!(rest.len(), 40, "records were lost across the empty-group window");
+        assert_eq!(
+            rest.len(),
+            40,
+            "records were lost across the empty-group window"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
