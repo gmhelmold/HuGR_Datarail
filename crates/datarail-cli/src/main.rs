@@ -89,7 +89,7 @@ thread_local! {
 fn txn_fault(point: u8) {
     let armed = TXN_FAULT_POINT.with(|fault| {
         if fault.get() == point {
-            fault.set(0);
+            fault.set(u8::MAX);
             true
         } else {
             false
@@ -3785,5 +3785,14 @@ mod tests {
             watch_sink.committed_view().unwrap(),
             plain_sink.committed_view().unwrap()
         );
+    }
+
+    #[test]
+    fn transaction_fault_point_zero_is_one_shot() {
+        use std::panic::{catch_unwind, AssertUnwindSafe};
+
+        super::arm_txn_fault(0);
+        assert!(catch_unwind(AssertUnwindSafe(|| super::txn_fault(0))).is_err());
+        assert!(catch_unwind(AssertUnwindSafe(|| super::txn_fault(0))).is_ok());
     }
 }

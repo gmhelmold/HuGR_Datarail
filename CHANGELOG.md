@@ -11,7 +11,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Durable CRC-32C transaction journal with `Prepare`, `Commit`, and `Abort` records
 - Cross-partition transaction gate, participant rollback, offset snapshot/restore, and startup recovery
 - Restart tests for committed records/offsets and unresolved intent rollback
-- Deterministic in-process fault-point test covers main boundaries; process-level restart proof remains open
+- Deterministic in-process and real-binary fault tests cover transaction boundaries plus partial/complete journal writes;
+  single-node recovery is all-or-none
 
 ### Added — Backlog Wave 02
 - `ReplayLog::replay_from` now drops stale cross-segment framing after corruption; later segments remain seekable
@@ -34,7 +35,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `FileOffsets` extracted to dedicated `Arc<RwLock<FileOffsets>>` — decoupled from partition locks
 - `partition_log` lazy init fixed under partition lock (no global mutex race)
 - `EndTxn` completion now carries `(producer_id, epoch)` — stale completions cannot reset newer transaction epochs
-- Failed txn sealing restores unlanded buffers for retry; cross-partition crash atomicity remains explicitly unsupported
+- Failed txn sealing restores unlanded buffers for retry; single-node cross-partition crash atomicity is backed by the
+  durable journal matrix
 - Added ignored 10k-operation contention stress (default and rollback builds pass)
 - Added per-partition sequence reservation regression test (1,000 reservations)
 - `BatchTooLarge` now maps to non-retriable Kafka `MESSAGE_TOO_LARGE` (10), not storage error 56
@@ -46,7 +48,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed — Known Limitations
 - Per-partition lock scaffolding is present; throughput scaling remains unmeasured pending Phase 2 A/B evidence
-- Cross-partition transaction commit is lock-ordered but not crash-atomic; Phase 1 remains blocked on failure-path evidence
+- Cross-partition transaction commit is lock-ordered and crash-atomic within single-node scope; Kafka marker/LSO
+  fidelity and multi-node atomicity remain out of scope
 
 ## [0.1.0] - 2026-09-10
 
