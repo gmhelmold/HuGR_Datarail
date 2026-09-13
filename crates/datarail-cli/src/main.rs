@@ -17,6 +17,7 @@
 
 #![forbid(unsafe_code)]
 
+mod kafka_dedup_broker;
 mod kafka_store;
 #[cfg(feature = "tls")]
 mod tls;
@@ -1139,6 +1140,8 @@ struct PartitionState {
     /// Held until `EndTxn`; on commit ONLY matching epoch flushes to log, on abort dropped.
     /// Epoch in key prevents stale-epoch flush (audit TOCTOU).
     txn_buffers: HashMap<(i64, i16), Vec<Vec<u8>>>,
+    /// Durable idempotent-producer sequence state for this partition.
+    dedup: kafka_store::DedupState,
 }
 
 /// Map from `(topic, partition)` to its per-partition `RwLock<PartitionState>`.
@@ -1197,10 +1200,13 @@ impl PartitionBrokerStore {
             return Arc::clone(lock);
         }
         let dir = partition_dir(&self.data_dir, topic, partition);
-        let log = kafka_store::SealedPartitionLog::open(dir).expect("partition log open");
+        let mut log = kafka_store::SealedPartitionLog::open(&dir).expect("partition log open");
+        let dedup = kafka_store::DedupState::open(dir.join("dedup.meta"), &mut log)
+            .expect("idempotent dedup metadata open");
         let state = PartitionState {
             log,
             txn_buffers: HashMap::new(),
+            dedup,
         };
         let lock = Arc::new(RwLock::new(state));
         map.insert(key, Arc::clone(&lock));
@@ -1260,6 +1266,18 @@ impl PartitionBrokerStore {
             .collect();
 
         f(&mut guards[..])
+    }
+}
+
+impl kafka_dedup_broker::IdempotentBroker for PartitionBrokerStore {
+    fn produce_idempotent(
+        &self,
+        topic: &str,
+        partition: i32,
+        records: &[Vec<u8>],
+        coord: kafka_dedup_broker::EosCoord,
+    ) -> std::io::Result<i64> {
+        self.produce_idempotent(topic, partition, records, coord)
     }
 }
 
@@ -1510,6 +1528,44 @@ impl PartitionBrokerStore {
             records,
         )?;
         state.log.append_durable(&sealed)
+    }
+
+    fn produce_idempotent(
+        &self,
+        topic: &str,
+        partition: i32,
+        records: &[Vec<u8>],
+        coord: kafka_dedup_broker::EosCoord,
+    ) -> std::io::Result<i64> {
+        self.with_write_partition(topic, partition, |state| {
+            let key = kafka_store::DedupCoord {
+                producer_id: coord.producer_id,
+                epoch: coord.producer_epoch,
+                base_sequence: coord.base_sequence,
+                count: coord.count,
+            };
+            if let Some(entry) = state.dedup.lookup(key)? {
+                return Ok(entry.base_offset);
+            }
+            let byte_end = state.log.byte_end();
+            let logical_len = state.log.len();
+            state.dedup.prepare(key, byte_end, logical_len)?;
+            let result = self.produce_into_with_guard(state, topic, partition, records);
+            let base = match result {
+                Ok(base) => base,
+                Err(error) => {
+                    state.log.truncate_to(byte_end, logical_len)?;
+                    state.dedup.rollback()?;
+                    return Err(error);
+                }
+            };
+            if let Err(error) = state.dedup.commit(key, byte_end, logical_len, base) {
+                state.log.truncate_to(byte_end, logical_len)?;
+                state.dedup.rollback()?;
+                return Err(error);
+            }
+            Ok(base)
+        })
     }
 
     fn commit_txn_durable(
@@ -1820,6 +1876,23 @@ impl KafkaBrokerStore {
 }
 
 #[cfg(not(feature = "per_partition_locking"))]
+impl kafka_dedup_broker::IdempotentBroker for KafkaBrokerStore {
+    fn produce_idempotent(
+        &self,
+        topic: &str,
+        partition: i32,
+        records: &[Vec<u8>],
+        coord: kafka_dedup_broker::EosCoord,
+    ) -> std::io::Result<i64> {
+        let guard = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        guard.produce_idempotent(topic, partition, records, coord)
+    }
+}
+
+#[cfg(not(feature = "per_partition_locking"))]
 impl datarail_kafka::serve::KafkaBroker for KafkaBrokerStore {
     fn produce(&self, topic: &str, partition: i32, records: &[Vec<u8>]) -> std::io::Result<i64> {
         let guard = self
@@ -2075,7 +2148,7 @@ fn cmd_kafka_broker(rest: &[String]) -> Result<String, CliError> {
         ));
     }
     let conn_wrap = build_conn(tls, tls_cert, tls_key, tls_client_ca)?;
-    datarail_kafka::serve::serve_broker(
+    kafka_dedup_broker::serve_broker(
         &listener,
         &advertised,
         port,

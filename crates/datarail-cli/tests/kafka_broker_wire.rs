@@ -24,8 +24,12 @@ fn req_header(api_key: i16, api_version: i16, correlation_id: i32) -> Writer {
     w
 }
 
-/// A non-idempotent v2 `RecordBatch` blob carrying `values` (`producer_id` = -1).
-fn record_batch(values: &[&[u8]]) -> Vec<u8> {
+fn record_batch_with_coord(
+    values: &[&[u8]],
+    producer_id: i64,
+    producer_epoch: i16,
+    base_sequence: i32,
+) -> Vec<u8> {
     let mut recs = Writer::new();
     for (i, v) in values.iter().enumerate() {
         let mut r = Writer::new();
@@ -49,9 +53,9 @@ fn record_batch(values: &[&[u8]]) -> Vec<u8> {
     b.int32(i32::try_from(values.len().saturating_sub(1)).unwrap());
     b.int64(0);
     b.int64(0);
-    b.int64(-1);
-    b.int16(-1);
-    b.int32(-1);
+    b.int64(producer_id);
+    b.int16(producer_epoch);
+    b.int32(base_sequence);
     b.int32(i32::try_from(values.len()).unwrap());
     b.raw(&records);
     let mut after = b.into_bytes();
@@ -66,8 +70,15 @@ fn record_batch(values: &[&[u8]]) -> Vec<u8> {
     full.into_bytes()
 }
 
-fn produce_req(correlation_id: i32, topic: &str, values: &[&[u8]]) -> Vec<u8> {
-    let batch = record_batch(values);
+fn idempotent_produce_req(
+    correlation_id: i32,
+    topic: &str,
+    values: &[&[u8]],
+    producer_id: i64,
+    producer_epoch: i16,
+    base_sequence: i32,
+) -> Vec<u8> {
+    let batch = record_batch_with_coord(values, producer_id, producer_epoch, base_sequence);
     let mut w = req_header(0, 7, correlation_id);
     w.nullable_string(None);
     w.int16(-1);
@@ -78,6 +89,20 @@ fn produce_req(correlation_id: i32, topic: &str, values: &[&[u8]]) -> Vec<u8> {
     w.int32(0);
     w.bytes(&batch);
     Writer::frame(&w.into_bytes())
+}
+
+fn produce_ack(resp: &[u8]) -> (i64, i16) {
+    let mut r = Reader::new(resp);
+    let _corr = r.int32().unwrap();
+    let topic_count = r.int32().unwrap();
+    assert_eq!(topic_count, 1);
+    let _name = r.string().unwrap();
+    let part_count = r.int32().unwrap();
+    assert_eq!(part_count, 1);
+    let _partition = r.int32().unwrap();
+    let error = r.int16().unwrap();
+    let base = r.int64().unwrap();
+    (base, error)
 }
 
 fn fetch_req(correlation_id: i32, topic: &str, fetch_offset: i64) -> Vec<u8> {
@@ -225,10 +250,13 @@ fn produce_then_fetch_round_trips_and_survives_a_broker_restart() {
 
         // PRODUCE 3 records (sealed + durably stored by the broker).
         stream
-            .write_all(&produce_req(
+            .write_all(&idempotent_produce_req(
                 1,
                 "events",
                 &[b"evt:m0", b"evt:m1", b"evt:m2"],
+                41,
+                2,
+                0,
             ))
             .unwrap();
         let _ = read_frame(&mut stream);
@@ -272,20 +300,52 @@ fn produce_then_fetch_round_trips_and_survives_a_broker_restart() {
     {
         let (_daemon, mut stream) = spawn_broker(&rail, &data_dir);
 
-        stream.write_all(&list_offsets_req(5, "events")).unwrap();
+        stream
+            .write_all(&idempotent_produce_req(
+                5,
+                "events",
+                &[b"evt:m0", b"evt:m1", b"evt:m2"],
+                41,
+                2,
+                0,
+            ))
+            .unwrap();
+        let (base, error) = produce_ack(&read_frame(&mut stream));
+        assert_eq!(error, 0, "retry of committed sequence must ack cleanly");
+        assert_eq!(base, 0, "retry must return original stable base offset");
+
+        stream
+            .write_all(&idempotent_produce_req(6, "events", &[b"evt:m3"], 41, 2, 3))
+            .unwrap();
+        let (base, error) = produce_ack(&read_frame(&mut stream));
+        assert_eq!(error, 0);
+        assert_eq!(base, 3, "new sequence appends at stable next offset");
+
+        stream.write_all(&list_offsets_req(7, "events")).unwrap();
         let resp = read_frame(&mut stream);
         assert_eq!(
             list_offset_latest(&resp),
-            3,
-            "all acked records recovered after a real broker restart"
+            4,
+            "retry is deduplicated; new sequence extends log"
         );
 
-        stream.write_all(&fetch_req(6, "events", 0)).unwrap();
+        stream.write_all(&fetch_req(8, "events", 0)).unwrap();
         let resp = read_frame(&mut stream);
         assert_eq!(
             fetch_values(&resp),
-            vec![b"evt:m0".to_vec(), b"evt:m1".to_vec(), b"evt:m2".to_vec()],
-            "a consumer fetches the original plaintext back AFTER the broker restarted (durable provider-blind)"
+            vec![
+                b"evt:m0".to_vec(),
+                b"evt:m1".to_vec(),
+                b"evt:m2".to_vec(),
+                b"evt:m3".to_vec(),
+            ],
+            "the retry does not duplicate records"
+        );
+        // Fetch from offset 3 independently confirms the new sequence's stable offset.
+        stream.write_all(&fetch_req(9, "events", 3)).unwrap();
+        assert_eq!(
+            fetch_values(&read_frame(&mut stream)),
+            vec![b"evt:m3".to_vec()]
         );
     }
 
