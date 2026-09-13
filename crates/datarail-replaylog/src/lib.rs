@@ -461,14 +461,10 @@ impl Replay {
             let Some(next) = self.starts.get(self.seg_idx).copied() else {
                 return Ok(false);
             };
-            self.open_segment_keep_buf(next)?;
+            // Frames never straddle segments. Any bytes left here are therefore a corrupt/truncated
+            // frame from the exhausted segment; do not let its framing consume the next segment.
+            self.open_segment(next)?;
         }
-    }
-
-    fn open_segment_keep_buf(&mut self, seg: u64) -> Result<(), ReplayError> {
-        // Open the next segment at its start without clearing the partial-frame bytes still in `buf`.
-        self.file = Some(File::open(self.dir.join(seg_name(seg)))?);
-        Ok(())
     }
 
     /// A bad frame (oversize `len` or CRC mismatch) was found at logical offset `bad_off`. If a *later* segment
@@ -768,6 +764,74 @@ mod tests {
             got.len() < n as usize,
             "expected to lose the corrupt segment's tail"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn replay_from_later_segment_survives_prior_corruption() {
+        let dir = tmpdir("seek-after-corruption");
+        let mut log = ReplayLog::open(&dir, 1024).expect("open");
+        let mut offsets = Vec::new();
+        let mut records = Vec::new();
+        for i in 0u32..40 {
+            let mut record = format!("seek-record-{i:03}").into_bytes();
+            record.resize(200, b'x');
+            offsets.push(log.append(&record).expect("append"));
+            records.push(record);
+        }
+        log.sync().expect("sync");
+
+        let mut segs: Vec<std::path::PathBuf> = std::fs::read_dir(&dir)
+            .expect("read_dir")
+            .map(|e| e.expect("entry").path())
+            .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("seg"))
+            .collect();
+        segs.sort();
+        assert!(
+            segs.len() >= 3,
+            "test needs >=3 segments, got {}",
+            segs.len()
+        );
+
+        // Damage an earlier segment; requested offset belongs to a later intact segment.
+        let victim = &segs[1];
+        let mut bytes = std::fs::read(victim).expect("read seg");
+        let mid = bytes.len() / 2;
+        bytes[mid] ^= 0xFF;
+        std::fs::write(victim, &bytes).expect("write seg");
+
+        let start_index = 25;
+        let got = drain(&log, offsets[start_index]);
+        let expected: Vec<_> = offsets[start_index..]
+            .iter()
+            .zip(&records[start_index..])
+            .map(|(&offset, record)| (offset, record.clone()))
+            .collect();
+        assert_eq!(got, expected);
+
+        let later_start = segs[2]
+            .file_stem()
+            .expect("segment stem")
+            .to_str()
+            .expect("segment name")
+            .parse::<u64>()
+            .expect("segment offset");
+        let got_from_zero = drain(&log, 0);
+        let expected_later: Vec<_> = offsets
+            .iter()
+            .zip(&records)
+            .filter(|(offset, _)| **offset >= later_start)
+            .map(|(&offset, record)| (offset, record.clone()))
+            .collect();
+        let actual_later: Vec<_> = got_from_zero
+            .into_iter()
+            .filter(|(offset, _)| *offset >= later_start)
+            .collect();
+        assert_eq!(actual_later, expected_later);
+        assert!(matches!(
+            log.replay_from(log.end_offset() + 1),
+            Err(ReplayError::BadOffset(_))
+        ));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
