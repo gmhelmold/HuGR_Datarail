@@ -10,8 +10,8 @@ superados; este arquivo define status atual. `Done` nao e backlog ativo.
 
 **Status:** open. Durable `Prepare`/`Commit` journal, partition rollback, startup recovery, offset snapshots, and a
 transaction visibility gate now exist. In-process and real-binary restart tests cover five post-fsync boundaries, but
-ambiguous journal-write handling, transactional-offset process coverage, and full all-or-none proof remain open; do
-not claim crash atomicity yet.
+ambiguous journal-write handling and full all-or-none proof under those ambiguous outcomes remain open; do not claim
+crash atomicity yet.
 
 **Do:** finish process-level crash tests and ambiguous journal-write handling against
 [`KAFKA-TXN-DURABILITY.md`](../design/KAFKA-TXN-DURABILITY.md). Keep control metadata provider-blind. Do not claim

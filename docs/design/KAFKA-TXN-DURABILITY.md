@@ -88,8 +88,7 @@ idempotent. A successful wire test without this matrix is not a crash-atomicity 
 
 The unit test injects panics at these boundaries and reopens the data directory after unwinding. The real-binary
 `kafka_txn_wire` harness now aborts and restarts the process at each post-fsync boundary (points 1 through 5), proving
-record all-or-none recovery there. It does not cover ambiguous `fsync`/partial-journal-write outcomes or transactional
-offsets through the wire path.
+record and staged-offset all-or-none recovery there. It does not cover ambiguous `fsync`/partial-journal-write outcomes.
 
 ## Explicit Non-Goals
 
