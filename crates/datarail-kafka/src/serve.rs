@@ -221,80 +221,7 @@ fn handle_connection<S: Read + Write>(mut stream: S, shared: &Shared) -> io::Res
                     1,
                 ))
             }
-            API_PRODUCE => {
-                let ProducedRequest { acks, topics } = parse_produce(&mut reader, api_version)?;
-                // ACK-AFTER-DURABLE: wait for durable landing before building each partition ack.
-                let mut codes: HashMap<(String, i32), i16> = HashMap::new();
-                for t in &topics {
-                    for p in &t.partitions {
-                        if p.values.is_empty() {
-                            continue; // nothing to land → NONE
-                        }
-                        let (done, done_rx) = std::sync::mpsc::channel();
-                        let sent = shared.tx.send(ProducedBatch {
-                            topic: t.name.clone(),
-                            partition: p.partition,
-                            values: p.values.clone(),
-                            eos: p.eos,
-                            done,
-                        });
-                        // 0 = durable success; 56 = retriable landing failure; 87 = permanent invalid record.
-                        let code = match sent {
-                            Err(_) => {
-                                eprintln!(
-                                    "kafka: ingest land unreachable (retriable) topic={} partition={}",
-                                    t.name, p.partition
-                                );
-                                56
-                            }
-                            Ok(()) => match done_rx.recv() {
-                                Ok(Ok(())) => 0,
-                                Ok(Err(e)) => produce_error_code(&t.name, p.partition, &e),
-                                Err(e) => {
-                                    eprintln!(
-                                        "kafka: ingest land result lost (retriable) topic={} partition={} error={e}",
-                                        t.name, p.partition
-                                    );
-                                    56
-                                }
-                            },
-                        };
-                        codes.insert((t.name.clone(), p.partition), code);
-                    }
-                }
-                // Recover from a poisoned lock so one panicked connection cannot brick produce.
-                let mut offsets = shared
-                    .offsets
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner);
-                // Advance reported offsets only for durable lands; acks=0 discards the response frame.
-                let built = produce_response(
-                    api_version,
-                    correlation_id,
-                    &topics,
-                    &mut |name, part, count| {
-                        let key = (name.to_owned(), part);
-                        let base = *offsets.get(&key).unwrap_or(&0);
-                        let code = codes.get(&key).copied().unwrap_or(0); // read before the insert moves `key`
-                                                                          // Failed batches do not consume offsets; bound identity cardinality and saturate addition.
-                        if code == 0
-                            && (offsets.contains_key(&key) || offsets.len() < MAX_OFFSET_KEYS)
-                        {
-                            offsets.insert(
-                                key,
-                                base.saturating_add(i64::try_from(count).unwrap_or(i64::MAX)),
-                            );
-                        }
-                        (base, code)
-                    },
-                );
-                // acks=0 is fire-and-forget: no response frame; acks=1/-1 return normally.
-                if acks == 0 {
-                    None
-                } else {
-                    Some(built)
-                }
-            }
+            API_PRODUCE => handle_ingest_produce(&mut reader, api_version, correlation_id, shared)?,
             API_INIT_PRODUCER_ID => {
                 // Hand out a fresh producer_id so the client can enable idempotence; the request body
                 // (transactional_id / timeout) needs no parsing — each producer just needs a distinct id.
@@ -316,6 +243,74 @@ fn handle_connection<S: Read + Write>(mut stream: S, shared: &Shared) -> io::Res
         }
     }
     Ok(())
+}
+
+fn handle_ingest_produce(
+    reader: &mut Reader<'_>,
+    api_version: i16,
+    correlation_id: i32,
+    shared: &Shared,
+) -> io::Result<Option<Vec<u8>>> {
+    let ProducedRequest { acks, topics } = parse_produce(reader, api_version)?;
+    let mut codes: HashMap<(String, i32), i16> = HashMap::new();
+    for topic in &topics {
+        for partition in &topic.partitions {
+            if partition.values.is_empty() {
+                continue;
+            }
+            let (done, done_rx) = std::sync::mpsc::channel();
+            let sent = shared.tx.send(ProducedBatch {
+                topic: topic.name.clone(),
+                partition: partition.partition,
+                values: partition.values.clone(),
+                eos: partition.eos,
+                done,
+            });
+            let code = match sent {
+                Err(_) => {
+                    eprintln!(
+                        "kafka: ingest land unreachable (retriable) topic={} partition={}",
+                        topic.name, partition.partition
+                    );
+                    56
+                }
+                Ok(()) => match done_rx.recv() {
+                    Ok(Ok(())) => 0,
+                    Ok(Err(error)) => produce_error_code(&topic.name, partition.partition, &error),
+                    Err(error) => {
+                        eprintln!(
+                            "kafka: ingest land result lost (retriable) topic={} partition={} error={error}",
+                            topic.name, partition.partition
+                        );
+                        56
+                    }
+                },
+            };
+            codes.insert((topic.name.clone(), partition.partition), code);
+        }
+    }
+    let mut offsets = shared
+        .offsets
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    let response = produce_response(
+        api_version,
+        correlation_id,
+        &topics,
+        &mut |name, partition, count| {
+            let key = (name.to_owned(), partition);
+            let base = *offsets.get(&key).unwrap_or(&0);
+            let code = codes.get(&key).copied().unwrap_or(0);
+            if code == 0 && (offsets.contains_key(&key) || offsets.len() < MAX_OFFSET_KEYS) {
+                offsets.insert(
+                    key,
+                    base.saturating_add(i64::try_from(count).unwrap_or(i64::MAX)),
+                );
+            }
+            (base, code)
+        },
+    );
+    Ok((acks != 0).then_some(response))
 }
 
 /// The CONSUME-side broker backend (see `KAFKA-FETCH-DESIGN.md`). The `kafka-broker` mode wires this to a sealed
@@ -618,26 +613,7 @@ fn handle_broker_request<B: KafkaBroker>(
             let out = fetch_results(bctx.broker, &topics);
             fetch_response(api_version, correlation_id, &out)
         }
-        API_LIST_OFFSETS => {
-            let topics = parse_list_offsets(reader, api_version)?;
-            let mut out = Vec::with_capacity(topics.len());
-            for t in &topics {
-                let mut parts = Vec::with_capacity(t.partitions.len());
-                for p in &t.partitions {
-                    let (earliest, latest) = bctx.broker.bounds(&t.name, p.partition);
-                    let offset = if p.timestamp == -2 { earliest } else { latest };
-                    parts.push(ListOffsetResult {
-                        partition: p.partition,
-                        offset,
-                    });
-                }
-                out.push(ListOffsetTopicResult {
-                    name: t.name.clone(),
-                    partitions: parts,
-                });
-            }
-            list_offsets_response(api_version, correlation_id, &out)
-        }
+        API_LIST_OFFSETS => handle_list_offsets(reader, api_version, correlation_id, bctx.broker)?,
         API_FIND_COORDINATOR => {
             let _group = parse_find_coordinator(reader, api_version)?;
             find_coordinator_response(api_version, correlation_id, 0, bctx.ctx.host, bctx.ctx.port)
@@ -674,6 +650,37 @@ fn handle_broker_request<B: KafkaBroker>(
         }
     };
     Ok((response, suppress_response))
+}
+
+fn handle_list_offsets<B: KafkaBroker>(
+    reader: &mut Reader<'_>,
+    api_version: i16,
+    correlation_id: i32,
+    broker: &B,
+) -> io::Result<Vec<u8>> {
+    let topics = parse_list_offsets(reader, api_version)?;
+    let out = topics
+        .iter()
+        .map(|topic| ListOffsetTopicResult {
+            name: topic.name.clone(),
+            partitions: topic
+                .partitions
+                .iter()
+                .map(|partition| {
+                    let (earliest, latest) = broker.bounds(&topic.name, partition.partition);
+                    ListOffsetResult {
+                        partition: partition.partition,
+                        offset: if partition.timestamp == -2 {
+                            earliest
+                        } else {
+                            latest
+                        },
+                    }
+                })
+                .collect(),
+        })
+        .collect::<Vec<_>>();
+    Ok(list_offsets_response(api_version, correlation_id, &out))
 }
 
 /// What the SASL pre-stage decided for a request: send a reply and keep going, send a reply then close (failed
