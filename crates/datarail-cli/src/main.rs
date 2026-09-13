@@ -94,7 +94,17 @@ fn txn_fault(point: u8) {
             false
         }
     });
-    assert!(!armed, "injected transaction crash at point {point}");
+    // Explicit process-level test hook; normal operation has no fault environment.
+    let process_fault = std::env::var("DATARAIL_TXN_FAULT_POINT")
+        .ok()
+        .and_then(|value| value.parse::<u8>().ok())
+        == Some(point);
+    if armed || process_fault {
+        if std::env::var_os("DATARAIL_TXN_FAULT_ABORT").is_some() {
+            std::process::abort();
+        }
+        panic!("injected transaction crash at point {point}");
+    }
 }
 
 #[cfg(test)]

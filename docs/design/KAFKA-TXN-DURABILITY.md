@@ -86,8 +86,10 @@ Fault injection must stop the process after each of these points and restart on 
 Expected result: all records plus all offsets, or no records plus old offsets. Retry of the same transaction is
 idempotent. A successful wire test without this matrix is not a crash-atomicity proof.
 
-The current unit test injects panics at these boundaries and reopens the data directory after unwinding. It is not a
-process-level kill/restart proof and does not cover ambiguous `fsync`/partial-journal-write outcomes.
+The unit test injects panics at these boundaries and reopens the data directory after unwinding. The real-binary
+`kafka_txn_wire` harness now aborts and restarts the process at each post-fsync boundary (points 1 through 5), proving
+record all-or-none recovery there. It does not cover ambiguous `fsync`/partial-journal-write outcomes or transactional
+offsets through the wire path.
 
 ## Explicit Non-Goals
 

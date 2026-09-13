@@ -6,10 +6,13 @@
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::process::{Child, Command};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use datarail_kafka::codec::{Reader, Writer};
 use datarail_kafka::produce::parse_record_batch;
+
+static BROKER_TEST_LOCK: Mutex<()> = Mutex::new(());
 
 fn free_port() -> u16 {
     let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind ephemeral port");
@@ -191,8 +194,140 @@ impl Drop for Daemon {
     }
 }
 
+fn spawn_fault_broker(
+    rail: &std::path::Path,
+    data_dir: &std::path::Path,
+    port: u16,
+    fault_point: Option<u8>,
+) -> (Daemon, TcpStream) {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_datarail"));
+    command.args([
+        "kafka-broker",
+        rail.to_str().unwrap(),
+        "--listen",
+        &format!("127.0.0.1:{port}"),
+        "--advertised",
+        "127.0.0.1",
+        "--data-dir",
+        data_dir.to_str().unwrap(),
+        "--partitions",
+        "2",
+    ]);
+    if let Some(point) = fault_point {
+        command
+            .env("DATARAIL_TXN_FAULT_POINT", point.to_string())
+            .env("DATARAIL_TXN_FAULT_ABORT", "1");
+    }
+    let child = command.spawn().expect("spawn datarail kafka-broker");
+    let mut daemon = Daemon(child);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let stream = loop {
+        if let Ok(s) = TcpStream::connect(("127.0.0.1", port)) {
+            break s;
+        }
+        if let Ok(Some(status)) = daemon.0.try_wait() {
+            panic!("kafka-broker exited before listening: {status}");
+        }
+        assert!(Instant::now() < deadline, "broker never started");
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    (daemon, stream)
+}
+
+fn write_fault_rail(point: u8) -> (std::path::PathBuf, std::path::PathBuf) {
+    let rail = std::env::temp_dir().join(format!("kafka-txn-fault-{point}-{}.toml", std::process::id()));
+    std::fs::write(
+        &rail,
+        "[route]\n\
+         route_id = \"0x03030303030303030303030303030303\"\n\
+         stream_id = \"0x04040404040404040404040404040404\"\n\
+         aead = \"gcm-siv-256\"\n\
+         guarantee = \"exactly-once\"\n\
+         [onboarding]\nmax_record_len = 1024\nrequired_prefix = \"evt:\"\n\
+         [offloading]\nmax_record_len = 1024\nrequired_prefix = \"evt:\"\n\
+         [keys]\n\
+         source_seed = \"0x2222222222222222222222222222222222222222222222222222222222222222\"\n\
+         dest_seed = \"0x2222222222222222222222222222222222222222222222222222222222222222\"\n\
+         dest_x25519_secret = \"0x2222222222222222222222222222222222222222222222222222222222222222\"\n\
+         tenant_secret = \"0x2222222222222222222222222222222222222222222222222222222222222222\"\n",
+    )
+    .expect("write fault rail");
+    let data_dir = std::env::temp_dir().join(format!("kafka-txn-fault-data-{point}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&data_dir);
+    (rail, data_dir)
+}
+
+fn drive_faulted_commit(stream: &mut TcpStream) {
+    stream.write_all(&init_producer_id_req(1, "tx-1")).unwrap();
+    let (pid, epoch) = init_producer_id(&read_frame(stream));
+    stream
+        .write_all(&add_partitions_req(
+            2,
+            "tx-1",
+            pid,
+            epoch,
+            "events",
+            &[0, 1],
+        ))
+        .unwrap();
+    let _ = read_frame(stream);
+    for (correlation_id, partition, values) in [
+        (3, 0, vec![b"evt:fault-0".as_slice()]),
+        (4, 1, vec![b"evt:fault-1".as_slice()]),
+    ] {
+        stream
+            .write_all(&produce_txn_req(
+                correlation_id,
+                "events",
+                partition,
+                pid,
+                epoch,
+                &values,
+            ))
+            .unwrap();
+        let _ = read_frame(stream);
+    }
+    stream
+        .write_all(&end_txn_req(5, "tx-1", pid, epoch, true))
+        .unwrap();
+    let mut byte = [0u8; 1];
+    let _ = stream.read(&mut byte);
+}
+
+#[test]
+fn process_crash_at_each_transaction_boundary_recovers_all_or_none() {
+    let _lock = BROKER_TEST_LOCK.lock().unwrap();
+    for point in 1..=5 {
+        let (rail, data_dir) = write_fault_rail(point);
+        let port = free_port();
+        let (mut daemon, mut stream) = spawn_fault_broker(&rail, &data_dir, port, Some(point));
+        drive_faulted_commit(&mut stream);
+        let status = daemon.0.wait().expect("wait for injected transaction crash");
+        assert!(!status.success(), "fault point {point} did not stop broker");
+
+        let (_daemon, mut stream) = spawn_fault_broker(&rail, &data_dir, port, None);
+        for partition in 0..2 {
+            stream
+                .write_all(&fetch_req(10 + partition, "events", partition, 0))
+                .unwrap();
+            let values = fetch_values(&read_frame(&mut stream));
+            if point == 5 {
+                assert_eq!(values, vec![format!("evt:fault-{partition}").into_bytes()]);
+            } else {
+                assert!(values.is_empty(), "fault point {point} left committed data");
+            }
+        }
+        let _ = std::fs::remove_file(&rail);
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+}
+
 #[test]
 fn transactional_commit_is_visible_after_success_and_abort_is_hidden() {
+    let _lock = BROKER_TEST_LOCK.lock().unwrap();
     let port = free_port();
     let rail = std::env::temp_dir().join(format!("kafka-txn-{}.toml", std::process::id()));
     std::fs::write(
@@ -214,35 +349,7 @@ fn transactional_commit_is_visible_after_success_and_abort_is_hidden() {
     let data_dir = std::env::temp_dir().join(format!("kafka-txn-data-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&data_dir);
 
-    let child = Command::new(env!("CARGO_BIN_EXE_datarail"))
-        .args([
-            "kafka-broker",
-            rail.to_str().unwrap(),
-            "--listen",
-            &format!("127.0.0.1:{port}"),
-            "--advertised",
-            "127.0.0.1",
-            "--data-dir",
-            data_dir.to_str().unwrap(),
-            "--partitions",
-            "2",
-        ])
-        .spawn()
-        .expect("spawn datarail kafka-broker");
-    let _daemon = Daemon(child);
-    let mut stream = {
-        let deadline = Instant::now() + Duration::from_secs(10);
-        loop {
-            if let Ok(s) = TcpStream::connect(("127.0.0.1", port)) {
-                break s;
-            }
-            assert!(Instant::now() < deadline, "broker never started");
-            std::thread::sleep(Duration::from_millis(100));
-        }
-    };
-    stream
-        .set_read_timeout(Some(Duration::from_secs(10)))
-        .unwrap();
+    let (_daemon, mut stream) = spawn_fault_broker(&rail, &data_dir, port, None);
 
     let _ = commit_transaction(&mut stream);
     abort_and_fence_transaction(&mut stream);
