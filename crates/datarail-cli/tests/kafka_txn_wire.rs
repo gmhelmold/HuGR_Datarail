@@ -255,6 +255,7 @@ fn spawn_fault_broker(
     data_dir: &std::path::Path,
     port: u16,
     fault_point: Option<u8>,
+    journal_cut: Option<usize>,
 ) -> (Daemon, TcpStream) {
     let mut command = Command::new(env!("CARGO_BIN_EXE_datarail"));
     command.args([
@@ -273,6 +274,9 @@ fn spawn_fault_broker(
         command
             .env("DATARAIL_TXN_FAULT_POINT", point.to_string())
             .env("DATARAIL_TXN_FAULT_ABORT", "1");
+    }
+    if let Some(cut) = journal_cut {
+        command.env("DATARAIL_TXN_JOURNAL_CUT", format!("commit:{cut}"));
     }
     let child = command.spawn().expect("spawn datarail kafka-broker");
     let mut daemon = Daemon(child);
@@ -293,11 +297,9 @@ fn spawn_fault_broker(
     (daemon, stream)
 }
 
-fn write_fault_rail(point: u8) -> (std::path::PathBuf, std::path::PathBuf) {
-    let rail = std::env::temp_dir().join(format!(
-        "kafka-txn-fault-{point}-{}.toml",
-        std::process::id()
-    ));
+fn write_fault_rail(tag: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+    let rail =
+        std::env::temp_dir().join(format!("kafka-txn-fault-{tag}-{}.toml", std::process::id()));
     std::fs::write(
         &rail,
         "[route]\n\
@@ -314,10 +316,8 @@ fn write_fault_rail(point: u8) -> (std::path::PathBuf, std::path::PathBuf) {
          tenant_secret = \"0x2222222222222222222222222222222222222222222222222222222222222222\"\n",
     )
     .expect("write fault rail");
-    let data_dir = std::env::temp_dir().join(format!(
-        "kafka-txn-fault-data-{point}-{}",
-        std::process::id()
-    ));
+    let data_dir =
+        std::env::temp_dir().join(format!("kafka-txn-fault-data-{tag}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&data_dir);
     (rail, data_dir)
 }
@@ -385,9 +385,10 @@ fn drive_faulted_commit(stream: &mut TcpStream) {
 fn process_crash_at_each_transaction_boundary_recovers_all_or_none() {
     let _lock = BROKER_TEST_LOCK.lock().unwrap();
     for point in 1..=5 {
-        let (rail, data_dir) = write_fault_rail(point);
+        let (rail, data_dir) = write_fault_rail(&point.to_string());
         let port = free_port();
-        let (mut daemon, mut stream) = spawn_fault_broker(&rail, &data_dir, port, Some(point));
+        let (mut daemon, mut stream) =
+            spawn_fault_broker(&rail, &data_dir, port, Some(point), None);
         drive_faulted_commit(&mut stream);
         let status = daemon
             .0
@@ -395,7 +396,7 @@ fn process_crash_at_each_transaction_boundary_recovers_all_or_none() {
             .expect("wait for injected transaction crash");
         assert!(!status.success(), "fault point {point} did not stop broker");
 
-        let (_daemon, mut stream) = spawn_fault_broker(&rail, &data_dir, port, None);
+        let (_daemon, mut stream) = spawn_fault_broker(&rail, &data_dir, port, None, None);
         for partition in 0..2 {
             stream
                 .write_all(&fetch_req(10 + partition, "events", partition, 0))
@@ -414,6 +415,54 @@ fn process_crash_at_each_transaction_boundary_recovers_all_or_none() {
                 assert_eq!(offset, i64::from(partition + 7));
             } else {
                 assert_eq!(offset, -1, "fault point {point} left committed offset");
+            }
+        }
+        let _ = std::fs::remove_file(&rail);
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+}
+
+#[test]
+fn process_crash_during_ambiguous_commit_write_recovers_all_or_none() {
+    let _lock = BROKER_TEST_LOCK.lock().unwrap();
+    // 0 and 64 are partial prefixes; usize::MAX writes the complete frame but crashes before fsync.
+    for cut in [0, 1, 16, 64, usize::MAX] {
+        let tag = format!("journal-cut-{cut}");
+        let (rail, data_dir) = write_fault_rail(&tag);
+        let port = free_port();
+        let (mut daemon, mut stream) = spawn_fault_broker(&rail, &data_dir, port, None, Some(cut));
+        drive_faulted_commit(&mut stream);
+        let status = daemon
+            .0
+            .wait()
+            .expect("wait for ambiguous journal-write crash");
+        assert!(!status.success(), "journal cut {cut} did not stop broker");
+
+        let (_daemon, mut stream) = spawn_fault_broker(&rail, &data_dir, port, None, None);
+        for partition in 0..2 {
+            stream
+                .write_all(&fetch_req(10 + partition, "events", partition, 0))
+                .unwrap();
+            let values = fetch_values(&read_frame(&mut stream));
+            if cut == usize::MAX {
+                assert_eq!(values, vec![format!("evt:fault-{partition}").into_bytes()]);
+            } else {
+                assert!(
+                    values.is_empty(),
+                    "partial Commit left committed data at cut {cut}"
+                );
+            }
+            stream
+                .write_all(&offset_fetch_req(20 + partition, "fault-group", partition))
+                .unwrap();
+            let offset = fetched_offset(&read_frame(&mut stream));
+            if cut == usize::MAX {
+                assert_eq!(offset, i64::from(partition + 7));
+            } else {
+                assert_eq!(
+                    offset, -1,
+                    "partial Commit left committed offset at cut {cut}"
+                );
             }
         }
         let _ = std::fs::remove_file(&rail);
@@ -445,7 +494,7 @@ fn transactional_commit_is_visible_after_success_and_abort_is_hidden() {
     let data_dir = std::env::temp_dir().join(format!("kafka-txn-data-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&data_dir);
 
-    let (_daemon, mut stream) = spawn_fault_broker(&rail, &data_dir, port, None);
+    let (_daemon, mut stream) = spawn_fault_broker(&rail, &data_dir, port, None, None);
 
     let _ = commit_transaction(&mut stream);
     abort_and_fence_transaction(&mut stream);

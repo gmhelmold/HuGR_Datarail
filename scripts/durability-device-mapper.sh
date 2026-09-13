@@ -3,6 +3,15 @@ set -euo pipefail
 
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 IMAGE=${DATARAIL_DURABILITY_IMAGE:-rust:1.90-bookworm}
+FAULT_MODE=${DATARAIL_DURABILITY_FAULT_MODE:-cut}
+
+case "$FAULT_MODE" in
+    cut|flakey) ;;
+    *)
+        printf 'DUR-01: unsupported fault mode: %s\n' "$FAULT_MODE" >&2
+        exit 2
+        ;;
+esac
 
 command -v docker >/dev/null 2>&1 || {
     printf '%s\n' 'DUR-01: docker is required' >&2
@@ -14,6 +23,7 @@ docker info >/dev/null 2>&1 || {
 }
 
 docker run --rm --privileged \
+    -e "DATARAIL_DURABILITY_FAULT_MODE=$FAULT_MODE" \
     -v "$ROOT:/src" \
     -w /src \
     "$IMAGE" \
@@ -23,6 +33,7 @@ docker run --rm --privileged \
         cargo build --release -p datarail-substrate-wal --example durability_probe
 
         image=/tmp/datarail-device-mapper.img
+        fault_mode=${DATARAIL_DURABILITY_FAULT_MODE:-cut}
         dm_name=datarail-fault-$RANDOM-$RANDOM
         loop=
         mounted=0
@@ -50,6 +61,34 @@ docker run --rm --privileged \
         mkdir -p /mnt/datarail-fault
         mount "/dev/mapper/$dm_name" /mnt/datarail-fault
         mounted=1
+        if [ "$fault_mode" = flakey ]; then
+            fstype=$(findmnt -n -o FSTYPE /mnt/datarail-fault)
+            case "$fstype" in
+                ext4|xfs) ;;
+                *)
+                    printf "DUR-01: flakey mode requires ext4/xfs, got %s\n" "$fstype" >&2
+                    exit 1
+                    ;;
+            esac
+            mount_opts=$(findmnt -n -o OPTIONS /mnt/datarail-fault)
+            case ",$mount_opts," in
+                *,nobarrier,*)
+                    printf "%s\n" "DUR-01: flakey mode requires filesystem write barriers" >&2
+                    exit 1
+                    ;;
+            esac
+            flakey_target=0
+            while read -r target _; do
+                if [ "$target" = flakey ]; then
+                    flakey_target=1
+                    break
+                fi
+            done < <(dmsetup targets)
+            if [ "$flakey_target" -ne 1 ]; then
+                printf "%s\n" "DUR-01: dm-flakey target unavailable; refusing dm-error fallback" >&2
+                exit 1
+            fi
+        fi
 
         status=/tmp/datarail-durability-status
         log=/tmp/datarail-durability-writer.log
@@ -77,7 +116,13 @@ docker run --rm --privileged \
         fi
         sleep 1
         dmsetup suspend --nolockfs "$dm_name"
-        dmsetup reload "$dm_name" --table "0 $sectors error"
+        if [ "$fault_mode" = flakey ]; then
+            # One second of healthy I/O, then 300 seconds of dropped I/O. This is a real dm-flakey transition,
+            # unlike the portable linear↔error cut used by the macOS Docker fallback.
+            dmsetup reload "$dm_name" --table "0 $sectors flakey $loop 0 1 300"
+        else
+            dmsetup reload "$dm_name" --table "0 $sectors error"
+        fi
         dmsetup resume "$dm_name"
         set +e
         writer_status=124
@@ -127,5 +172,5 @@ docker run --rm --privileged \
         sleep 6
         cargo run --quiet --release -p datarail-substrate-wal --example durability_probe -- \
             verify /mnt/datarail-fault/wal "$status"
-        printf "DUR-01 device-mapper cut: PASS (%s acknowledged records)\n" "$acked"
+        printf "DUR-01 device-mapper %s: PASS (%s acknowledged records)\n" "$fault_mode" "$acked"
     '

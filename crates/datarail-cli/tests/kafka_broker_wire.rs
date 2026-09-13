@@ -212,8 +212,10 @@ fn spawn_broker(
         if let Ok(s) = TcpStream::connect(("127.0.0.1", port)) {
             break s;
         }
-        if let Ok(Some(status)) = daemon.0.try_wait() {
-            panic!("kafka-broker exited before listening: {status}");
+        match daemon.0.try_wait() {
+            Ok(Some(status)) => panic!("kafka-broker exited before listening: {status}"),
+            Ok(None) => {}
+            Err(error) => panic!("failed to poll kafka-broker startup: {error}"),
         }
         assert!(
             Instant::now() < deadline,

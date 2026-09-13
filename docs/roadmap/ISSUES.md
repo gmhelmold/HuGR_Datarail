@@ -8,26 +8,26 @@ superados; este arquivo define status atual. `Done` nao e backlog ativo.
 ### TXN-01 - Make cross-partition `EndTxn` crash-atomic
 **Legacy:** Issue #4 · `docs/design/KAFKA-TXN-DESIGN.md`
 
-**Status:** open. Durable `Prepare`/`Commit` journal, partition rollback, startup recovery, offset snapshots, and a
-transaction visibility gate now exist. In-process and real-binary restart tests cover five post-fsync boundaries, but
-ambiguous journal-write handling and full all-or-none proof under those ambiguous outcomes remain open; do not claim
-crash atomicity yet.
+**Status:** closed for single-node scope. Durable `Prepare`/`Commit` journal, partition rollback, startup recovery,
+offset snapshots, transaction visibility gate, five post-fsync process boundaries, and real-binary partial/complete
+`Commit` write cuts now prove deterministic all-or-none recovery. Multi-node coordination remains out of scope.
 
-**Do:** finish process-level crash tests and ambiguous journal-write handling against
-[`KAFKA-TXN-DURABILITY.md`](../design/KAFKA-TXN-DURABILITY.md). Keep control metadata provider-blind. Do not claim
-Kafka EOS until kill-during-commit proves all-or-none.
+**Do:** retain the fault matrix against [`KAFKA-TXN-DURABILITY.md`](../design/KAFKA-TXN-DURABILITY.md). Keep control
+metadata provider-blind. Scope claim to single-node datarail transaction protocol, not Kafka EOS compatibility.
 
-**Acceptance:** injected crash at every commit boundary leaves either all enrolled records and offsets visible or none;
-recovery is deterministic; stale epoch cannot finish a newer transaction.
+**Acceptance:** injected crash at every commit boundary and partial/complete `Commit` write cut leaves either all
+enrolled records and offsets visible or none; recovery is deterministic; stale epoch cannot finish a newer transaction.
 
 ### DUR-01 - Prove power-loss durability
 **Legacy:** Issue #2
 
 **Status:** partial. `scripts/durability-device-mapper.sh` runs a privileged Docker device-mapper cut and verifies
-every acknowledged WAL record after recovery. It does not yet model directory-entry loss or fsync reordering, so the
-power-loss claim remains open.
+every acknowledged WAL record after recovery. WAL tests now model stale/lost cursor directory entries and fail closed
+on real directory-fsync errors. Manual `.github/workflows/durability-linux.yml` requires `dm-flakey`, ext4/xfs, and
+write barriers. Physical power-loss ordering remains open until that Linux evidence runs successfully.
 
-**Do:** extend the harness with a backend that can cut/reorder fsync and rename, including directory-entry loss.
+**Do:** run the manual Linux workflow on a runner exposing `dm-flakey`, then add actual poweroff/replay evidence on
+Linux/ext4 or xfs with barriers.
 
 **Acceptance:** reproducible local or CI harness fails without dir-fsync ordering and passes with it; every acked record
 survives the injected cut.
@@ -162,6 +162,7 @@ an unresolved product decision.
 - `BatchTooLarge` -> Kafka `MESSAGE_TOO_LARGE` `10`; regression covered.
 - Per-partition locking implementation, rollback feature, lock-order stress, and sequence-range test.
 - Transaction epoch fencing, stale completion rejection, failed-buffer restoration.
+- Single-node cross-partition transaction crash atomicity, including partial/complete journal-write recovery.
 - Replay corruption active mitigation and loud fetch behavior.
 - Contract violation -> non-retriable `INVALID_RECORD` `87`.
 
@@ -169,8 +170,7 @@ an unresolved product decision.
 
 1. `WP1-01` evidence/release decision and `DUR-01` power-loss semantics.
 2. `DUR-01` power-loss harness.
-3. `TXN-01` durable transaction protocol and crash test.
-4. `DEDUP-01` restart deduplication.
-5. `COMPAT-01` real-client matrix.
-6. `KEY-01` and `QUIC-01` security hardening.
-7. `REPL-01`, `MAN-01`, `NET-01`, `CRYPTO-01`, and `EXT-01` by leverage/resources.
+3. `DEDUP-01` restart deduplication.
+4. `COMPAT-01` real-client matrix.
+5. `KEY-01` and `QUIC-01` security hardening.
+6. `REPL-01`, `MAN-01`, `NET-01`, `CRYPTO-01`, and `EXT-01` by leverage/resources.

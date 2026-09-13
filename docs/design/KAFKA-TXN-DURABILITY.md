@@ -1,13 +1,14 @@
 # Kafka Transaction Durability Contract
 
-**Status:** foundation implemented; crash matrix and fault-injection proof pending.
+**Status:** foundation implemented; process-level crash matrix and ambiguous journal-write proof backed by real-binary
+fault injection. Multi-node transactions remain out of scope.
 **Scope:** single-node `datarail kafka-broker`; cross-partition records plus transactional offsets.
 
 ## Problem
 
 Current path journals `Prepare`, flushes enrolled partition logs, applies offsets, then journals `Commit`. Recovery
-rolls back an unresolved intent or verifies/reapplies a committed one. The wire test and local restart tests do not
-prove crash atomicity; fault injection remains required.
+rolls back an unresolved intent or verifies/reapplies a committed one. Real-binary fault injection now covers both
+process boundaries and partial/complete `Commit` writes before fsync.
 
 ## Required Invariants
 
@@ -79,7 +80,7 @@ Fault injection must stop the process after each of these points and restart on 
 - before and after `Prepare` append;
 - after each participant append and fsync;
 - after the last participant fsync;
-- after each offset write and fsync;
+- after the staged-offset batch write and fsync;
 - before and after `Commit` append and fsync;
 - after recovery truncation and offset restore.
 
@@ -87,8 +88,9 @@ Expected result: all records plus all offsets, or no records plus old offsets. R
 idempotent. A successful wire test without this matrix is not a crash-atomicity proof.
 
 The unit test injects panics at these boundaries and reopens the data directory after unwinding. The real-binary
-`kafka_txn_wire` harness now aborts and restarts the process at each post-fsync boundary (points 1 through 5), proving
-record and staged-offset all-or-none recovery there. It does not cover ambiguous `fsync`/partial-journal-write outcomes.
+`kafka_txn_wire` harness aborts and restarts at each post-fsync boundary (points 1 through 5), then writes partial
+`Commit` prefixes at several cuts plus a complete frame before aborting before fsync. Recovery proves records and
+staged offsets are all-or-none for both absent/partial and complete ambiguous journal outcomes.
 
 ## Explicit Non-Goals
 

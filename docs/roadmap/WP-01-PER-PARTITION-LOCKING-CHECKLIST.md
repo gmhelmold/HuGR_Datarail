@@ -22,14 +22,14 @@
 
 ### F3: `commit_txn` is CROSS-PARTITION
 - [x] **Root cause:** `commit_txn` flushes enrolled partitions sequentially; a crash can expose a partial commit
-- [ ] **Fix required:** Add durable intent/commit protocol; lock ordering is already implemented
+- [x] **Fix required:** Add durable intent/commit protocol; lock ordering is already implemented
   - [x] Design lock ordering: deterministic partition order (e.g., sorted by `(topic, partition)`)
   - [x] Implement lock acquisition in order, release in reverse
   - [x] Verify no deadlock with reverse-order `commit_txn` + concurrent `produce` + `fetch`
   - [x] Preserve epoch fencing: stale-epoch dropped, matching epoch flushed; stale `EndTxn` completion fenced
   - [x] Restore unlanded buffer after pre-append commit failure
 - [x] **Gate:** transaction wire test + reverse-order and 10k-op stress pass
-- [ ] **Risk:** HIGH — crash atomicity and offset atomicity remain unproven
+- [x] **Risk:** HIGH — single-node crash/offset atomicity backed by process and journal-write fault matrix; Kafka marker/LSO remains out of scope
 
 ### F4: `FileOffsets` is SINGLE GLOBAL
 - [ ] **Root cause:** One `Option<FileOffsets>` in `BrokerInner`; currently under global mutex
@@ -251,5 +251,5 @@ PHASE 6: Rollback & Docs
 
 ---
 
-**Next Action:** Execute canonical backlog in `docs/roadmap/ISSUES.md`; extend device-mapper power-loss cut to fsync/rename
-reordering, then close remaining transaction ambiguity proof.
+**Next Action:** Execute canonical backlog in `docs/roadmap/ISSUES.md`; run
+`.github/workflows/durability-linux.yml` on a runner exposing `dm-flakey`, then collect physical power-loss evidence.

@@ -47,13 +47,12 @@ exato em dados íntegros depois de corrupção anterior.
 
 **Fase 1:** `PartitionLockMap` + `PartitionState` implementados; abort, retry de commit, lazy-init, sequência por
 partição e fencing de epoch corrigidos; buffer não-lançado é restaurado após falha de commit. Stress de 10k ops passa.
-Atomicidade crash cross-partition ainda pendente.
+Atomicidade crash cross-partition single-node agora coberta por fault matrix e cortes de escrita do journal.
 
-**Próximos:** seguir backlog canônico em `docs/roadmap/ISSUES.md`; primeiro `DUR-01`, depois prova process-level de
-`TXN-01`.
+**Próximos:** seguir backlog canônico em `docs/roadmap/ISSUES.md`; primeiro `DUR-01` e evidência WP1.
 
-**Dependências bloqueantes:** protocolo txn process-level, power-loss evidence e WP1 release evidence. `STOR-01` core
-está fechado; `DUR-01` ainda exige fsync/rename fault harness.
+**Dependências bloqueantes:** power-loss evidence e WP1 release evidence. `STOR-01` core e `TXN-01` single-node estão
+fechados; `DUR-01` ainda exige fsync/rename reorder + directory-entry-loss harness.
 
 ---
 

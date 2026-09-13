@@ -214,6 +214,18 @@ impl TxnJournal {
         frame.extend_from_slice(&len.to_le_bytes());
         frame.extend_from_slice(payload);
         frame.extend_from_slice(&crc32c(&frame).to_le_bytes());
+        // Test-only process hook: a crash after an arbitrary Commit prefix models the ambiguous
+        // write window between write(2) and fsync(2). Normal processes never set this variable.
+        if kind == COMMIT {
+            if let Some(cut) = std::env::var("DATARAIL_TXN_JOURNAL_CUT")
+                .ok()
+                .and_then(|value| value.strip_prefix("commit:").map(str::to_owned))
+                .and_then(|value| value.parse::<usize>().ok())
+            {
+                self.file.write_all(&frame[..cut.min(frame.len())])?;
+                std::process::abort();
+            }
+        }
         self.file.write_all(&frame)?;
         self.file.sync_all()
     }

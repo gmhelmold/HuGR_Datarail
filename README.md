@@ -183,9 +183,9 @@ The sharp edges, before you find them:
 - **Throughput scaling is not independently evidenced:** per-partition locking is implemented; local 512-byte
   interleaved A/B samples ranged `1.154x–1.684x` on this host, with high variance. Independent product evidence,
   CI-scale samples, and RSS remain absent. See [`docs/roadmap/WP-01-BENCH-LOCAL-2026-09-12.md`](docs/roadmap/WP-01-BENCH-LOCAL-2026-09-12.md).
-- **Transactional crash atomicity remains unproven:** broker now has a durable prepare/commit journal, rollback,
-  startup recovery, and deterministic in-process fault points, but process-level restart coverage is still missing.
-  Do not treat cross-partition transactions as crash-atomic. See
+- **Transactional crash atomicity is single-node scoped:** broker has durable prepare/commit journaling, rollback,
+  startup recovery, process-boundary faults, and partial/complete journal-write cuts with all-or-none recovery.
+  This is not Kafka marker/LSO compatibility or multi-node atomicity. See
   [`docs/design/KAFKA-TXN-DURABILITY.md`](docs/design/KAFKA-TXN-DURABILITY.md).
 - **Broker restarts are at-least-once** for non-idempotent producers (the general dedup index is not wired in).
 - **QUIC substrate ships dev-only embedded certs and the client accepts any server cert** — an active MITM on

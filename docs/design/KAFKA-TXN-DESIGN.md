@@ -1,6 +1,6 @@
 # KAFKA-TXN-DESIGN — transactional producer EOS (bounded buffer model)
 
-> **STATUS: BUILT + PARTIALLY DURABLE; CRASH PROOF OPEN (2026-09-13).** `datarail kafka-broker` serves the transactional producer
+> **STATUS: BUILT + SINGLE-NODE CRASH-ATOMIC (2026-09-13).** `datarail kafka-broker` serves the transactional producer
 > APIs (`InitProducerId(transactional_id)` with epoch fencing, `AddPartitionsToTxn`, `AddOffsetsToTxn`,
 > `TxnOffsetCommit`, `EndTxn`) on the **buffer-until-commit** model: a transactional batch is FENCED against the
 > coordinator (`produce_check`: epoch + partition-claim) then BUFFERED (keyed by `(producer_id, epoch, topic,
@@ -15,10 +15,10 @@
 > parse-safe + charter-clean; provider-blind holds (buffered plaintext is sealed before it ever hits disk).
 > **HONEST SCOPE:** correct for **one producer per partition during a txn** (concurrent same-partition → retriable
 > `CONCURRENT_TRANSACTIONS`); `read_uncommitted` behaves like `read_committed`; unresolved journal intents roll back
-> during startup recovery; crash-boundary fault injection is still missing, so cross-partition crash atomicity remains
-> unclaimed.
-> The faithful marker/LSO model (cross-partition crash atomicity, concurrent same-partition txns + a true
-> `read_uncommitted`) is tracked future work.
+> during startup recovery; single-node cross-partition crash atomicity is backed by the fault matrix and journal-write
+> cuts. This is not Kafka's faithful marker/LSO model or multi-node transaction coordination.
+> The faithful marker/LSO model (marker semantics, concurrent same-partition txns + a true `read_uncommitted`) is
+> tracked future work.
 >
 > **(build history below — Q1–Q4 RATIFIED BY THE TECHLEAD.)**
 > The owner re-armed the autonomous loop rather than answer Q1–Q4, so per the standing "decide+execute, don't ask
@@ -29,7 +29,8 @@
 > provider-blind preserved). **Q2 = (a)** `read_committed` is **edge-filtered** by us (we are the authoritative
 > coordinator → return only committed records + a correct LSO + an empty aborted-list; wire-compatible with a
 > `read_committed` client, and we never ship aborted plaintext). **Q3 = abort-on-restart** for in-memory pre-prepare
-> state; durable participant intents now recover from the transaction journal. The crash proof remains open.
+> state; durable participant intents now recover from the transaction journal. The single-node crash proof is backed
+> by the process and journal-write fault matrix; Kafka marker/LSO fidelity remains open.
 > **Q4 = IN SCOPE, build now.** Build order: TxnCoordinator (state machine + epoch fencing, unit-tested) → codec →
 > serve wiring → store markers + LSO → `read_committed` Fetch → wire test → brutal audit.
 >

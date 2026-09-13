@@ -22,6 +22,8 @@
 
 #![forbid(unsafe_code)]
 
+#[cfg(test)]
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -32,6 +34,11 @@ use datarail_core::{Cofre, Substrate, MAX_COFRE_WIRE_LEN};
 
 /// Frame overhead on disk: a 4-byte big-endian length prefix + a 4-byte big-endian CRC-32 suffix.
 const FRAME_OVERHEAD: usize = 8;
+
+#[cfg(test)]
+thread_local! {
+    static FAIL_DIR_FSYNC: Cell<bool> = const { Cell::new(false) };
+}
 
 /// Tunables for the log (all have warp-but-safe defaults).
 #[derive(Debug, Clone, Copy)]
@@ -365,16 +372,27 @@ impl Substrate for DurableLog {
     }
 
     fn ack(&mut self, cofre_id: [u8; 32]) -> Result<(), WalError> {
-        if let Some(seg) = self.inflight.remove(&cofre_id) {
+        let removed = if let Some(seg) = self.inflight.remove(&cofre_id) {
             if let Some(n) = self.seg_inflight.get_mut(&seg) {
                 *n = n.saturating_sub(1);
             }
-        }
+            Some(seg)
+        } else {
+            None
+        };
         // CRASH-SAFE GC ORDER: durably checkpoint the advanced cursor FIRST, THEN delete segments. If we deleted
         // first and crashed before the cursor was durable, recovery would point at a deleted segment — the
         // total-loss bug. (recv's skip-forward is the additional safety net if a delete still races a stale
         // cursor.) The dir fsync in checkpoint() makes the cursor rename itself durable.
-        self.checkpoint()?;
+        if let Err(error) = self.checkpoint() {
+            // A failed directory fsync means caller has no durable ack. Restore in-memory bookkeeping so a retry
+            // cannot silently skip the cofre after a transient persistence failure.
+            if let Some(seg) = removed {
+                self.inflight.insert(cofre_id, seg);
+                *self.seg_inflight.entry(seg).or_insert(0) += 1;
+            }
+            return Err(error);
+        }
         let floor = self.ack_floor().0;
         let mut s = 1u64;
         let mut deleted = false;
@@ -407,14 +425,29 @@ fn seg_path(dir: &Path, id: u64) -> PathBuf {
     dir.join(format!("{id:012}.seg"))
 }
 
-/// fsync a directory so a create/rename/unlink of its entries is durable (Unix semantics). Best-effort: some
-/// filesystems return `EINVAL` for a directory fsync — that's tolerated (durability there relies on the FS's
-/// own ordering), but a failure to OPEN the directory is a real error.
+/// fsync a directory so a create/rename/unlink of its entries is durable (Unix semantics). Some filesystems
+/// return `EINVAL` for a directory fsync — that unsupported operation is tolerated. Other sync failures are
+/// real durability errors and must reach the caller.
 fn fsync_dir(dir: &Path) -> Result<(), WalError> {
+    #[cfg(test)]
+    if FAIL_DIR_FSYNC.with(Cell::get) {
+        return Err(std::io::Error::from_raw_os_error(5).into());
+    }
+    fsync_dir_with(dir, File::sync_all)
+}
+
+fn fsync_dir_with<F>(dir: &Path, sync: F) -> Result<(), WalError>
+where
+    F: FnOnce(&File) -> std::io::Result<()>,
+{
     match File::open(dir) {
         Ok(f) => {
-            let _ = f.sync_all(); // ignore EINVAL on FSes without dir-fsync; succeeds on ext4/xfs where it matters
-            Ok(())
+            match sync(&f) {
+                Ok(()) => Ok(()),
+                // POSIX directory fsync is unavailable on some supported filesystems (notably macOS APIs).
+                Err(error) if error.raw_os_error() == Some(22) => Ok(()),
+                Err(error) => Err(error.into()),
+            }
         }
         Err(e) => Err(e.into()),
     }
@@ -505,4 +538,66 @@ fn read_frame(file: &mut File, active: bool) -> Result<FrameRead, WalError> {
     }
     let advance = (FRAME_OVERHEAD + len) as u64;
     Ok(FrameRead::Cofre { bytes, advance })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use datarail_core::Substrate;
+    use datarail_rail::testsupport::cofre_seq;
+
+    use super::{fsync_dir_with, DurableLog, WalError, FAIL_DIR_FSYNC};
+
+    static UNIQUE: AtomicU64 = AtomicU64::new(0);
+
+    fn temp_dir() -> std::path::PathBuf {
+        let id = UNIQUE.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "datarail-wal-fsync-dir-{}-{id}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create test directory");
+        dir
+    }
+
+    #[test]
+    fn directory_sync_tolerates_only_unsupported_einval() {
+        let dir = temp_dir();
+        let unsupported = io::Error::from_raw_os_error(22);
+        assert!(fsync_dir_with(&dir, |_| Err(unsupported)).is_ok());
+
+        let real_failure = io::Error::from_raw_os_error(5);
+        assert!(matches!(
+            fsync_dir_with(&dir, |_| Err(real_failure)),
+            Err(WalError::Io(_))
+        ));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn failed_directory_sync_does_not_consume_ack() {
+        let dir = temp_dir();
+        let mut log = DurableLog::open(&dir).expect("open test log");
+        log.send(&cofre_seq(0)).expect("send");
+        log.flush().expect("flush");
+        let cofre = log.recv().expect("recv").expect("record");
+
+        FAIL_DIR_FSYNC.with(|failed| failed.set(true));
+        assert!(log.ack(cofre.etiqueta.cofre_id).is_err());
+        assert_eq!(
+            log.inflight_len(),
+            1,
+            "failed dir fsync must preserve retryable ack state"
+        );
+        FAIL_DIR_FSYNC.with(|failed| failed.set(false));
+        log.ack(cofre.etiqueta.cofre_id).expect("retry ack");
+        drop(log);
+
+        let mut reopened = DurableLog::open(&dir).expect("reopen test log");
+        assert!(reopened.recv().expect("recv after durable ack").is_none());
+        let _ = std::fs::remove_dir_all(dir);
+    }
 }

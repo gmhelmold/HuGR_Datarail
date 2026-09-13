@@ -53,14 +53,14 @@ flagged) — the offset *is* the dedup state. O(1).
 file is **deleted** (GC). Disk is bounded by the un-acked retention window; RAM is unaffected. The cursor
 checkpoint (`read`/`ack` offsets) is fsync'd via write-tmp+rename periodically and on close.
 
-### Crash recovery (real power-loss durability)
+### Crash recovery (fsync durability contract)
 On `open()`: read the `cursor` checkpoint (read/ack offsets). Scan the active segment **forward from the last
 checkpoint**, validating each frame's CRC; set the durable write offset to the end of the last **intact** frame
 and **truncate** any torn tail (a frame whose write was interrupted by power-loss). Result: every cofre whose
-`flush()` returned (fsync'd) is recovered; a half-written tail is dropped (it was never acked). This is
-**at-least-once at the substrate** (a crash between downstream-commit and cursor-checkpoint may re-deliver a few
-cofres) → composed with the terminal's effectively-once gate = **effectively-once end-to-end**, exactly as the
-existing resumable-socket path already proves.
+`flush()` returned (fsync'd) is recovered on a filesystem honoring fsync ordering; a half-written tail is dropped (it
+was never acked). This is **at-least-once at the substrate** (a crash between downstream-commit and cursor-checkpoint
+may re-deliver a few cofres) → composed with the terminal's effectively-once gate = **effectively-once end-to-end**,
+exactly as the existing resumable-socket path already proves. Physical power-loss evidence remains environment-specific.
 
 ## The RAM invariant (the masterpiece guarantee — must be TESTED, not asserted)
 Process RSS attributable to the substrate = `write_buf cap + read_buf cap + ~3 file handles + fixed cursor
@@ -79,7 +79,8 @@ struct` ≈ **a couple of MiB, FLAT** — independent of (a) total bytes stored 
    only need a CSPRNG, not a fresh kernel read each time.
 
 ## Honesty boundaries (carry into the eventual claim)
-- This gives **fsync durability** (power-loss safe, single node). **Replication (RF≥3, node-loss safe)** is a
+- This implements **fsync durability** for a single node; the Docker device-mapper cut harness exercises abrupt I/O
+  loss, but does not prove physical power-loss ordering. **Replication (RF≥3, node-loss safe)** is a
   separate axis — provided by pointing the segment dir at a replicated store (S3/GCS/CoreLink) or a future
   replicated-WAL mode. We will claim "fsync-durable, single-node" precisely, not "Kafka RF=3" unless measured.
 - The fair comparison is **datarail-WAL-durable vs Kafka-acks=all**, both measured with the **same ruler** (both
@@ -96,3 +97,9 @@ struct` ≈ **a couple of MiB, FLAT** — independent of (a) total bytes stored 
   loss, but NOT disk/node loss. "Kafka-grade" in the RF≥3 sense is NOT claimed.
 - Recovery scans the active segment for a torn tail (truncates it); a CRC failure inside a SEALED segment is a
   hard error (not silently skipped). A lost cursor + GC is survived by recv's skip-forward over missing segments.
+- `scripts/durability-device-mapper.sh` is the reproducible cut-I/O probe. Set `DATARAIL_DURABILITY_FAULT_MODE=flakey`
+  on a Linux runner to require `dm-flakey`, ext4/xfs, and write barriers; `.github/workflows/durability-linux.yml`
+  runs that mode manually. `reordered_cursor_rename_plus_gc...` and
+  `missing_cursor_entry...` model stale/lost directory-entry visibility; directory-fsync failures fail closed without
+  consuming the ack. Final `DUR-01` physical power-loss closure still needs a filesystem/backend that injects
+  fsync/rename reordering and directory-entry loss.

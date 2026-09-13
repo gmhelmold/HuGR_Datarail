@@ -238,10 +238,10 @@ fn unacked_backlog_ram_is_bounded_by_inflight_and_reclaimed_on_ack() {
     }
 }
 
-/// REGRESSION GATE for the audit's total-loss bug: a lost cursor checkpoint combined with GC of early segments
+/// REGRESSION GATE for cursor rename reordering: a stale cursor directory entry combined with GC of early segments
 /// must NOT lose the un-acked tail. recv must skip forward over the GC'd/missing segments and recover them.
 #[test]
-fn lost_cursor_plus_gc_still_recovers_unacked_tail() {
+fn reordered_cursor_rename_plus_gc_still_recovers_unacked_tail() {
     const N: u64 = 1200;
     let dir = temp_dir("lostcursor");
     let cfg = WalConfig {
@@ -249,6 +249,7 @@ fn lost_cursor_plus_gc_still_recovers_unacked_tail() {
         flush_micros: 1,
         segment_bytes: 8 * 1024,
     };
+    let stale_cursor;
     {
         let mut log = DurableLog::open_with(&dir, cfg).expect("open");
         for seq in 0..N {
@@ -256,13 +257,19 @@ fn lost_cursor_plus_gc_still_recovers_unacked_tail() {
         }
         log.flush().expect("flush");
         // ack the first half → GC deletes the early segments
-        for _ in 0..(N / 2) {
+        let mut saved_cursor = None;
+        for index in 0..(N / 2) {
             let c = log.recv().expect("recv").expect("some");
             log.ack(c.etiqueta.cofre_id).expect("ack");
+            if index == 0 {
+                saved_cursor = Some(std::fs::read(dir.join("cursor")).expect("read stale cursor"));
+            }
         }
+        stale_cursor = saved_cursor.expect("saved stale cursor");
     }
-    // Simulate a LOST cursor checkpoint (crash before the cursor rename was durable) while early segments are GC'd.
-    let _ = std::fs::remove_file(dir.join("cursor"));
+    // Simulate rename reordering: the old cursor directory entry survives while later entries and early segments
+    // were already made visible. Recovery must skip forward rather than treating the missing segment as end-of-log.
+    std::fs::write(dir.join("cursor"), stale_cursor).expect("restore stale cursor");
     let mut reopened = DurableLog::open_with(&dir, cfg).expect("reopen");
     let mut got = Vec::new();
     while let Some(c) = reopened.recv().expect("recv") {
@@ -278,6 +285,29 @@ fn lost_cursor_plus_gc_still_recovers_unacked_tail() {
             "un-acked cofre seq {seq} was LOST after lost-cursor+GC (the total-loss bug)"
         );
     }
+}
+
+/// A lost cursor directory entry must fall back to the ack floor, not the advanced in-memory read cursor.
+#[test]
+fn missing_cursor_entry_redelivers_unacked_tail() {
+    let dir = temp_dir("missing-cursor");
+    {
+        let mut log = DurableLog::open(&dir).expect("open");
+        for seq in 0..4 {
+            log.send(&cofre_seq(seq)).expect("send");
+        }
+        log.flush().expect("flush");
+        let _ = log.recv().expect("recv").expect("record");
+    }
+    std::fs::remove_file(dir.join("cursor")).expect("remove cursor directory entry");
+
+    let mut reopened = DurableLog::open(&dir).expect("reopen");
+    let mut got = Vec::new();
+    while let Some(cofre) = reopened.recv().expect("recv after lost cursor") {
+        got.push(cofre.etiqueta.seq);
+        reopened.ack(cofre.etiqueta.cofre_id).expect("ack");
+    }
+    assert_eq!(got, vec![0, 1, 2, 3]);
 }
 
 /// REGRESSION GATE: a corrupt frame in a SEALED (non-active) segment must ERROR, not silently skip it plus the
