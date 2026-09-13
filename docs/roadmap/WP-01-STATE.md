@@ -1,11 +1,11 @@
 # WP-01 — Estado Compacto (Fase 1 em revisão)
 
-**Base:** `v0.1.0` (`3cc5bb9`); current worktree uncommitted
+**Base:** `v0.1.0` (`3cc5bb9`); current branch `test/durability-linux-evidence`
 **Data:** 2026-09-10
 **Status Fase 0:** ✅ COMPLETA
-**Status Fase 1:** ⚠️ locking implementado; evidência independente e atomicidade crash pendentes
-**Bug ReplayLog:** contornado em `kafka_store`, teste de corrupção ativo
-**Release:** `v0.1.1` — bloqueado por gates de txn, rollback e benchmark
+**Status Fase 1:** ⚠️ locking implementado; evidência independente e power-loss físico pendentes
+**Bug ReplayLog:** corrigido em `ReplayLog`, teste de corrupção ativo
+**Release:** `v0.1.1` — bloqueado por evidência WP1 e `DUR-01` físico
 
 ---
 
