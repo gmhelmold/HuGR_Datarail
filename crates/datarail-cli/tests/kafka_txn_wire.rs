@@ -294,7 +294,10 @@ fn spawn_fault_broker(
 }
 
 fn write_fault_rail(point: u8) -> (std::path::PathBuf, std::path::PathBuf) {
-    let rail = std::env::temp_dir().join(format!("kafka-txn-fault-{point}-{}.toml", std::process::id()));
+    let rail = std::env::temp_dir().join(format!(
+        "kafka-txn-fault-{point}-{}.toml",
+        std::process::id()
+    ));
     std::fs::write(
         &rail,
         "[route]\n\
@@ -311,7 +314,10 @@ fn write_fault_rail(point: u8) -> (std::path::PathBuf, std::path::PathBuf) {
          tenant_secret = \"0x2222222222222222222222222222222222222222222222222222222222222222\"\n",
     )
     .expect("write fault rail");
-    let data_dir = std::env::temp_dir().join(format!("kafka-txn-fault-data-{point}-{}", std::process::id()));
+    let data_dir = std::env::temp_dir().join(format!(
+        "kafka-txn-fault-data-{point}-{}",
+        std::process::id()
+    ));
     let _ = std::fs::remove_dir_all(&data_dir);
     (rail, data_dir)
 }
@@ -383,7 +389,10 @@ fn process_crash_at_each_transaction_boundary_recovers_all_or_none() {
         let port = free_port();
         let (mut daemon, mut stream) = spawn_fault_broker(&rail, &data_dir, port, Some(point));
         drive_faulted_commit(&mut stream);
-        let status = daemon.0.wait().expect("wait for injected transaction crash");
+        let status = daemon
+            .0
+            .wait()
+            .expect("wait for injected transaction crash");
         assert!(!status.success(), "fault point {point} did not stop broker");
 
         let (_daemon, mut stream) = spawn_fault_broker(&rail, &data_dir, port, None);

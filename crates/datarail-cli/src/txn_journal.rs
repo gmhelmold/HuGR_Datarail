@@ -77,7 +77,9 @@ impl TxnJournal {
             .read(true)
             .append(true)
             .open(&path)?;
-        Ok(Self { path, file })
+        let mut journal = Self { path, file };
+        journal.repair_torn_tail()?;
+        Ok(journal)
     }
 
     pub(crate) fn prepare(
@@ -181,6 +183,22 @@ impl TxnJournal {
             .max()
             .unwrap_or(0)
             .saturating_add(1))
+    }
+
+    fn repair_torn_tail(&mut self) -> io::Result<()> {
+        let mut bytes = Vec::new();
+        File::open(&self.path)?.read_to_end(&mut bytes)?;
+        let mut pos = 0usize;
+        while pos < bytes.len() {
+            let Some((_, _, next)) = decode_frame(&bytes, pos)? else {
+                self.file
+                    .set_len(u64::try_from(pos).map_err(|_| invalid("journal offset overflow"))?)?;
+                self.file.sync_all()?;
+                break;
+            };
+            pos = next;
+        }
+        Ok(())
     }
 
     fn append_frame(&mut self, kind: u8, payload: &[u8]) -> io::Result<()> {
@@ -607,5 +625,79 @@ mod tests {
             [JournalState::Aborted(_)]
         ));
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn every_partial_prepare_or_commit_tail_is_repaired() {
+        let source = path("partial-source");
+        let _ = std::fs::remove_file(&source);
+        let mut journal = TxnJournal::open(&source).expect("open");
+        let prepared = journal
+            .prepare(
+                "tx",
+                11,
+                0,
+                vec![ParticipantBoundary {
+                    topic: "events".to_owned(),
+                    partition: 0,
+                    byte_end: 12,
+                    logical_end: 1,
+                }],
+                vec![OffsetChange {
+                    group: "g".to_owned(),
+                    before: None,
+                    after: 4,
+                }],
+            )
+            .expect("prepare");
+        let prepare_len = std::fs::metadata(&source).expect("prepare metadata").len();
+        journal
+            .commit(
+                &prepared,
+                &[ParticipantBoundary {
+                    topic: "events".to_owned(),
+                    partition: 0,
+                    byte_end: 20,
+                    logical_end: 2,
+                }],
+            )
+            .expect("commit");
+        drop(journal);
+        let bytes = std::fs::read(&source).expect("read complete journal");
+        let total_len = u64::try_from(bytes.len()).expect("journal length");
+
+        for cut in 0..total_len {
+            let partial = path(&format!("partial-{cut}"));
+            std::fs::write(&partial, &bytes).expect("write partial source");
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(&partial)
+                .expect("open partial source")
+                .set_len(cut)
+                .expect("truncate partial source");
+            let mut reopened = TxnJournal::open(&partial).expect("reopen partial journal");
+            let states = reopened.states().expect("states");
+            if cut < prepare_len {
+                assert!(states.is_empty(), "partial prepare became visible at {cut}");
+            } else {
+                assert!(matches!(states.as_slice(), [JournalState::Prepared(_)]));
+            }
+            assert_eq!(
+                std::fs::metadata(&partial).expect("partial metadata").len(),
+                if cut < prepare_len { 0 } else { prepare_len }
+            );
+            let _ = std::fs::remove_file(partial);
+        }
+
+        let mut reopened = TxnJournal::open(&source).expect("reopen complete journal");
+        assert!(matches!(
+            reopened.states().expect("complete states").as_slice(),
+            [JournalState::Committed { .. }]
+        ));
+        assert_eq!(
+            total_len,
+            std::fs::metadata(&source).expect("source metadata").len()
+        );
+        let _ = std::fs::remove_file(source);
     }
 }
