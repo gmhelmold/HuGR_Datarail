@@ -251,4 +251,5 @@ PHASE 6: Rollback & Docs
 
 ---
 
-**Next Action:** Execute canonical backlog in `docs/roadmap/ISSUES.md`; next power-loss harness, then process-level txn proof.
+**Next Action:** Execute canonical backlog in `docs/roadmap/ISSUES.md`; extend device-mapper power-loss cut to fsync/rename
+reordering, then close remaining transaction ambiguity proof.

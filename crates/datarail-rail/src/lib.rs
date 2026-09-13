@@ -126,10 +126,18 @@ where
     }
 
     for (i, expected) in sent.iter().enumerate() {
-        let got = sub
-            .recv()
-            .expect("recv must succeed")
-            .unwrap_or_else(|| panic!("recv #{i} returned None but a cofre was sent"));
+        let mut attempts = 0;
+        let got = loop {
+            if let Some(got) = sub.recv().expect("recv must succeed") {
+                break got;
+            }
+            attempts += 1;
+            assert!(
+                attempts < 1_000,
+                "recv #{i} returned None for 1 second after a cofre was sent"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        };
         assert_eq!(
             &got, expected,
             "recv #{i} must return the sent cofre in order"

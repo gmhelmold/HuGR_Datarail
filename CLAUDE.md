@@ -75,13 +75,13 @@ This repo's whole credibility rests on claims matching reality. Before writing a
 
 1. **WP1 evidence/release decision** — implementation and local stress are done; independent A/B, p99/RSS, CI-scale
    evidence, and `v0.1.1` release gates remain.
-2. **ReplayLog + power-loss durability** — core seek fix and persistent idempotent dedup landed; add fsync/rename
-   fault injection beyond `kill9_crash.rs`.
-3. **Durable transaction protocol** — journal/recovery/offset atomicity foundation landed; process-level kill-during-
-   commit and ambiguous-write proof remain open.
+2. **ReplayLog + power-loss durability** — core seek fix, persistent idempotent dedup, and a Docker device-mapper
+   cut harness landed; extend it to fsync/rename reordering and directory-entry loss.
+3. **Durable transaction protocol** — journal/recovery/offset atomicity foundation and process-level kill-during-commit
+   proof landed; ambiguous-write proof remains open.
 4. **Real Kafka clients + key refs** — compatibility harness and env/file refs landed; run Java, franz-go, kafka-python,
    Sarama, librdkafka 2.x, real-client transactions, and add KMS integration.
-5. **Security/architecture** — verified QUIC and standalone Merkle verifier landed; external crypto review, replication
+5. **Security/architecture** — verified QUIC, standalone Merkle verifier, and owned receipt boundary landed; external crypto review, replication
    decision, verifier CLI/typed boundary, real FASP transport, and owner/external queue remain.
 
 ## Owner-reserved files

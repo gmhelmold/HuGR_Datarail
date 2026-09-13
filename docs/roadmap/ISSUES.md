@@ -23,9 +23,11 @@ recovery is deterministic; stale epoch cannot finish a newer transaction.
 ### DUR-01 - Prove power-loss durability
 **Legacy:** Issue #2
 
-**Status:** open. `kill9_crash.rs` proves SIGKILL survival, not fsync reordering or directory-entry loss.
+**Status:** partial. `scripts/durability-device-mapper.sh` runs a privileged Docker device-mapper cut and verifies
+every acknowledged WAL record after recovery. It does not yet model directory-entry loss or fsync reordering, so the
+power-loss claim remains open.
 
-**Do:** FUSE, `dm-flakey`, CharybdeFS, or equivalent fault-injection harness that can cut/reorder fsync and rename.
+**Do:** extend the harness with a backend that can cut/reorder fsync and rename, including directory-entry loss.
 
 **Acceptance:** reproducible local or CI harness fails without dir-fsync ordering and passes with it; every acked record
 survives the injected cut.
