@@ -58,8 +58,10 @@ staging/tag/CI evidence is recorded; no claim exceeds evidence.
 ### COMPAT-01 - Run real Kafka client conformance matrix
 **Legacy:** Issue #3 · `docs/design/KAFKA-COMPAT.md`
 
-**Status:** open. Real coverage exists for kcat/librdkafka 1.7.1 and an independent librdkafka 1.8.0 run. Missing:
-Apache Kafka Java, franz-go, kafka-python, Sarama, librdkafka 2.x, and real-client transactional EOS.
+**Status:** open. Preparation landed: `scripts/kafka-compat-matrix.sh` validates a fail-closed matrix and provides
+the real-broker adapter contract. Real coverage remains limited to kcat/librdkafka 1.7.1 and an independent
+librdkafka 1.8.0 run. Missing: Apache Kafka Java, franz-go, kafka-python, Sarama, librdkafka 2.x, and real-client
+transactional EOS.
 
 **Acceptance:** each client row has a real pass/fail result for produce, fetch, groups, security, compression, and
 transactions where supported.
