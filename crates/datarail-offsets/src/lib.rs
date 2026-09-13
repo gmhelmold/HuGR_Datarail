@@ -81,7 +81,8 @@ fn crc32(bytes: &[u8]) -> u32 {
 /// (all integers little-endian) and fsyncs the file before returning, so a
 /// committed offset survives a process restart or crash. On [`open`](Self::open)
 /// the log is replayed start-to-finish and the last record per group wins; a
-/// torn or corrupt tail record is discarded, leaving every prior commit intact.
+/// torn or corrupt tail record is discarded and physically truncated on open, leaving every prior commit intact and
+/// allowing later commits to append safely.
 ///
 /// ## Bounded size via compaction
 /// Because the log is append-only and last-write-wins, a group committed N
@@ -137,7 +138,11 @@ impl FileOffsets {
             .append(true)
             .create(true)
             .open(path)?;
-        let (map, records) = Self::replay(&mut file)?;
+        let (map, records, valid_len) = Self::replay(&mut file)?;
+        if valid_len < file.metadata()?.len() {
+            file.set_len(valid_len)?;
+            file.sync_all()?;
+        }
         // Make the log's directory entry durable: a first-ever create must survive a power loss, else a
         // committed offset whose file data fsync'd could vanish with the lost create (audit D-6).
         fsync_dir(&dir)?;
@@ -202,7 +207,7 @@ impl FileOffsets {
     /// Read the whole log and fold it into the latest-offset-per-group map,
     /// stopping at the first incomplete or CRC-mismatched record (a torn tail).
     /// Also returns the number of intact physical records replayed.
-    fn replay(file: &mut File) -> io::Result<(BTreeMap<String, u64>, usize)> {
+    fn replay(file: &mut File) -> io::Result<(BTreeMap<String, u64>, usize, u64)> {
         let mut buf = Vec::new();
         file.read_to_end(&mut buf)?;
         let mut map = BTreeMap::new();
@@ -213,7 +218,9 @@ impl FileOffsets {
             pos = next;
             records += 1;
         }
-        Ok((map, records))
+        let valid_len =
+            u64::try_from(pos).map_err(|_| io::Error::other("offset log position exceeds u64"))?;
+        Ok((map, records, valid_len))
     }
 
     /// Encode one length-prefixed, CRC-checked record for `group`/`offset`.
@@ -441,6 +448,43 @@ mod tests {
         let tmp = TmpDir::new("unknown");
         let store = FileOffsets::open(&tmp.0).expect("open");
         assert_eq!(store.fetch("nope"), None);
+    }
+
+    #[test]
+    fn every_partial_tail_is_repaired_before_next_commit() {
+        let tmp = TmpDir::new("partial-tail");
+        let first = FileOffsets::encode_record("g", 1).expect("first record");
+        let second = FileOffsets::encode_record("g", 2).expect("second record");
+        let log = tmp.0.join("offsets.log");
+
+        for cut in 0..second.len() {
+            let mut bytes = first.clone();
+            bytes.extend_from_slice(&second);
+            std::fs::write(&log, &bytes).expect("write partial log");
+            let cut_len = u64::try_from(first.len() + cut).expect("cut length");
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(&log)
+                .expect("open partial log")
+                .set_len(cut_len)
+                .expect("truncate partial log");
+
+            let mut store = FileOffsets::open(&tmp.0).expect("reopen partial log");
+            assert_eq!(
+                store.fetch("g"),
+                Some(1),
+                "partial record became visible at {cut}"
+            );
+            assert_eq!(
+                std::fs::metadata(&log).expect("log metadata").len(),
+                first.len() as u64
+            );
+            store.commit("h", 3).expect("append after repair");
+            drop(store);
+            let reopened = FileOffsets::open(&tmp.0).expect("reopen appended log");
+            assert_eq!(reopened.fetch("g"), Some(1));
+            assert_eq!(reopened.fetch("h"), Some(3));
+        }
     }
 
     /// Current on-disk size of the live log.
