@@ -114,11 +114,12 @@ the project as single-node/embedded and remove unfulfilled product language.
 ### MAN-01 - Extract Merkle delivery receipt crate
 **Legacy:** Issue #10
 
-**Status:** partial. Public standalone verifier API and external-consumer tests/docs landed; verifier CLI and a
-serialization protocol remain absent.
+**Status:** closed via typed boundary. Public standalone verifier API now includes owned `OwnedDeliveryReceipt` plus
+external-consumer tests/docs; verifier CLI and serialization remain intentionally absent because SPEC 04 defines no
+wire format.
 
-**Acceptance:** external consumer can verify receipt offline without importing CLI internals; add verifier CLI or
-freeze an explicit typed-input boundary.
+**Acceptance:** external consumer verifies owned receipt offline without importing CLI internals; no CLI or wire-format
+claim is made.
 
 ### NET-01 - Wire FASP delay controller into real lossy transport
 

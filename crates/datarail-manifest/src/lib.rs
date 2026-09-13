@@ -462,6 +462,55 @@ pub struct DeliveryProof<'a> {
 /// crate because no wire format is defined by SPEC 04.
 pub type DeliveryReceipt<'a> = DeliveryProof<'a>;
 
+/// Owned typed-input boundary for consumers that parse receipts outside this crate.
+///
+/// This type deliberately carries no parser or wire-format policy. An external consumer owns the evidence, then
+/// calls [`OwnedDeliveryReceipt::verify`] without importing CLI internals.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OwnedDeliveryReceipt {
+    /// Delivered cofre payload bytes.
+    pub carga: Vec<u8>,
+    /// Claimed route.
+    pub route_id: [u8; 16],
+    /// Claimed stream.
+    pub stream_id: [u8; 16],
+    /// Claimed per-stream sequence.
+    pub seq: u64,
+    /// Claimed manifest epoch.
+    pub epoch: u64,
+    /// Merkle inclusion proof.
+    pub proof: InclusionProof,
+    /// Signed Tree Head.
+    pub sth: SignedTreeHead,
+    /// Pinned source verifying key.
+    pub source_vk: [u8; 32],
+    /// Destination delivery ack.
+    pub ack: DestAck,
+    /// Pinned destination verifying key.
+    pub dest_vk: [u8; 32],
+}
+
+impl OwnedDeliveryReceipt {
+    /// Verify owned receipt evidence offline.
+    ///
+    /// # Errors
+    /// Returns the corresponding [`ManifestError`] from [`verify_receipt`].
+    pub fn verify(&self) -> Result<(), ManifestError> {
+        verify_receipt(&DeliveryReceipt {
+            carga: &self.carga,
+            route_id: &self.route_id,
+            stream_id: &self.stream_id,
+            seq: self.seq,
+            epoch: self.epoch,
+            proof: &self.proof,
+            sth: &self.sth,
+            source_vk: &self.source_vk,
+            ack: &self.ack,
+            dest_vk: &self.dest_vk,
+        })
+    }
+}
+
 /// The full offline delivery proof for *"this cofre was delivered, exactly once, intact"* (AC-5).
 ///
 /// Given the delivered cofre's `carga` (so the verifier can re-derive the content-address `cofre_id`, BLK-8)

@@ -2,7 +2,7 @@
 
 use datarail_manifest::{
     leaf_hash, sign_ack, verify_receipt, DeliveryReceipt, DestAck, InclusionProof, ManifestError,
-    ManifestLog, SignedTreeHead,
+    ManifestLog, OwnedDeliveryReceipt, SignedTreeHead,
 };
 
 const SOURCE_SEED: [u8; 32] = [11; 32];
@@ -60,6 +60,25 @@ fn receipt<'a>(
 fn external_consumer_verifies_receipt_offline() {
     let (proof, sth, ack) = fixture();
     verify_receipt(&receipt(&proof, &sth, &ack)).expect("valid receipt");
+}
+
+#[test]
+fn external_consumer_verifies_owned_typed_receipt() {
+    let (proof, sth, ack) = fixture();
+    OwnedDeliveryReceipt {
+        carga: CARGA.to_vec(),
+        route_id: ROUTE,
+        stream_id: STREAM,
+        seq: SEQ,
+        epoch: EPOCH,
+        proof,
+        sth,
+        source_vk: SOURCE_VK,
+        ack,
+        dest_vk: DEST_VK,
+    }
+    .verify()
+    .expect("valid owned receipt");
 }
 
 #[test]
