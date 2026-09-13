@@ -307,7 +307,7 @@ pub fn root_from_path(leaf: &[u8; 32], path: &[ProofStep]) -> [u8; 32] {
 /// (separately signature-verified) STH.
 #[must_use]
 pub fn verify_inclusion(leaf: &[u8; 32], proof: &InclusionProof, expected_root: &[u8; 32]) -> bool {
-    root_from_path(leaf, &proof.path) == *expected_root
+    proof.index < proof.tree_size && root_from_path(leaf, &proof.path) == *expected_root
 }
 
 /// Verify a [`SignedTreeHead`] signature against the pinned source verifying key.
@@ -455,6 +455,13 @@ pub struct DeliveryProof<'a> {
     pub dest_vk: &'a [u8; 32],
 }
 
+/// Public name for an offline delivery receipt.
+///
+/// The alias keeps [`DeliveryProof`] available for existing callers while making the verifier-facing
+/// vocabulary explicit. A receipt contains typed in-memory evidence; serialization is intentionally outside this
+/// crate because no wire format is defined by SPEC 04.
+pub type DeliveryReceipt<'a> = DeliveryProof<'a>;
+
 /// The full offline delivery proof for *"this cofre was delivered, exactly once, intact"* (AC-5).
 ///
 /// Given the delivered cofre's `carga` (so the verifier can re-derive the content-address `cofre_id`, BLK-8)
@@ -470,7 +477,7 @@ pub struct DeliveryProof<'a> {
 /// Returns the corresponding [`ManifestError`] variant for whichever check fails first
 /// ([`ManifestError::CofreIdMismatch`], [`ManifestError::BadSth`], [`ManifestError::BadInclusion`], or an
 /// ack error from [`verify_ack`]).
-pub fn verify_delivery(p: &DeliveryProof<'_>) -> Result<(), ManifestError> {
+pub fn verify_receipt(p: &DeliveryReceipt<'_>) -> Result<(), ManifestError> {
     // (1) Content-address recomputation (BLK-8): the verifier trusts the bytes, not the claim.
     let cofre_id = blake3_256(p.carga);
     if cofre_id != p.ack.cofre_id {
@@ -480,6 +487,12 @@ pub fn verify_delivery(p: &DeliveryProof<'_>) -> Result<(), ManifestError> {
     // (2) STH signed by the source identity.
     if !verify_sth(p.sth, p.source_vk) {
         return Err(ManifestError::BadSth);
+    }
+    let Ok(proof_tree_size) = u64::try_from(p.proof.tree_size) else {
+        return Err(ManifestError::BadInclusion);
+    };
+    if proof_tree_size != p.sth.tree_size {
+        return Err(ManifestError::BadInclusion);
     }
     // (3) leaf ∈ tree, against the STH's root.
     if !verify_inclusion(&leaf, p.proof, &p.sth.root) {
@@ -495,6 +508,16 @@ pub fn verify_delivery(p: &DeliveryProof<'_>) -> Result<(), ManifestError> {
         p.epoch,
         &p.sth.root,
     )
+}
+
+/// Verify an offline delivery proof.
+///
+/// Kept as the original entry point; new external consumers should prefer [`verify_receipt`].
+///
+/// # Errors
+/// Returns the corresponding [`ManifestError`] from [`verify_receipt`].
+pub fn verify_delivery(p: &DeliveryProof<'_>) -> Result<(), ManifestError> {
+    verify_receipt(p)
 }
 
 /// E4 — BLAKE3 verified-streaming **chunk resume** (SPEC 07), built on this crate's Merkle tree.
