@@ -59,6 +59,14 @@ struct Group {
     member_seq: u64,
 }
 
+struct JoinMember<'a> {
+    member_id: &'a str,
+    session_timeout_ms: i32,
+    rebalance_timeout_ms: i32,
+    protocol_type: &'a str,
+    protocols: &'a [(String, Vec<u8>)],
+}
+
 impl Group {
     fn new() -> Self {
         Self {
@@ -169,6 +177,57 @@ impl GroupCoordinator {
         self.groups.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
+    fn register_member(
+        &self,
+        guard: &mut HashMap<String, Group>,
+        group: &str,
+        request: &JoinMember<'_>,
+        now: Instant,
+    ) -> String {
+        let g = guard.entry(group.to_owned()).or_insert_with(Group::new);
+        g.expire_stale(now);
+        let mid = if request.member_id.is_empty() {
+            g.member_seq += 1;
+            format!("datarail-{group}-{}", g.member_seq)
+        } else {
+            request.member_id.to_owned()
+        };
+        let session = Duration::from_millis(
+            u64::try_from(request.session_timeout_ms)
+                .unwrap_or(30_000)
+                .clamp(1, 3_600_000),
+        );
+        let rebalance = Duration::from_millis(
+            u64::try_from(request.rebalance_timeout_ms)
+                .unwrap_or(30_000)
+                .clamp(1, 3_600_000),
+        );
+        let (proto_names, subscription) = split_protocols(request.protocols);
+        g.members.insert(
+            mid.clone(),
+            Member {
+                subscription,
+                protocols: proto_names,
+                assignment: None,
+                last_heartbeat: now,
+                session_timeout: session,
+                rebalance_timeout: rebalance,
+            },
+        );
+        if !request.protocol_type.is_empty() {
+            request.protocol_type.clone_into(&mut g.protocol_type);
+        }
+        if !matches!(g.state, GroupState::PreparingRebalance) {
+            g.state = GroupState::PreparingRebalance;
+            g.generation = g.generation.checked_add(1).unwrap_or(1);
+            g.deadline = Some(now + self.rebalance_delay);
+            for member in g.members.values_mut() {
+                member.assignment = None;
+            }
+        }
+        mid
+    }
+
     /// `JoinGroup`: register (or refresh) a member and BLOCK until the join window closes, then return the
     /// finalized generation/leader/protocol (the leader also gets the member list). A brand-new member id is
     /// generated when `member_id` is empty.
@@ -184,55 +243,18 @@ impl GroupCoordinator {
         let mut guard = self.lock();
         let now = Instant::now();
         let delay = self.rebalance_delay;
-        let mid = {
-            let g = guard.entry(group.to_owned()).or_insert_with(Group::new);
-            g.expire_stale(now);
-            let mid = if member_id.is_empty() {
-                g.member_seq += 1;
-                format!("datarail-{group}-{}", g.member_seq)
-            } else {
-                member_id.to_owned()
-            };
-            let session = Duration::from_millis(
-                u64::try_from(session_timeout_ms)
-                    .unwrap_or(30_000)
-                    .clamp(1, 3_600_000),
-            );
-            let rebalance = Duration::from_millis(
-                u64::try_from(rebalance_timeout_ms)
-                    .unwrap_or(30_000)
-                    .clamp(1, 3_600_000),
-            );
-            let (proto_names, subscription) = split_protocols(protocols);
-            g.members.insert(
-                mid.clone(),
-                Member {
-                    subscription,
-                    protocols: proto_names,
-                    assignment: None,
-                    last_heartbeat: now,
-                    session_timeout: session,
-                    rebalance_timeout: rebalance,
-                },
-            );
-            if !protocol_type.is_empty() {
-                protocol_type.clone_into(&mut g.protocol_type);
-            }
-            // Start a new rebalance window unless one is already open (PreparingRebalance). A join during
-            // CompletingRebalance (a member arriving after the window closed but before the leader synced) or
-            // Stable must RESTART the rebalance — otherwise the late member joins a finalized generation and never
-            // gets an assignment. (Kafka semantics: any join outside an open window re-opens it.)
-            if !matches!(g.state, GroupState::PreparingRebalance) {
-                g.state = GroupState::PreparingRebalance;
-                g.generation = g.generation.checked_add(1).unwrap_or(1); // stay positive — never wrap to the -1 "unknown" sentinel (audit 4b LOW)
-                g.deadline = Some(now + delay);
-                // a new rebalance invalidates prior assignments
-                for m in g.members.values_mut() {
-                    m.assignment = None;
-                }
-            }
-            mid
-        };
+        let mid = self.register_member(
+            &mut guard,
+            group,
+            &JoinMember {
+                member_id,
+                session_timeout_ms,
+                rebalance_timeout_ms,
+                protocol_type,
+                protocols,
+            },
+            now,
+        );
         self.cond.notify_all();
 
         // Park until the join window closes (CompletingRebalance/Stable), or close it ourselves at the deadline.
