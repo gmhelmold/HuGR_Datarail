@@ -148,6 +148,62 @@ fn end_txn_req(correlation_id: i32, tid: &str, pid: i64, epoch: i16, committed: 
     Writer::frame(&w.into_bytes())
 }
 
+fn add_offsets_req(correlation_id: i32, tid: &str, pid: i64, epoch: i16, group: &str) -> Vec<u8> {
+    let mut w = req_header(25, 1, correlation_id);
+    w.string(tid);
+    w.int64(pid);
+    w.int16(epoch);
+    w.string(group);
+    Writer::frame(&w.into_bytes())
+}
+
+fn txn_offset_commit_req(
+    correlation_id: i32,
+    tid: &str,
+    group: &str,
+    pid: i64,
+    epoch: i16,
+) -> Vec<u8> {
+    let mut w = req_header(28, 1, correlation_id);
+    w.string(tid);
+    w.string(group);
+    w.int64(pid);
+    w.int16(epoch);
+    w.int32(1);
+    w.string("events");
+    w.int32(2);
+    for partition in 0..2 {
+        w.int32(partition);
+        w.int64(i64::from(partition + 7));
+        w.nullable_string(None);
+    }
+    Writer::frame(&w.into_bytes())
+}
+
+fn offset_fetch_req(correlation_id: i32, group: &str, partition: i32) -> Vec<u8> {
+    let mut w = req_header(9, 2, correlation_id);
+    w.string(group);
+    w.int32(1);
+    w.string("events");
+    w.int32(1);
+    w.int32(partition);
+    Writer::frame(&w.into_bytes())
+}
+
+fn fetched_offset(resp: &[u8]) -> i64 {
+    let mut r = Reader::new(resp);
+    let _corr = r.int32().unwrap();
+    assert_eq!(r.int32().unwrap(), 1);
+    let _topic = r.string().unwrap();
+    assert_eq!(r.int32().unwrap(), 1);
+    let _partition = r.int32().unwrap();
+    let offset = r.int64().unwrap();
+    let _metadata = r.nullable_string().unwrap();
+    assert_eq!(r.int16().unwrap(), 0, "partition error NONE");
+    assert_eq!(r.int16().unwrap(), 0, "top-level error NONE");
+    offset
+}
+
 fn fetch_req(correlation_id: i32, topic: &str, partition: i32, fetch_offset: i64) -> Vec<u8> {
     let mut w = req_header(1, 4, correlation_id);
     w.int32(-1);
@@ -291,7 +347,29 @@ fn drive_faulted_commit(stream: &mut TcpStream) {
         let _ = read_frame(stream);
     }
     stream
-        .write_all(&end_txn_req(5, "tx-1", pid, epoch, true))
+        .write_all(&add_offsets_req(5, "tx-1", pid, epoch, "fault-group"))
+        .unwrap();
+    let response_bytes = read_frame(stream);
+    let mut response = Reader::new(&response_bytes);
+    let _corr = response.int32().unwrap();
+    let _throttle = response.int32().unwrap();
+    assert_eq!(response.int16().unwrap(), 0, "AddOffsetsToTxn error NONE");
+    stream
+        .write_all(&txn_offset_commit_req(6, "tx-1", "fault-group", pid, epoch))
+        .unwrap();
+    let response_bytes = read_frame(stream);
+    let mut response = Reader::new(&response_bytes);
+    let _corr = response.int32().unwrap();
+    let _throttle = response.int32().unwrap();
+    assert_eq!(response.int32().unwrap(), 1);
+    let _topic = response.string().unwrap();
+    assert_eq!(response.int32().unwrap(), 2);
+    for _ in 0..2 {
+        let _partition = response.int32().unwrap();
+        assert_eq!(response.int16().unwrap(), 0, "TxnOffsetCommit error NONE");
+    }
+    stream
+        .write_all(&end_txn_req(7, "tx-1", pid, epoch, true))
         .unwrap();
     let mut byte = [0u8; 1];
     let _ = stream.read(&mut byte);
@@ -318,6 +396,15 @@ fn process_crash_at_each_transaction_boundary_recovers_all_or_none() {
                 assert_eq!(values, vec![format!("evt:fault-{partition}").into_bytes()]);
             } else {
                 assert!(values.is_empty(), "fault point {point} left committed data");
+            }
+            stream
+                .write_all(&offset_fetch_req(20 + partition, "fault-group", partition))
+                .unwrap();
+            let offset = fetched_offset(&read_frame(&mut stream));
+            if point == 5 {
+                assert_eq!(offset, i64::from(partition + 7));
+            } else {
+                assert_eq!(offset, -1, "fault point {point} left committed offset");
             }
         }
         let _ = std::fs::remove_file(&rail);
