@@ -243,15 +243,12 @@ PHASE 6: Rollback & Docs
 
 ---
 
-## 📌 REMAINING ISSUE — Must Fix Before Full Claim (Not a Hack, Real Root Cause)
+## 📌 CLOSED ISSUE — ReplayLog Seek After Corruption
 
-### ReplayLog Bug: `replay_from` Seek Incorrect After Corrupt Frame
-- **Evidence:** `DEBUG replay_from: start_offset=363, segment_start=0` shows correct seek calculation, but `read_sealed_from(2, ...)` returns 2 records (offset 0 + offset 2) instead of 1 (offset 2 only)
-- **Root cause:** `ReplayLog::replay_from(start_offset)` with non-zero `start_offset` does not correctly seek past corrupt frames; `Replay::open_segment` seeks to `at_offset - seg` but the replay cursor or buffer management reads from the wrong position
-- **Status:** Active mitigation in `SealedPartitionLog::read_sealed_from`; `fetch_halts_loud` runs against direct segment reads
-- **Required fix:** Redesign `ReplayLog::replay_from` to correctly handle seek past corrupt frames, OR redesign `SealedPartitionLog::read_sealed_from` to use a different replay mechanism
-- **Not a gambiarra:** This is a real storage-layer bug, not a work-around
+- `ReplayLog::replay_from` now resets framing when crossing segment boundaries.
+- Regression covers prior-segment corruption plus exact seek into later intact data.
+- `SealedPartitionLog::read_sealed_from` uses replay cursor again; no direct-read workaround remains.
 
 ---
 
-**Next Action:** Execute canonical backlog in `docs/roadmap/ISSUES.md`; first durable txn protocol, then power-loss harness.
+**Next Action:** Execute canonical backlog in `docs/roadmap/ISSUES.md`; next power-loss harness, then process-level txn proof.

@@ -75,8 +75,8 @@ This repo's whole credibility rests on claims matching reality. Before writing a
 
 1. **WP1 evidence/release decision** — implementation and local stress are done; independent A/B, p99/RSS, CI-scale
    evidence, and `v0.1.1` release gates remain.
-2. **ReplayLog + power-loss durability** — core seek fix and persistent idempotent dedup landed; remove direct-read
-   workaround and add fsync/rename fault injection beyond `kill9_crash.rs`.
+2. **ReplayLog + power-loss durability** — core seek fix and persistent idempotent dedup landed; add fsync/rename
+   fault injection beyond `kill9_crash.rs`.
 3. **Durable transaction protocol** — journal/recovery/offset atomicity foundation landed; process-level kill-during-
    commit and ambiguous-write proof remain open.
 4. **Real Kafka clients + key refs** — compatibility harness and env/file refs landed; run Java, franz-go, kafka-python,

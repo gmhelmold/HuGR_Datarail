@@ -4,6 +4,9 @@
 **Baseline:** `3cc5bb9` (v0.1.0)
 **Date:** 2026-09-10
 
+**Superseded:** canonical status is `docs/roadmap/ISSUES.md`; follow-up commits `183e9e0` and `78acd59` landed after
+this snapshot.
+
 ---
 
 ## FASE 0: COMPLETE ✅
@@ -15,13 +18,11 @@
 
 ---
 
-## BUG REAL: REPLAYLOG (`replay_from` seek) ❌
+## BUG REAL: REPLAYLOG (`replay_from` seek) CLOSED
 
-- `replay_from(start_offset=363)`: nao busca corretamente apos frame corrupto no log
-- `read_sealed_from(2, ...)` retorna 2 registros (0 + 2) ao inves de 1 (2)
-- Fix real requer redesign `ReplayLog::replay_from` / `Replay::open_segment`
-- `#[ignore]` em `fetch_halts_loud` + documentacao completa no codigo (`main.rs`) + CHANGELOG
-- `replaylog/src/lib.rs`: revertido para original (sem experimentos)
+- `ReplayLog::refill` now clears stale partial-frame bytes before opening the next segment.
+- Regression covers prior corruption plus exact seek into later intact data.
+- `SealedPartitionLog::read_sealed_from` uses corrected `ReplayLog::replay_from`; no direct-read workaround remains.
 
 ---
 
@@ -36,12 +37,12 @@
 | `kafka_multipartition_wire` | ✅ PASS | 3 particoes |
 | `kafka_replay_wire` | ✅ PASS | Replay + grow |
 | `two_process` | ✅ PASS | TCP + Noise_KK |
-| `fetch_halts_loud` | ❌ IGNORED | Replaylog bug (documentado, nao gambiarra) |
+| `fetch_halts_loud` | ✅ PASS | Corruption remains loud; offsets do not renumber |
 | `fasp_s2` | ❌ IGNORED | FASP timeout flakiness CI |
 
 ---
 
-## NEXT PHASE
+## NEXT PHASE (HISTORICAL)
 
 **Fase 1 (CT-1..CT-12): `PartitionLockMap` + `PartitionState` + per-partition `RwLock` para `produce`, `fetch`, `txn_buffers`**
 - Blocked by replaylog bug fix (storage-layer real fix required)
@@ -50,6 +51,6 @@
 
 ---
 
-**DECISAO PENDENTE:**
+**DECISAO SUPERSEDED:**
 A: Continuar Fase 1 (scaffold `PartitionLockMap` — replaylog bug nao bloqueia locking)
 B: Fixar replaylog primeiro (redesign `replay_from` seek — storage-layer fix)

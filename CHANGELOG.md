@@ -23,7 +23,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed — ReplayLog Corruption Handling
 - **`ReplayLog::replay_from` now resets framing when advancing across segments** — later intact segments remain seekable after prior corruption
-- `read_sealed_from` retains direct segment reads as a defensive path with manual seek + CRC-32C validation
+- `SealedPartitionLog::read_sealed_from` now uses corrected `ReplayLog::replay_from` seek semantics
 - Corrupt frames (oversize length or CRC mismatch) halt replay cleanly, matching `ReplayLog` semantics
 - `fetch_halts_loud_at_a_corrupt_record_and_never_renumbers` test un-ignored and passing
 

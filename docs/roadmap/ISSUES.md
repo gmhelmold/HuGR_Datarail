@@ -33,13 +33,12 @@ survives the injected cut.
 ### STOR-01 - Fix `ReplayLog::replay_from` seek after corruption
 **Legacy:** WP-01 checklist remaining issue
 
-**Status:** core seek fix landed and regression-tested. `SealedPartitionLog::read_sealed_from` still uses direct segment
-reads as a defensive path; removing that workaround and revalidating all storage semantics remain open.
+**Status:** closed. Core seek fix landed, direct-read workaround removed, and storage/fetch regressions pass.
 
-**Do:** remove direct-read workaround after proving equivalent corruption-safe fetch behavior.
+**Do:** none; retain corruption regression coverage.
 
 **Acceptance:** arbitrary valid record offsets after corrupt frames return exact suffixes; no renumbering; existing
-corruption tests remain green; direct-read workaround can be removed.
+corruption tests remain green.
 
 ## P1 - product correctness and compatibility
 
@@ -165,7 +164,7 @@ an unresolved product decision.
 
 ## Dependency order
 
-1. `WP1-01` evidence/release decision and `STOR-01` storage semantics.
+1. `WP1-01` evidence/release decision and `DUR-01` power-loss semantics.
 2. `DUR-01` power-loss harness.
 3. `TXN-01` durable transaction protocol and crash test.
 4. `DEDUP-01` restart deduplication.

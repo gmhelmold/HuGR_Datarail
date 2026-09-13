@@ -15,8 +15,8 @@
 |---------|---------|--------|
 | `datarail-terminal/src/lib.rs` | `reserve_seqs(partition_id, n)` + `HashMap<u64,u64>` | ✅ Feito |
 | `datarail-cli/src/main.rs` | Call site passa `partition_id = u64::try_from(partition)`; `KafkaBrokerStore` refatorado para `RwLock` per-partition (scaffold) | ✅ Feito |
-| `datarail-replaylog/src/lib.rs` | `fsync_dir` no `sync()` + 10ms sleep | ✅ Feito (não resolve seek bug) |
-| `datarail-cli/src/kafka_store.rs` | Leitura direta de segmento + CRC, contornando seek defeituoso | ✅ Teste ativo |
+| `datarail-replaylog/src/lib.rs` | `fsync_dir` no `sync()` + correção de framing ao trocar segmento | ✅ Feito |
+| `datarail-cli/src/kafka_store.rs` | `read_sealed_from` usa `ReplayLog::replay_from` corrigido | ✅ Feito |
 
 ---
 
@@ -38,8 +38,8 @@ Evidência (`DEBUG` prints no replaylog):
 - `open_segment: seek_to=363` → seek calculado corretamente
 - Mas `read_sealed_from` retorna registros de `starts=[0, 344, 363]` no offset 2 (deveria só 1 registro — o 3º)
 
-Mitigação atual: `SealedPartitionLog::read_sealed_from` busca diretamente no segmento e valida CRC. O redesign de
-`ReplayLog::replay_from` continua separado; não alegamos que o crate foi corrigido.
+Correção: `ReplayLog::refill` limpa bytes de frame parcial antes de abrir o segmento seguinte. Regressão cobre seek
+exato em dados íntegros depois de corrupção anterior.
 
 ---
 
@@ -49,10 +49,11 @@ Mitigação atual: `SealedPartitionLog::read_sealed_from` busca diretamente no s
 partição e fencing de epoch corrigidos; buffer não-lançado é restaurado após falha de commit. Stress de 10k ops passa.
 Atomicidade crash cross-partition ainda pendente.
 
-**Próximos:** seguir backlog canônico em `docs/roadmap/ISSUES.md`; primeiro `TXN-01`, `DUR-01` e `STOR-01`.
+**Próximos:** seguir backlog canônico em `docs/roadmap/ISSUES.md`; primeiro `DUR-01`, depois prova process-level de
+`TXN-01`.
 
-**Dependências bloqueantes:** protocolo txn durável, power-loss/seek evidence e WP1 release evidence. A leitura direta
-mitiga o caso de corrupção testado, mas não corrige API interna de `ReplayLog`.
+**Dependências bloqueantes:** protocolo txn process-level, power-loss evidence e WP1 release evidence. `STOR-01` core
+está fechado; `DUR-01` ainda exige fsync/rename fault harness.
 
 ---
 

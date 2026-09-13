@@ -27,10 +27,10 @@
 //! an integrity checkpoint that fails loud instead of renumbering) is tracked future work, not claimed here.
 
 use std::fs::OpenOptions;
-use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::io::{self, Read, Write};
 use std::path::Path;
 
-use datarail_replaylog::{ReplayLog, MAX_RECORD};
+use datarail_replaylog::ReplayLog;
 
 /// IEEE CRC-32 (table-free) over a record's `len ‖ bytes`, matching `datarail_replaylog::crc32`.
 fn crc32(parts: &[&[u8]]) -> u32 {
@@ -466,68 +466,12 @@ impl SealedPartitionLog {
         let Some(&start) = self.starts.get(offset) else {
             return Ok(Vec::new());
         };
-        // FIX REAL: read directly from the correct segment file at byte offset `start` (bypass Replay replay mechanism
-        // which has a seek/replay bug when corrupt frames exist in previous segments — see replaylog crate doc).
-        // Find segment containing byte offset `start` by scanning segment file names from data_dir.
-        let dir = self.log.dir();
-        let mut seg_starts: Vec<u64> = Vec::new();
-        for entry in std::fs::read_dir(dir).map_err(io::Error::other)? {
-            let path = entry.map_err(io::Error::other)?.path();
-            if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                if let Some(s) = name
-                    .strip_suffix(".seg")
-                    .and_then(|s| s.parse::<u64>().ok())
-                {
-                    seg_starts.push(s);
-                }
-            }
-        }
-        seg_starts.sort_unstable();
-        let seg_start = seg_starts
-            .iter()
-            .rfind(|&&s| s <= start)
-            .copied()
-            .unwrap_or(0);
-        let seek_in_file = start.saturating_sub(seg_start);
-        let seg_path = dir.join(format!("{seg_start:020}.seg"));
-        let mut file = std::fs::File::open(&seg_path)
-            .map_err(|e| io::Error::other(format!("segment file open error: {e}")))?;
-        file.seek(SeekFrom::Start(seek_in_file))
-            .map_err(|e| io::Error::other(format!("segment seek error: {e}")))?;
+        let mut replay = self.log.replay_from(start).map_err(io::Error::other)?;
         let mut out = Vec::new();
         let mut bytes_read = 0i64;
-        loop {
-            let mut len_buf = [0u8; 4];
-            match file.read_exact(&mut len_buf) {
-                Ok(()) => {}
-                Err(_) => break, // torn tail / end of segment
-            }
-            let len = u32::from_le_bytes(len_buf) as usize;
-            if len > MAX_RECORD {
-                break; // corrupt length — stop replay (like replaylog resync_or_stop in final segment)
-            }
-            let frame_size = 4 + len + 4;
-            let mut frame_bytes = vec![0u8; frame_size];
-            frame_bytes[..4].copy_from_slice(&len_buf);
-            match file.read_exact(&mut frame_bytes[4..]) {
-                Ok(()) => {}
-                Err(_) => break, // truncated frame
-            }
-            // Validate CRC32 (like replaylog does) — stop at first corrupt frame in final segment.
-            let payload = &frame_bytes[4..4 + len];
-            let stored_crc = u32::from_le_bytes([
-                frame_bytes[4 + len],
-                frame_bytes[4 + len + 1],
-                frame_bytes[4 + len + 2],
-                frame_bytes[4 + len + 3],
-            ]);
-            let computed_crc = crc32(&[&len_buf, payload]);
-            if stored_crc != computed_crc {
-                break; // CRC mismatch — stop replay (like replaylog resync_or_stop in final segment)
-            }
-            let body = payload.to_vec();
+        while let Some((_byte_offset, body)) = replay.read_next().map_err(io::Error::other)? {
+            bytes_read += i64::try_from(body.len()).unwrap_or(i64::MAX);
             out.push(body);
-            bytes_read += i64::try_from(len).unwrap_or(i64::MAX);
             if bytes_read >= max_bytes {
                 break;
             }
