@@ -51,7 +51,7 @@ fn dest() -> DestTerminal {
 fn vertical_slice_over_quic_hop_delivers() {
     let mut src = source();
     let mut dst = dest();
-    let mut rail = QuicSubstrate::loopback_pair().expect("quic loopback");
+    let mut rail = QuicSubstrate::dev_loopback_pair().expect("quic loopback");
 
     let recs: [&[u8]; 2] = [b"evt:over-quic", b"evt:cross-host"];
     let cofre = src.board(&recs, b"quic-1").expect("board");
