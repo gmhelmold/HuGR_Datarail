@@ -388,7 +388,7 @@ fn drive_faulted_commit(stream: &mut TcpStream) {
 #[test]
 fn process_crash_at_each_transaction_boundary_recovers_all_or_none() {
     let _lock = BROKER_TEST_LOCK.lock().unwrap();
-    for point in 1..=5 {
+    for point in 0..=6 {
         let (rail, data_dir) = write_fault_rail(&point.to_string());
         let port = free_port();
         let (mut daemon, mut stream) =

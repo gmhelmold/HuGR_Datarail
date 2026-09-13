@@ -1,6 +1,6 @@
 # WP-01 Per-Partition Locking — ADVERSARIAL FIX CHECKLIST
 
-**Status:** IMPLEMENTATION COMPLETE — release evidence and crash-atomic txn remain open
+**Status:** IMPLEMENTATION COMPLETE — release evidence remains open; single-node crash-atomic txn is backed
 **Baseline:** `v0.1.0` (SHA: `3cc5bb9`)  
 **Owner:** TechLead  
 **Review Date:** 2026-09-12
@@ -235,7 +235,7 @@ PHASE 6: Rollback & Docs
 | Phase 0 complete | ✅ | MT-1 done; MT-2/MT-4 not needed (false positives) |
 | Phase 1 complete | ✅ | Implementation complete; full WP gate remains open |
 | Phase 2 complete | ✅ | Paths compile and wire tests pass |
-| Phase 3 complete | ⚠️ | Locking/stress pass; durable txn atomicity open |
+| Phase 3 complete | ✅ | Locking/stress pass; durable single-node txn matrix pass |
 | Phase 4 complete | ✅ | Seal audit and round-trip test pass |
 | Phase 5 complete | ⚠️ | Correctness/stress/local A/B pass; independent/p99/RSS evidence open |
 | Phase 6 complete | ⬜ | |

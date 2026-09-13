@@ -87,16 +87,17 @@ Fault injection must stop the process after each of these points and restart on 
 - after the staged-offset batch write and fsync;
 - before and after `Commit` append and fsync;
 - after a complete `Commit` frame write with fsync returning an error;
-- after recovery truncation and offset restore.
+- journal-prefix truncation and recovery are covered for every byte cut by the journal unit matrix.
 
 Expected result: all records plus all offsets, or no records plus old offsets. Retry of the same transaction is
 idempotent. A successful wire test without this matrix is not a crash-atomicity proof.
 
 The unit test injects panics at these boundaries and reopens the data directory after unwinding. The real-binary
-`kafka_txn_wire` harness aborts and restarts at each post-fsync boundary (points 1 through 5), then writes partial
-`Commit` prefixes at several cuts plus a complete frame before aborting before fsync. It also forces a complete frame's
-fsync to return `EIO`; the broker fail-stops and recovery proves records and staged offsets are all-or-none for absent,
-partial, complete-unfsynced, and explicit-sync-error outcomes.
+`kafka_txn_wire` harness aborts and restarts at points 0 through 6, then writes partial `Commit` prefixes at several
+cuts plus a complete frame before aborting before fsync. It also forces a complete frame's fsync to return `EIO`; the
+broker fail-stops and recovery proves records and staged offsets are all-or-none for absent, partial, complete-unfsynced,
+and explicit-sync-error outcomes. Journal unit tests cover every truncation point and reject a complete CRC-corrupt
+`Commit` tail.
 
 ## Explicit Non-Goals
 

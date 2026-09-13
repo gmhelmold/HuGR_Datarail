@@ -62,7 +62,7 @@ fechados; `DUR-01` ainda exige fsync/rename reorder + directory-entry-loss harne
 |-------|--------|
 | A1 — Single Writer Per Partition | ✅ Lock por partição; sequência reservada por partição |
 | A2 — Seq Uniqueness | ✅ Contiguous/non-overlapping per-partition ranges tested; namespaces intentionally independent |
-| A3 — Txn Atomicity | ⚠️ Retry + epoch + buffer restore testados; commit cross-partition não é crash-atômico |
+| A3 — Txn Atomicity | ✅ Single-node cross-partition commit + offsets cobertos por fault matrix e recovery determinístico |
 | A4 — Offsets Isolation | ✅ F4 fix applied (separate `OffsetsStore` lock) |
 | A5 — Zero Behavioral Regression | ✅ Testes + mutation probe + stress de 10k ops verdes |
 | A6 — Positive Scaling Measured | ⚠️ Local default samples 1.154x–1.684x; independent/CI/RSS evidence pending |

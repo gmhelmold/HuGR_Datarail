@@ -82,7 +82,8 @@ use datarail_spec::{RailSpec, SpecError};
 use datarail_terminal::{DestTerminal, SourceTerminal, TerminalError};
 
 thread_local! {
-    static TXN_FAULT_POINT: Cell<u8> = const { Cell::new(0) };
+    // u8::MAX is the disarmed sentinel so fault point 0 remains injectable.
+    static TXN_FAULT_POINT: Cell<u8> = const { Cell::new(u8::MAX) };
 }
 
 fn txn_fault(point: u8) {
@@ -1660,6 +1661,7 @@ impl PartitionBrokerStore {
             } else {
                 Vec::new()
             };
+            txn_fault(0); // before Prepare append
             let prepared = self.txn_journal.lock().unwrap().prepare(
                 transactional_id,
                 producer_id,
@@ -1711,6 +1713,7 @@ impl PartitionBrokerStore {
                 return rollback_transaction(self, guards, &prepared, error);
             }
             txn_fault(4); // after offsets fsync
+            txn_fault(6); // before Commit append
             if let Err(error) = self.txn_journal.lock().unwrap().commit(&prepared, &post) {
                 // Commit fsync failure is ambiguous: the complete frame may already be durable. Rolling back here
                 // could append Abort after a valid Commit and make startup reject the journal. Fail-stop instead;
@@ -3161,7 +3164,7 @@ mod tests {
         use std::panic::{catch_unwind, AssertUnwindSafe};
 
         let spec = RailSpec::parse(&sample()).unwrap();
-        for point in 1..=5 {
+        for point in 0..=6 {
             let data_dir = std::env::temp_dir()
                 .join(format!("datarail-txn-fault-{point}-{}", std::process::id()));
             let _ = std::fs::remove_dir_all(&data_dir);
