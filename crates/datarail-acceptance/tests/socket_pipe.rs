@@ -49,7 +49,10 @@ fn board_over_unix_socket_then_offload_delivers() {
             break c;
         }
     };
-    assert_eq!(received, cofre, "the cofre survived the kernel transport byte-for-byte");
+    assert_eq!(
+        received, cofre,
+        "the cofre survived the kernel transport byte-for-byte"
+    );
 
     // Offload behaves exactly as over the in-memory rail: verify → open → admit → commit, exactly once.
     assert_eq!(

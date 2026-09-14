@@ -58,7 +58,10 @@ impl<B: BlobStore> ErasureStore<B> {
         padded[..data.len()].copy_from_slice(data);
         let shards: Vec<&[u8]> = padded.chunks(shard_len).collect();
 
-        let parity = self.rs.encode(&shards).map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
+        let parity = self
+            .rs
+            .encode(&shards)
+            .map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
 
         for (i, shard) in shards.iter().enumerate() {
             self.blob.put(&Self::shard_key(id, i), shard)?;
@@ -101,7 +104,10 @@ impl<B: BlobStore> ErasureStore<B> {
         }
 
         let refs: Vec<(usize, &[u8])> = survivors.iter().map(|(i, b)| (*i, b.as_slice())).collect();
-        let data_shards = self.rs.reconstruct(&refs).map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
+        let data_shards = self
+            .rs
+            .reconstruct(&refs)
+            .map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
 
         let mut out = Vec::with_capacity(data_shards.iter().map(Vec::len).sum());
         for shard in &data_shards {
@@ -125,7 +131,13 @@ mod tests {
     }
 
     /// Visit every `depth`-element subset of `0..total`.
-    fn for_each_subset(start: usize, depth: usize, pick: &mut Vec<usize>, total: usize, hit: &mut dyn FnMut(&[usize])) {
+    fn for_each_subset(
+        start: usize,
+        depth: usize,
+        pick: &mut Vec<usize>,
+        total: usize,
+        hit: &mut dyn FnMut(&[usize]),
+    ) {
         if depth == pick.len() {
             hit(pick);
             return;
@@ -161,9 +173,16 @@ mod tests {
             let mut s = store();
             s.put("rec", &data).expect("put");
             for &i in lost {
-                assert!(s.blob.delete(&ErasureStore::<MemBlob>::shard_key("rec", i)).expect("delete"));
+                assert!(s
+                    .blob
+                    .delete(&ErasureStore::<MemBlob>::shard_key("rec", i))
+                    .expect("delete"));
             }
-            assert_eq!(s.get("rec").expect("get"), Some(data.clone()), "losing {lost:?}");
+            assert_eq!(
+                s.get("rec").expect("get"),
+                Some(data.clone()),
+                "losing {lost:?}"
+            );
             patterns += 1;
         });
         assert_eq!(patterns, 15, "C(6,2) loss patterns");
@@ -178,7 +197,9 @@ mod tests {
             let mut s = store();
             s.put("rec", &data).expect("put");
             for &i in lost {
-                s.blob.delete(&ErasureStore::<MemBlob>::shard_key("rec", i)).expect("delete");
+                s.blob
+                    .delete(&ErasureStore::<MemBlob>::shard_key("rec", i))
+                    .expect("delete");
             }
             // Fewer than k survive: must be None, never silently-wrong bytes.
             assert_eq!(s.get("rec").expect("get"), None, "losing {lost:?}");
@@ -189,12 +210,18 @@ mod tests {
     fn length_not_divisible_by_k_roundtrips() {
         // 4 data shards; lengths spanning every residue mod k, padded correctly.
         for len in 0..=37usize {
-            let data: Vec<u8> = (0..len).map(|i| u8::try_from(i % 251).expect("fits")).collect();
+            let data: Vec<u8> = (0..len)
+                .map(|i| u8::try_from(i % 251).expect("fits"))
+                .collect();
             let mut s = store();
             s.put("rec", &data).expect("put");
             // Drop 2 shards too, to prove padding survives reconstruction.
-            s.blob.delete(&ErasureStore::<MemBlob>::shard_key("rec", 1)).expect("delete");
-            s.blob.delete(&ErasureStore::<MemBlob>::shard_key("rec", K + 1)).expect("delete");
+            s.blob
+                .delete(&ErasureStore::<MemBlob>::shard_key("rec", 1))
+                .expect("delete");
+            s.blob
+                .delete(&ErasureStore::<MemBlob>::shard_key("rec", K + 1))
+                .expect("delete");
             assert_eq!(s.get("rec").expect("get"), Some(data), "len {len}");
         }
     }
@@ -207,9 +234,13 @@ mod tests {
 
         let mut s2 = store();
         s2.put("short", b"hi").expect("put"); // shorter than k bytes
-        // survive a double loss on the short record too
-        s2.blob.delete(&ErasureStore::<MemBlob>::shard_key("short", 0)).expect("delete");
-        s2.blob.delete(&ErasureStore::<MemBlob>::shard_key("short", 3)).expect("delete");
+                                              // survive a double loss on the short record too
+        s2.blob
+            .delete(&ErasureStore::<MemBlob>::shard_key("short", 0))
+            .expect("delete");
+        s2.blob
+            .delete(&ErasureStore::<MemBlob>::shard_key("short", 3))
+            .expect("delete");
         assert_eq!(s2.get("short").expect("get"), Some(b"hi".to_vec()));
     }
 
