@@ -493,6 +493,9 @@ pub fn verify_receipt(p: &DeliveryReceipt<'_>) -> Result<(), ManifestError> {
 }
 
 /// Verify an offline delivery proof using its original API name.
+///
+/// # Errors
+/// Returns the corresponding [`ManifestError`] from [`verify_receipt`].
 pub fn verify_delivery(p: &DeliveryProof<'_>) -> Result<(), ManifestError> {
     verify_receipt(p)
 }
