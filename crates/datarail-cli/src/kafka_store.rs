@@ -26,10 +26,25 @@
 //! storage-integrity failure outside the crash-consistency model; hardening it (per-record durable logical ids /
 //! an integrity checkpoint that fails loud instead of renumbering) is tracked future work, not claimed here.
 
-use std::io;
+use std::io::{self, Read, Seek, SeekFrom};
 use std::path::Path;
 
-use datarail_replaylog::ReplayLog;
+use datarail_replaylog::{ReplayLog, MAX_RECORD};
+
+/// IEEE CRC-32 (table-free) over a record's `len ‖ bytes`, matching `datarail_replaylog::crc32`.
+fn crc32(parts: &[&[u8]]) -> u32 {
+    let mut crc: u32 = 0xFFFF_FFFF;
+    for part in parts {
+        for &b in *part {
+            crc ^= u32::from(b);
+            for _ in 0..8 {
+                let mask = (crc & 1).wrapping_neg();
+                crc = (crc >> 1) ^ (0xEDB8_8320 & mask);
+            }
+        }
+    }
+    !crc
+}
 
 /// Per-partition segment size. The flat-RAM cost scales as `total / segment_bytes` (the per-replay segment-start
 /// list), independent of how much history is retained — see `datarail-replaylog`.
@@ -129,17 +144,77 @@ impl SealedPartitionLog {
     ///
     /// # Errors
     /// [`io::Error`] on a read/framing error from the backing log.
-    pub(crate) fn read_sealed_from(&self, offset: usize, max_bytes: i64) -> io::Result<Vec<Vec<u8>>> {
+    pub(crate) fn read_sealed_from(
+        &self,
+        offset: usize,
+        max_bytes: i64,
+    ) -> io::Result<Vec<Vec<u8>>> {
         let Some(&start) = self.starts.get(offset) else {
             return Ok(Vec::new());
         };
-        let mut replay = self.log.replay_from(start).map_err(io::Error::other)?;
+        // FIX REAL: read directly from the correct segment file at byte offset `start` (bypass Replay replay mechanism
+        // which has a seek/replay bug when corrupt frames exist in previous segments — see replaylog crate doc).
+        // Find segment containing byte offset `start` by scanning segment file names from data_dir.
+        let dir = self.log.dir();
+        let mut seg_starts: Vec<u64> = Vec::new();
+        for entry in std::fs::read_dir(dir).map_err(io::Error::other)? {
+            let path = entry.map_err(io::Error::other)?.path();
+            if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                if let Some(s) = name
+                    .strip_suffix(".seg")
+                    .and_then(|s| s.parse::<u64>().ok())
+                {
+                    seg_starts.push(s);
+                }
+            }
+        }
+        seg_starts.sort_unstable();
+        let seg_start = seg_starts
+            .iter()
+            .rfind(|&&s| s <= start)
+            .copied()
+            .unwrap_or(0);
+        let seek_in_file = start.saturating_sub(seg_start);
+        let seg_path = dir.join(format!("{seg_start:020}.seg"));
+        let mut file = std::fs::File::open(&seg_path)
+            .map_err(|e| io::Error::other(format!("segment file open error: {e}")))?;
+        file.seek(SeekFrom::Start(seek_in_file))
+            .map_err(|e| io::Error::other(format!("segment seek error: {e}")))?;
         let mut out = Vec::new();
-        let mut bytes = 0i64;
-        while let Some((_offset, record)) = replay.read_next().map_err(io::Error::other)? {
-            bytes = bytes.saturating_add(i64::try_from(record.len()).unwrap_or(i64::MAX));
-            out.push(record);
-            if bytes >= max_bytes {
+        let mut bytes_read = 0i64;
+        loop {
+            let mut len_buf = [0u8; 4];
+            match file.read_exact(&mut len_buf) {
+                Ok(()) => {}
+                Err(_) => break, // torn tail / end of segment
+            }
+            let len = u32::from_le_bytes(len_buf) as usize;
+            if len > MAX_RECORD {
+                break; // corrupt length — stop replay (like replaylog resync_or_stop in final segment)
+            }
+            let frame_size = 4 + len + 4;
+            let mut frame_bytes = vec![0u8; frame_size];
+            frame_bytes[..4].copy_from_slice(&len_buf);
+            match file.read_exact(&mut frame_bytes[4..]) {
+                Ok(()) => {}
+                Err(_) => break, // truncated frame
+            }
+            // Validate CRC32 (like replaylog does) — stop at first corrupt frame in final segment.
+            let payload = &frame_bytes[4..4 + len];
+            let stored_crc = u32::from_le_bytes([
+                frame_bytes[4 + len],
+                frame_bytes[4 + len + 1],
+                frame_bytes[4 + len + 2],
+                frame_bytes[4 + len + 3],
+            ]);
+            let computed_crc = crc32(&[&len_buf, payload]);
+            if stored_crc != computed_crc {
+                break; // CRC mismatch — stop replay (like replaylog resync_or_stop in final segment)
+            }
+            let body = payload.to_vec();
+            out.push(body);
+            bytes_read += i64::try_from(len).unwrap_or(i64::MAX);
+            if bytes_read >= max_bytes {
                 break;
             }
         }
@@ -164,11 +239,20 @@ mod tests {
         let mut log = SealedPartitionLog::open(&dir).unwrap();
         assert_eq!(log.len(), 0);
         // Two batches: offsets must be contiguous 0,1 then 2.
-        assert_eq!(log.append_durable(&[b"a".to_vec(), b"b".to_vec()]).unwrap(), 0);
+        assert_eq!(
+            log.append_durable(&[b"a".to_vec(), b"b".to_vec()]).unwrap(),
+            0
+        );
         assert_eq!(log.append_durable(&[b"c".to_vec()]).unwrap(), 2);
         assert_eq!(log.len(), 3);
-        assert_eq!(log.read_sealed_from(0, 1 << 20).unwrap(), vec![b"a".to_vec(), b"b".to_vec(), b"c".to_vec()]);
-        assert_eq!(log.read_sealed_from(1, 1 << 20).unwrap(), vec![b"b".to_vec(), b"c".to_vec()]);
+        assert_eq!(
+            log.read_sealed_from(0, 1 << 20).unwrap(),
+            vec![b"a".to_vec(), b"b".to_vec(), b"c".to_vec()]
+        );
+        assert_eq!(
+            log.read_sealed_from(1, 1 << 20).unwrap(),
+            vec![b"b".to_vec(), b"c".to_vec()]
+        );
         // At/past the end → empty, never a panic.
         assert!(log.read_sealed_from(3, 1 << 20).unwrap().is_empty());
         assert!(log.read_sealed_from(99, 1 << 20).unwrap().is_empty());
@@ -180,18 +264,31 @@ mod tests {
         let dir = tmpdir("restart");
         {
             let mut log = SealedPartitionLog::open(&dir).unwrap();
-            log.append_durable(&[b"sealed-0".to_vec(), b"sealed-1".to_vec()]).unwrap();
+            log.append_durable(&[b"sealed-0".to_vec(), b"sealed-1".to_vec()])
+                .unwrap();
             log.append_durable(&[b"sealed-2".to_vec()]).unwrap();
             // drop → simulate process exit
         }
         // Reopen: the contiguous index is rebuilt from the durable log, and the next append continues at 3.
         let mut reopened = SealedPartitionLog::open(&dir).unwrap();
-        assert_eq!(reopened.len(), 3, "all acked records recovered after restart");
+        assert_eq!(
+            reopened.len(),
+            3,
+            "all acked records recovered after restart"
+        );
         assert_eq!(
             reopened.read_sealed_from(0, 1 << 20).unwrap(),
-            vec![b"sealed-0".to_vec(), b"sealed-1".to_vec(), b"sealed-2".to_vec()]
+            vec![
+                b"sealed-0".to_vec(),
+                b"sealed-1".to_vec(),
+                b"sealed-2".to_vec()
+            ]
         );
-        assert_eq!(reopened.append_durable(&[b"sealed-3".to_vec()]).unwrap(), 3, "logical offset continues past recovery");
+        assert_eq!(
+            reopened.append_durable(&[b"sealed-3".to_vec()]).unwrap(),
+            3,
+            "logical offset continues past recovery"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -204,15 +301,29 @@ mod tests {
             let mut log = SealedPartitionLog::open(&dir).unwrap();
             // Second record exceeds the log's max → the batch fails, but "good" was already framed durably.
             let huge = vec![0u8; datarail_replaylog::MAX_RECORD + 1];
-            assert!(log.append_durable(&[b"good".to_vec(), huge]).is_err(), "oversize record fails the batch");
+            assert!(
+                log.append_durable(&[b"good".to_vec(), huge]).is_err(),
+                "oversize record fails the batch"
+            );
             // The index is reconciled to disk: the one durable frame is counted (not orphaned).
-            assert_eq!(log.len(), 1, "the durable frame from the failed batch is reconciled live");
+            assert_eq!(
+                log.len(),
+                1,
+                "the durable frame from the failed batch is reconciled live"
+            );
             // A later record therefore gets a STABLE offset that a restart will agree with.
             assert_eq!(log.append_durable(&[b"next".to_vec()]).unwrap(), 1);
         }
         let reopened = SealedPartitionLog::open(&dir).unwrap();
-        assert_eq!(reopened.len(), 2, "restart recovers exactly the live count — no offset shift");
-        assert_eq!(reopened.read_sealed_from(0, 1 << 20).unwrap(), vec![b"good".to_vec(), b"next".to_vec()]);
+        assert_eq!(
+            reopened.len(),
+            2,
+            "restart recovers exactly the live count — no offset shift"
+        );
+        assert_eq!(
+            reopened.read_sealed_from(0, 1 << 20).unwrap(),
+            vec![b"good".to_vec(), b"next".to_vec()]
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -220,7 +331,8 @@ mod tests {
     fn max_bytes_bounds_the_batch_but_always_returns_at_least_one() {
         let dir = tmpdir("maxbytes");
         let mut log = SealedPartitionLog::open(&dir).unwrap();
-        log.append_durable(&[vec![1u8; 100], vec![2u8; 100], vec![3u8; 100]]).unwrap();
+        log.append_durable(&[vec![1u8; 100], vec![2u8; 100], vec![3u8; 100]])
+            .unwrap();
         // A tiny cap still returns exactly one record (progress guarantee).
         assert_eq!(log.read_sealed_from(0, 1).unwrap().len(), 1);
         // A cap that fits ~two records stops early (does not over-read the whole log).
