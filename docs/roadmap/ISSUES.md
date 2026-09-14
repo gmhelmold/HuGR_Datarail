@@ -1,121 +1,176 @@
-# Roadmap — open work, as issues
+# Backlog Canonico
 
-Honest backlog. Each item is written so it can be pasted straight into a GitHub issue (title + labels +
-context + acceptance). Ordered roughly by leverage. "Done so far" at the bottom records what already shipped,
-so the trajectory is legible to anyone reading cold.
+Fonte unica para trabalho aberto. Revisado em 2026-09-12. Documentos antigos podem citar numeros ou planos
+superados; este arquivo define status atual. `Done` nao e backlog ativo.
 
----
+## P0 - correctness and ship blockers
 
-## High leverage
+### TXN-01 - Make cross-partition `EndTxn` crash-atomic
+**Legacy:** Issue #4 · `docs/design/KAFKA-TXN-DESIGN.md`
 
-### #1 — Per-partition locking (kill the last throughput serializer)
-**labels:** `perf`, `broker`, `good-second-issue`
-The per-batch seal is now parallel (see `docs/BENCH-INDEPENDENT-2026-07-01.md` addendum, ~2.5× measured),
-but a single `Mutex<BrokerInner>` still serializes *whole batches* across all partitions and connections. Two
-producers on two partitions aggregate to ~2.8 MB/s — the catastrophic negative scaling is gone, but there is
-no true multi-partition parallelism yet.
-**Do:** split `BrokerInner` so each `(topic, partition)` log has its own lock (or shard the map behind
-per-partition `Mutex`/`RwLock`); keep the seq-reservation invariant per partition; the offsets store and txn
-buffers need their own synchronization.
-**Acceptance:** two producers on two partitions exceed a single producer's throughput (positive scaling), with
-an interleaved-A/B measurement committed to the bench doc; all existing wire/durability tests still green.
+**Status:** closed for single-node scope. Durable `Prepare`/`Commit` journal, partition rollback, startup recovery,
+offset snapshots, transaction visibility gate, five post-fsync process boundaries, and real-binary partial/complete
+`Commit` write cuts now prove deterministic all-or-none recovery. Multi-node coordination remains out of scope.
 
-### #2 — Power-loss durability test (beyond `kill -9`)
-**labels:** `durability`, `test`, `hard`
-`tests/kill9_crash.rs` proves records survive a SIGKILL, but the OS page cache survives a killed process, so
-fsync-ordering bugs that only a real power cut exposes are still untested. The dir-fsync fix
-(`055b568`) is currently argued, not demonstrated under fault injection.
-**Do:** a harness that runs the broker against a filesystem whose fsync/rename can be reordered/dropped (e.g.
-a FUSE shim, `dm-flakey`, or CharybdeFS-style injector), then asserts no acked record is lost after an
-injected crash-consistent cut.
-**Acceptance:** a reproducible CI job (or documented local harness) that would FAIL without the dir-fsync and
-PASS with it.
+**Do:** retain the fault matrix against [`KAFKA-TXN-DURABILITY.md`](../design/KAFKA-TXN-DURABILITY.md). Keep control
+metadata provider-blind. Scope claim to single-node datarail transaction protocol, not Kafka EOS compatibility.
 
-### #3 — Kafka protocol conformance against real client libraries
-**labels:** `compat`, `test`
-CI exercises kcat/librdkafka only (see `docs/design/KAFKA-COMPAT.md` → tested-client matrix). Untested: the
-Apache Kafka **Java** client, **franz-go**, **kafka-python**, **Sarama**, **librdkafka 2.x**.
-**Do:** add a CI matrix that produces+consumes (and, where supported, consumer-group + transactions) against
-each; record pass/fail per API in the matrix.
-**Acceptance:** the KAFKA-COMPAT matrix rows move from "not yet tested" to a real status, green or honestly
-red.
+**Acceptance:** injected crash at every commit boundary and partial/complete `Commit` write cut leaves either all
+enrolled records and offsets visible or none; recovery is deterministic; stale epoch cannot finish a newer transaction.
 
----
+### DUR-01 - Prove power-loss durability
+**Legacy:** Issue #2
 
-## Correctness / protocol edges
+**Status:** partial. `scripts/durability-device-mapper.sh` runs a privileged Docker device-mapper cut and verifies
+every acknowledged WAL record after recovery. WAL tests now model stale/lost cursor directory entries and fail closed
+on real directory-fsync errors. Manual `.github/workflows/durability-linux.yml` requires `dm-flakey`, ext4/xfs, and
+write barriers. Physical power-loss ordering remains open until that Linux evidence runs successfully.
 
-### #4 — Transactional `EndTxn` is not crash-atomic across partitions
-**labels:** `correctness`, `kafka-txn`, `hard`
-The txn coordinator state is in-memory; a crash mid-`commit_txn` can leave a partial multi-partition commit
-(documented in `KAFKA-TXN-DESIGN.md` and README Known limitations). Contract violations are now rejected at
-buffer time (`529b040`), so the loop hazard is closed, but atomicity across a crash is not.
-**Do:** a durable transaction log (write intent → flush partitions → commit marker), replayed on restart.
-**Acceptance:** a kill-during-commit test shows all-or-nothing visibility of a multi-partition txn.
+**Do:** run the manual Linux workflow on a runner exposing `dm-flakey`, then add actual poweroff/replay evidence on
+Linux/ext4 or xfs with barriers.
 
-### #5 — `BatchTooLarge` should map to `MESSAGE_TOO_LARGE` (10), not retriable 56
-**labels:** `kafka`, `good-first-issue`
-An oversize batch (>u32 framing) currently returns the retriable `KAFKA_STORAGE_ERROR` (56); it is permanent
-for that batch, so a client retries forever — the same class of bug as the contract-violation infinite loop
-already fixed in `529b040`. See the comment in `KafkaBrokerStore::produce_into`.
-**Do:** map the framing-too-large error to non-retriable `MESSAGE_TOO_LARGE` (10); regression test.
-**Acceptance:** an oversize produce returns 10 and is not retried; a normal produce is unaffected.
+**Acceptance:** reproducible local or CI harness fails without dir-fsync ordering and passes with it; every acked record
+survives the injected cut.
 
-### #6 — Broker restarts are at-least-once for non-idempotent producers
-**labels:** `correctness`, `broker`
-The cross-restart dedup index exists as library code but is not wired into the broker; a non-idempotent
-producer that retries across a restart can double-land (README Known limitations).
-**Do:** persist and consult the dedup watermark in the broker path, as the Postgres sink already does.
-**Acceptance:** a produce→restart→retry sequence lands each record once.
+### STOR-01 - Fix `ReplayLog::replay_from` seek after corruption
+**Legacy:** WP-01 checklist remaining issue
 
----
+**Status:** closed. Core seek fix landed, direct-read workaround removed, and storage/fetch regressions pass.
 
-## Security / ops
+**Do:** none; retain corruption regression coverage.
 
-### #7 — Real key management (stop inlining secrets in `rail.toml`)
-**labels:** `security`, `ops`
-`examples/rail.toml` carries raw demo seeds; production has no key-ref/KMS path (see `SECURITY.md`).
-**Do:** support key references (env / file / a KMS handle) in the spec; never require inline secrets.
-**Acceptance:** a broker/rail boots from key-refs with no raw key material in the config file.
+**Acceptance:** arbitrary valid record offsets after corrupt frames return exact suffixes; no renumbering; existing
+corruption tests remain green.
 
-### #8 — QUIC substrate: real cert verification (retire the dev-only embedded cert)
-**labels:** `security`, `substrate`
-The QUIC substrate ships an embedded dev cert and the client accepts any server cert — an active MITM sees
-envelope metadata (never payloads). Documented as dev-only in the crate.
-**Do:** pluggable cert verification (CA chain + hostname), embedded cert gated behind an explicit dev flag.
-**Acceptance:** a MITM with a wrong cert is rejected; the dev path requires opting in.
+## P1 - product correctness and compatibility
 
-### #9 — External crypto review of the composition
-**labels:** `security`, `help-wanted`
-The primitives are vetted crates, but the *construction* (per-cofre X25519 wrap → AEAD, Ed25519 lacre, the
-DRBG's reseed-on-fork/CRIU story) has had no third-party review — only self-audit (`ADVERSARIAL-AUDIT.md`).
-**Do:** solicit a review; publish findings and fixes.
+### WP1-01 - Close per-partition locking evidence and release gates
+**Legacy:** Issue #1 · WP-01
 
----
+**Status:** implementation done; evidence incomplete. Per-partition locks, rollback build, deterministic multi-lock
+ordering, 10k contention stress, sequence reservation test, and local A/B harness exist. Local ratios ranged
+`1.154x-1.684x`; no independent product benchmark, 95% CI, RSS, or dedicated benchmark binary exists.
 
-## Longer-term / product
+**Do:** run independent/interleaved product A/B; collect p99, RSS, CI timing; decide whether to ship `v0.1.1`.
 
-### #10 — Extract the Merkle delivery receipt as a standalone crate
-**labels:** `product`, `crate`
-`datarail-manifest` (offline-verifiable delivery proof) is the piece most likely to matter to others
-independent of the broker (see `docs/blog/03-merkle-delivery-receipt.md`).
-**Do:** carve it into a dependency-light crate with its own docs + verifier CLI; publish.
+**Acceptance:** default build meets agreed throughput/p99/RSS gates on documented hardware; rollback remains green;
+staging/tag/CI evidence is recorded; no claim exceeds evidence.
 
-### #11 — Wire the designed-ahead replication tier into the binary, or cut it
-**labels:** `architecture`, `decision`
-`datarail-broker`, `datarail-replicated-topic`, `datarail-replication`, `datarail-erasure` are tested library
-code but unreachable from the CLI (README crate table calls this out). Single-node is currently a hard truth.
-**Do:** decide — either wire a real multi-node path (leader/replication/failover) or explicitly descope it and
-say "edge/embedded, single-node by design." Do not leave it in limbo.
+### COMPAT-01 - Run real Kafka client conformance matrix
+**Legacy:** Issue #3 · `docs/design/KAFKA-COMPAT.md`
 
----
+**Status:** open. Preparation landed: `scripts/kafka-compat-matrix.sh` validates a fail-closed matrix and provides
+the real-broker adapter contract. Real coverage remains limited to kcat/librdkafka 1.7.1 and an independent
+librdkafka 1.8.0 run. Missing: Apache Kafka Java, franz-go, kafka-python, Sarama, librdkafka 2.x, and real-client
+transactional EOS.
 
-## Done so far (trajectory, newest first)
+**Acceptance:** each client row has a real pass/fail result for produce, fetch, groups, security, compression, and
+transactions where supported.
 
-- Parallel per-batch seal (`88fe891`); dir-fsync on rotation + loud-fail on fetch corruption (`055b568`);
-  `acks=0` respected + produce CRC-32C validated (`a924e0a`); `kill -9` crash harness (`fa29cb8`);
-  SCRAM-SHA-256 in the Postgres driver (`f8691cc`).
-- Contract violation → non-retriable `INVALID_RECORD` on plain + txn paths (`529b040`, found by the
-  independent benchmark's librdkafka run).
-- Honest README + independent broker benchmark (`c8c85ed`); repo-wide claim reconciliation (`073966b`);
-  dual license + crate metadata (`c8ec420`); `SECURITY.md` + 60-second demo (`a61b3f6`); architecture diagram
-  + client matrix (`ba98df5`).
+### DEDUP-01 - Persist broker restart deduplication
+**Legacy:** Issue #6
+
+**Status:** implemented for idempotent producers. Persistent per-partition sequence metadata survives broker restart;
+non-idempotent producers remain at-least-once.
+
+**Acceptance:** produce, restart, retry sequence lands each record once at stable offsets; scope remains distinct from
+rail-mode and Postgres exactly-once claims.
+
+## P1 - security and trust boundary
+
+### KEY-01 - Replace inline demo secrets with key references
+**Legacy:** Issue #7
+
+**Status:** partial. `env:` and `file:` key refs work and demo inline seeds remain; KMS path is absent.
+
+**Acceptance:** env/file/KMS handle references boot rail and broker without raw secret material in config; errors fail
+closed and secret lifetime is documented.
+
+### QUIC-01 - Verify real QUIC server certificates
+**Legacy:** Issue #8
+
+**Status:** implemented. Production `connect` verifies caller CA and hostname; embedded cert and accept-any behavior
+remain explicit dev/test paths.
+
+**Acceptance:** CA/hostname verification rejects wrong-cert MITM; dev certificate path requires explicit opt-in.
+
+### CRYPTO-01 - Obtain external review of crypto composition
+**Legacy:** Issue #9
+
+**Status:** open. Primitive crates and construction have self-audit only.
+
+**Acceptance:** external review covers X25519 wrap, AEAD/AAD, Ed25519 lacre, DRBG snapshot/fork behavior, and key
+zeroization; findings and remediation are published.
+
+## P2 - architecture and extraction
+
+### REPL-01 - Decide replication scope: wire it or cut it
+**Legacy:** Issue #11
+
+**Status:** open decision. Replication, erasure, routed topics, tiered log, and related crates are tested libraries,
+not wired into the CLI. Single-node is current truth.
+
+**Acceptance:** either a real multi-node leader/replication/failover path reaches the binary, or docs explicitly scope
+the project as single-node/embedded and remove unfulfilled product language.
+
+### MAN-01 - Extract Merkle delivery receipt crate
+**Legacy:** Issue #10
+
+**Status:** closed via typed boundary. Public standalone verifier API now includes owned `OwnedDeliveryReceipt` plus
+external-consumer tests/docs; verifier CLI and serialization remain intentionally absent because SPEC 04 defines no
+wire format.
+
+**Acceptance:** external consumer verifies owned receipt offline without importing CLI internals; no CLI or wire-format
+claim is made.
+
+### NET-01 - Wire FASP delay controller into real lossy transport
+
+**Status:** parked. The algorithm is proven in seeded simulation; production TCP path does not use FASP over UDP.
+
+**Acceptance:** real UDP transport with authenticated peer/session handling, loss/latency test, and no claim based on
+simulation alone.
+
+## External and owner queue
+
+### EXT-01 - AC-10 real competitor bake-off
+**Legacy:** Issue #20
+
+**Status:** external resource. Fairness rig/methodology can be maintained here; actual competitor binaries and suitable
+infrastructure are not in this repository.
+
+**Acceptance:** real engine binaries, byte-equal workload, documented environment, and reproducible results.
+
+### OWNER-01 - Reconcile CAST/MF-0 ratification status
+
+**Status:** owner/documentation gate. `DECOMPOSITION.md` says MF-0 ratified, while `00-CONSTITUTION.md`,
+`adr/0001-adopt-cast.md`, and product-intent docs still say pending. Resolve status before another product-scope
+freeze. Owner-reserved product docs remain untouched here.
+
+**Acceptance:** one signed decision record is authoritative; dependent docs agree; no implementation claim depends on
+an unresolved product decision.
+
+## Parked, not active defects
+
+- Kafka-faithful marker/LSO model and true `read_uncommitted`; current safe scope is buffer-until-commit with
+  `read_uncommitted == read_committed`.
+- RFC-3161 TSA anchoring; explicitly out of v1 delivery path.
+- FASP real transport integration; tracked as `NET-01`.
+- CI p99/RSS/lock-contention measurement; part of `WP1-01`, not a product number yet.
+
+## Closed in current worktree
+
+- `BatchTooLarge` -> Kafka `MESSAGE_TOO_LARGE` `10`; regression covered.
+- Per-partition locking implementation, rollback feature, lock-order stress, and sequence-range test.
+- Transaction epoch fencing, stale completion rejection, failed-buffer restoration.
+- Single-node cross-partition transaction crash atomicity, including partial/complete journal-write recovery.
+- Replay corruption active mitigation and loud fetch behavior.
+- Contract violation -> non-retriable `INVALID_RECORD` `87`.
+
+## Dependency order
+
+1. `WP1-01` evidence/release decision and `DUR-01` power-loss semantics.
+2. `DUR-01` power-loss harness.
+3. `DEDUP-01` restart deduplication.
+4. `COMPAT-01` real-client matrix.
+5. `KEY-01` and `QUIC-01` security hardening.
+6. `REPL-01`, `MAN-01`, `NET-01`, `CRYPTO-01`, and `EXT-01` by leverage/resources.
