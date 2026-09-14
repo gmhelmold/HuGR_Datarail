@@ -126,6 +126,55 @@ infrastructure never see plaintext. With Kafka ingest, the trust boundary is:
    `KAFKA-EOS-DESIGN.md`). Next within this line: **transactional** producer (cross-session EOS via a stable
    `transactional.id`).
 
+## Reproducible client matrix harness
+
+Preparation only. The harness does not turn wire-test coverage into client evidence. Matrix source:
+`scripts/kafka-compat-matrix.tsv`.
+
+```text
+./scripts/kafka-compat-matrix.sh --check
+./scripts/kafka-compat-matrix.test.sh
+```
+
+Run requires the real release broker and an executable client adapter:
+
+```text
+cargo build --release -p datarail-cli
+./scripts/kafka-compat-matrix.sh --run CLIENT_ID \
+  --broker-bin ./target/release/datarail --adapter ./compat-adapter
+```
+
+Adapter contract: accept `--broker HOST:PORT`, `--topic NAME`, and `--data-dir DIR`; exercise the client against
+that real `datarail kafka-broker`; print exactly one `DATARAIL_COMPAT_VERSION=<exact version>` line and exactly one
+`DATARAIL_COMPAT_RESULT=PASS` or `DATARAIL_COMPAT_RESULT=FAIL` line. Known-version rows must include their expected
+version. Missing tool/adapter records `UNAVAILABLE` and exits nonzero. Missing, contradictory, malformed, or
+versionless output records `UNKNOWN` and exits nonzero. No absent client can become `PASS`.
+
+Common broker command used by every adapter:
+
+```text
+./target/release/datarail kafka-broker examples/rail.toml \
+  --listen 127.0.0.1:19092 --advertised 127.0.0.1 \
+  --data-dir "$DATA_DIR" --partitions 1
+```
+
+Client-specific version and wire commands. These are reproducible run recipes, not evidence until an adapter emits
+the result marker and its output is retained with the version output.
+
+| Client | Capture exact version | Produce/fetch/group command |
+|---|---|---|
+| Apache Kafka Java | `$KAFKA_HOME/bin/kafka-topics.sh --version` | `$KAFKA_HOME/bin/kafka-console-producer.sh --bootstrap-server 127.0.0.1:19092 --topic compat-java`; then `kafka-console-consumer.sh --bootstrap-server 127.0.0.1:19092 --topic compat-java --from-beginning --group compat-java` |
+| franz-go | `go list -m -f '{{.Version}}' github.com/twmb/franz-go` | `go run "$FRANZ_GO_ADAPTER" --broker 127.0.0.1:19092 --topic compat-franz-go` |
+| kafka-python | `python3 -c 'import kafka; print(kafka.__version__)'` | `python3 "$KAFKA_PYTHON_ADAPTER" --broker 127.0.0.1:19092 --topic compat-python` |
+| Sarama | `go list -m -f '{{.Version}}' github.com/IBM/sarama` | `go run "$SARAMA_ADAPTER" --broker 127.0.0.1:19092 --topic compat-sarama` |
+| librdkafka 2.x | `kcat -V`; require reported librdkafka major `2` | `printf 'evt:1\\nevt:2\\n' \| kcat -P -b 127.0.0.1:19092 -t compat-rdkafka-2`; then `kcat -C -b 127.0.0.1:19092 -t compat-rdkafka-2 -o beginning -e` |
+| Transactional EOS | client-specific command plus exact version capture | client adapter must run transactional produce, consumer-group offset commit, restart/retry, then emit marker; wire test alone is not real-client evidence |
+
+`franz-go`, kafka-python, Sarama, and transactional rows have no adapter in this repository. They remain
+`UNTESTED`; commands above intentionally use operator-supplied adapter paths. Java and librdkafka 2.x likewise remain
+untested until their exact client distributions are captured. Do not replace `UNTESTED` with `PASS` after a missing-tool
+run.
+
 ## Tested client matrix (honest)
 
 Every row below reflects something that was actually exercised against the real binary, either in CI or during the independent audit. Nothing here is inferred from wire-test coverage alone.
