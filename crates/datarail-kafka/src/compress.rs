@@ -22,21 +22,29 @@ pub fn decompress(codec: u8, input: &[u8], max: usize) -> io::Result<Vec<u8>> {
         4 => unzstd(input, max),
         #[cfg(feature = "compression-snappy")]
         2 => unsnappy(input, max),
-        other => {
-            Err(io::Error::new(io::ErrorKind::InvalidData, format!("unsupported compression codec {other}")))
-        }
+        other => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("unsupported compression codec {other}"),
+        )),
     }
 }
 
 /// Read a decompressing reader to completion, bounded at `max` bytes (the shared zip-bomb guard).
-#[cfg(any(feature = "compression-lz4", feature = "compression-zstd", feature = "compression-snappy"))]
+#[cfg(any(
+    feature = "compression-lz4",
+    feature = "compression-zstd",
+    feature = "compression-snappy"
+))]
 fn read_capped(mut r: impl std::io::Read, max: usize) -> io::Result<Vec<u8>> {
     use std::io::Read as _;
     let cap = u64::try_from(max).unwrap_or(u64::MAX).saturating_add(1);
     let mut out = Vec::new();
     r.by_ref().take(cap).read_to_end(&mut out)?;
     if out.len() > max {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "decompressed batch exceeds the size cap"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "decompressed batch exceeds the size cap",
+        ));
     }
     Ok(out)
 }
@@ -88,14 +96,25 @@ fn unsnappy_xerial(input: &[u8], max: usize) -> io::Result<Vec<u8>> {
     let mut out = Vec::new();
     let mut dec = snap::raw::Decoder::new();
     while pos < input.len() {
-        let len_end = pos.checked_add(4).ok_or_else(|| bad("block length overflow"))?;
-        let len_bytes: [u8; 4] =
-            input.get(pos..len_end).ok_or_else(|| bad("truncated snappy block length"))?.try_into().map_err(|_| bad("bad block length"))?;
+        let len_end = pos
+            .checked_add(4)
+            .ok_or_else(|| bad("block length overflow"))?;
+        let len_bytes: [u8; 4] = input
+            .get(pos..len_end)
+            .ok_or_else(|| bad("truncated snappy block length"))?
+            .try_into()
+            .map_err(|_| bad("bad block length"))?;
         let block_len = usize::try_from(u32::from_be_bytes(len_bytes)).unwrap_or(usize::MAX);
-        let block_end = len_end.checked_add(block_len).ok_or_else(|| bad("block overflow"))?;
-        let block = input.get(len_end..block_end).ok_or_else(|| bad("truncated snappy block"))?;
+        let block_end = len_end
+            .checked_add(block_len)
+            .ok_or_else(|| bad("block overflow"))?;
+        let block = input
+            .get(len_end..block_end)
+            .ok_or_else(|| bad("truncated snappy block"))?;
         pos = block_end;
-        let decoded = dec.decompress_vec(block).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+        let decoded = dec
+            .decompress_vec(block)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
         if out.len().saturating_add(decoded.len()) > max {
             return Err(bad("decompressed batch exceeds the size cap"));
         }
@@ -111,9 +130,14 @@ fn gunzip(input: &[u8], max: usize) -> io::Result<Vec<u8>> {
     // Read at most max+1 bytes so an over-cap stream is detected without materializing the whole thing.
     let cap = u64::try_from(max).unwrap_or(u64::MAX).saturating_add(1);
     let mut out = Vec::new();
-    flate2::read::GzDecoder::new(input).take(cap).read_to_end(&mut out)?;
+    flate2::read::GzDecoder::new(input)
+        .take(cap)
+        .read_to_end(&mut out)?;
     if out.len() > max {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "decompressed batch exceeds the size cap"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "decompressed batch exceeds the size cap",
+        ));
     }
     Ok(out)
 }
