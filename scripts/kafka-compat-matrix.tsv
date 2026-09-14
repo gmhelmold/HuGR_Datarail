@@ -1,0 +1,9 @@
+# id	client	status	expected_version	version_command	tool	adapter	scope	evidence
+kcat-librdkafka-1.7.1	kcat (librdkafka)	PASS	1.7.1	docker run --rm edenhill/kcat:1.7.1 -V	docker	-	produce,fetch,groups,TLS,mTLS,SASL/PLAIN,compression	.github/workflows/kafka-broker-librdkafka.yml; kafka-broker-tls.yml; kafka-broker-mtls.yml; kafka-broker-sasl.yml; kafka-broker-compression.yml
+librdkafka-1.8.0-independent	kafkacat (librdkafka)	PASS	1.8.0	kafkacat -V	kafkacat	-	produce,fetch	docs/BENCH-INDEPENDENT-2026-07-01.md
+apache-kafka-java	Apache Kafka Java client	UNTESTED	-	$KAFKA_HOME/bin/kafka-topics.sh --version	java	compat-adapters/apache-kafka-java	produce,fetch,groups,TLS,mTLS,SASL/PLAIN,compression	No real-client run recorded.
+franz-go	franz-go	UNTESTED	-	go list -m -f '{{.Version}}' github.com/twmb/franz-go	go	compat-adapters/franz-go	produce,fetch,groups,TLS,mTLS,SASL/PLAIN,compression	No adapter or real-client run recorded.
+kafka-python	kafka-python	UNTESTED	-	python3 -c 'import kafka; print(kafka.__version__)'	python3	compat-adapters/kafka-python	produce,fetch,groups,TLS,mTLS,SASL/PLAIN,compression	No adapter or real-client run recorded.
+sarama	Sarama	UNTESTED	-	go list -m -f '{{.Version}}' github.com/IBM/sarama	go	compat-adapters/sarama	produce,fetch,groups,TLS,mTLS,SASL/PLAIN,compression	No adapter or real-client run recorded.
+librdkafka-2.x	librdkafka 2.x	UNTESTED	-	kcat -V (must report librdkafka 2.x)	kcat	compat-adapters/librdkafka-2.x	produce,fetch,groups,TLS,mTLS,SASL/PLAIN,compression	No librdkafka 2.x run recorded.
+transactional-eos	real-client transactional EOS	UNTESTED	-	client-specific version command	-	compat-adapters/transactional-eos	transactional produce,fetch,groups,offsets	Wire tests only; no real-client transactional run recorded.
