@@ -293,7 +293,8 @@ impl<'a> Reader<'a> {
         for _ in 0..count {
             let _tag = self.unsigned_varint()?;
             let size = self.unsigned_varint()?;
-            let n = usize::try_from(size).map_err(|_| Self::invalid("tagged field size overflow"))?;
+            let n =
+                usize::try_from(size).map_err(|_| Self::invalid("tagged field size overflow"))?;
             self.take(n)?;
         }
         Ok(())
@@ -620,7 +621,10 @@ mod tests {
     fn compact_string_zero_is_null_error() {
         let bytes = [0x00u8];
         let mut r = Reader::new(&bytes);
-        assert_eq!(r.compact_string().unwrap_err().kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            r.compact_string().unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
     }
 
     #[test]
@@ -784,7 +788,10 @@ mod tests {
         // Six continuation bytes — overlong.
         let bytes = [0x80u8, 0x80, 0x80, 0x80, 0x80, 0x01];
         let mut r = Reader::new(&bytes);
-        assert_eq!(r.unsigned_varint().unwrap_err().kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            r.unsigned_varint().unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
     }
 
     #[test]
@@ -792,7 +799,10 @@ mod tests {
         // Five bytes whose value exceeds u32::MAX.
         let bytes = [0xFFu8, 0xFF, 0xFF, 0xFF, 0x7F];
         let mut r = Reader::new(&bytes);
-        assert_eq!(r.unsigned_varint().unwrap_err().kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            r.unsigned_varint().unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
     }
 
     #[test]
