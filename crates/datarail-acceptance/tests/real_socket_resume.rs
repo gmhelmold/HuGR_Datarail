@@ -51,9 +51,17 @@ fn drain_offload(
             let already = committed.contains(&c.etiqueta.cofre_id);
             let disp = dest.offload(&c).expect("offload");
             if already {
-                assert_eq!(disp, Disposition::Duplicate, "a re-driven committed cofre must dedup");
+                assert_eq!(
+                    disp,
+                    Disposition::Duplicate,
+                    "a re-driven committed cofre must dedup"
+                );
             } else {
-                assert_eq!(disp, Disposition::Delivered, "a fresh cofre must be delivered");
+                assert_eq!(
+                    disp,
+                    Disposition::Delivered,
+                    "a fresh cofre must be delivered"
+                );
                 committed.insert(c.etiqueta.cofre_id);
             }
             link.ack(c.etiqueta.cofre_id).expect("ack");
@@ -95,7 +103,11 @@ fn ac8_real_tcp_partition_then_resume_delivers_each_record_exactly_once() {
         drain_offload(&mut link, &mut dest, &mut committed, FIRST_LEG);
         // `link` drops here → the real kernel sockets are torn down → PARTITION.
     }
-    assert_eq!(committed.len(), FIRST_LEG, "first leg committed before the partition");
+    assert_eq!(
+        committed.len(),
+        FIRST_LEG,
+        "first leg committed before the partition"
+    );
 
     // --- Session 2 over a NEW real TCP socket: the source RE-DRIVES the whole outbox; the already-committed
     //     cofres dedup to Duplicate, the rest are Delivered. ---
@@ -113,6 +125,9 @@ fn ac8_real_tcp_partition_then_resume_delivers_each_record_exactly_once() {
         expected.as_slice(),
         "each record delivered exactly once, in order, across a real TCP partition + resume"
     );
-    assert!(dest.dead_letters().is_empty(), "nothing dead-lettered across the partition");
+    assert!(
+        dest.dead_letters().is_empty(),
+        "nothing dead-lettered across the partition"
+    );
     assert_eq!(committed.len(), N, "all N records committed exactly once");
 }

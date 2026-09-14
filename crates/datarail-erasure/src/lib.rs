@@ -267,7 +267,13 @@ mod tests {
     use super::{gf_inv, gf_mul, ErasureError, Rs};
 
     /// Visit every `m`-element subset of `0..total` (the loss patterns).
-    fn for_each_subset(start: usize, depth: usize, total: usize, lost: &mut Vec<usize>, hit: &mut dyn FnMut(&[usize])) {
+    fn for_each_subset(
+        start: usize,
+        depth: usize,
+        total: usize,
+        lost: &mut Vec<usize>,
+        hit: &mut dyn FnMut(&[usize]),
+    ) {
         if depth == lost.len() {
             hit(lost);
             return;
@@ -299,7 +305,10 @@ mod tests {
             .map(|j| {
                 let jb = j.to_le_bytes()[0];
                 (0..len)
-                    .map(|b| jb.wrapping_mul(31).wrapping_add(b.to_le_bytes()[0].wrapping_mul(17)))
+                    .map(|b| {
+                        jb.wrapping_mul(31)
+                            .wrapping_add(b.to_le_bytes()[0].wrapping_mul(17))
+                    })
                     .collect()
             })
             .collect();
@@ -326,7 +335,10 @@ mod tests {
                 .map(|(idx, bytes)| (*idx, bytes.as_slice()))
                 .collect();
             let recovered = rs.reconstruct(&survivors).expect("reconstruct");
-            assert_eq!(recovered, data, "recovery failed losing shards {lost_set:?}");
+            assert_eq!(
+                recovered, data,
+                "recovery failed losing shards {lost_set:?}"
+            );
             count += 1;
         });
         // Sanity: we actually exercised C(total, m) patterns.
@@ -367,6 +379,9 @@ mod tests {
         let ragged: Vec<&[u8]> = vec![&[1, 2], &[3], &[4, 5]];
         assert_eq!(rs.encode(&ragged).unwrap_err(), ErasureError::RaggedShards);
         let too_few: Vec<(usize, &[u8])> = vec![(0, &[1, 2])];
-        assert_eq!(rs.reconstruct(&too_few).unwrap_err(), ErasureError::NotEnoughShards);
+        assert_eq!(
+            rs.reconstruct(&too_few).unwrap_err(),
+            ErasureError::NotEnoughShards
+        );
     }
 }
