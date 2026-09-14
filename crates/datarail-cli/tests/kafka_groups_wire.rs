@@ -28,7 +28,13 @@ fn find_coordinator_req(correlation_id: i32, group: &str) -> Vec<u8> {
     Writer::frame(&w.into_bytes())
 }
 
-fn offset_commit_req(correlation_id: i32, group: &str, topic: &str, partition: i32, offset: i64) -> Vec<u8> {
+fn offset_commit_req(
+    correlation_id: i32,
+    group: &str,
+    topic: &str,
+    partition: i32,
+    offset: i64,
+) -> Vec<u8> {
     let mut w = req_header(8, 2, correlation_id);
     w.string(group);
     w.int32(-1); // generation_id (v1+)
@@ -129,10 +135,15 @@ fn spawn_broker(rail: &std::path::Path, data_dir: &std::path::Path) -> (Daemon, 
         if let Ok(s) = TcpStream::connect(("127.0.0.1", PORT)) {
             break s;
         }
-        assert!(Instant::now() < deadline, "kafka-broker never started listening");
+        assert!(
+            Instant::now() < deadline,
+            "kafka-broker never started listening"
+        );
         std::thread::sleep(Duration::from_millis(100));
     };
-    stream.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
     (daemon, stream)
 }
 
@@ -163,33 +174,64 @@ fn offset_commit_fetch_round_trips_and_survives_a_broker_restart() {
         let (_daemon, mut stream) = spawn_broker(&rail, &data_dir);
 
         // FindCoordinator → THIS broker (node 0, advertised host/port).
-        stream.write_all(&find_coordinator_req(1, "analytics")).unwrap();
+        stream
+            .write_all(&find_coordinator_req(1, "analytics"))
+            .unwrap();
         let (node, host, port) = coordinator(&read_frame(&mut stream));
-        assert_eq!(node, 0, "single-node: the broker is its own group coordinator");
+        assert_eq!(
+            node, 0,
+            "single-node: the broker is its own group coordinator"
+        );
         assert_eq!((host.as_str(), port), ("127.0.0.1", i32::from(PORT)));
 
         // OffsetFetch before any commit → -1 (no committed offset).
-        stream.write_all(&offset_fetch_req(2, "analytics", "events", 0)).unwrap();
-        assert_eq!(fetched_offset(&read_frame(&mut stream)), -1, "no committed offset yet");
+        stream
+            .write_all(&offset_fetch_req(2, "analytics", "events", 0))
+            .unwrap();
+        assert_eq!(
+            fetched_offset(&read_frame(&mut stream)),
+            -1,
+            "no committed offset yet"
+        );
 
         // OffsetCommit offset 7 → NONE.
-        stream.write_all(&offset_commit_req(3, "analytics", "events", 0, 7)).unwrap();
-        assert_eq!(commit_error(&read_frame(&mut stream)), 0, "commit acked NONE (durable)");
+        stream
+            .write_all(&offset_commit_req(3, "analytics", "events", 0, 7))
+            .unwrap();
+        assert_eq!(
+            commit_error(&read_frame(&mut stream)),
+            0,
+            "commit acked NONE (durable)"
+        );
 
         // OffsetFetch → 7.
-        stream.write_all(&offset_fetch_req(4, "analytics", "events", 0)).unwrap();
-        assert_eq!(fetched_offset(&read_frame(&mut stream)), 7, "committed offset read back");
+        stream
+            .write_all(&offset_fetch_req(4, "analytics", "events", 0))
+            .unwrap();
+        assert_eq!(
+            fetched_offset(&read_frame(&mut stream)),
+            7,
+            "committed offset read back"
+        );
 
         // A DIFFERENT group is isolated (no cross-group leakage).
-        stream.write_all(&offset_fetch_req(5, "other-group", "events", 0)).unwrap();
-        assert_eq!(fetched_offset(&read_frame(&mut stream)), -1, "another group has its own (empty) offset");
+        stream
+            .write_all(&offset_fetch_req(5, "other-group", "events", 0))
+            .unwrap();
+        assert_eq!(
+            fetched_offset(&read_frame(&mut stream)),
+            -1,
+            "another group has its own (empty) offset"
+        );
         // _daemon dropped → broker killed.
     }
 
     // ---- PHASE 2: restart on the SAME data dir → the committed offset is recovered ----
     {
         let (_daemon, mut stream) = spawn_broker(&rail, &data_dir);
-        stream.write_all(&offset_fetch_req(6, "analytics", "events", 0)).unwrap();
+        stream
+            .write_all(&offset_fetch_req(6, "analytics", "events", 0))
+            .unwrap();
         assert_eq!(
             fetched_offset(&read_frame(&mut stream)),
             7,

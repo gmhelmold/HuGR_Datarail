@@ -140,7 +140,11 @@ fn fetch_values(resp: &[u8]) -> Vec<Vec<u8>> {
     let _aborted = r.int32().unwrap();
     match r.nullable_bytes().unwrap() {
         None => Vec::new(),
-        Some(blob) => parse_record_batch(&blob).expect("parse fetched batch").values,
+        Some(blob) => {
+            parse_record_batch(&blob)
+                .expect("parse fetched batch")
+                .values
+        }
     }
 }
 
@@ -176,10 +180,15 @@ fn spawn_broker(rail: &std::path::Path, data_dir: &std::path::Path) -> (Daemon, 
         if let Ok(s) = TcpStream::connect(("127.0.0.1", PORT)) {
             break s;
         }
-        assert!(Instant::now() < deadline, "kafka-broker never started listening");
+        assert!(
+            Instant::now() < deadline,
+            "kafka-broker never started listening"
+        );
         std::thread::sleep(Duration::from_millis(100));
     };
-    stream.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
     (daemon, stream)
 }
 
@@ -223,9 +232,14 @@ fn every_acked_record_survives_repeated_kill_minus_9() {
                 .collect();
             let refs: Vec<&[u8]> = values.iter().map(Vec::as_slice).collect();
             corr += 1;
-            stream.write_all(&produce_req(corr, "crash", &refs)).unwrap();
+            stream
+                .write_all(&produce_req(corr, "crash", &refs))
+                .unwrap();
             let (base, error) = produce_ack(&read_frame(&mut stream));
-            assert_eq!(error, 0, "produce must ack clean (round {round} batch {batch})");
+            assert_eq!(
+                error, 0,
+                "produce must ack clean (round {round} batch {batch})"
+            );
             for (i, v) in values.into_iter().enumerate() {
                 acked.push((base + i64::try_from(i).unwrap(), v));
             }

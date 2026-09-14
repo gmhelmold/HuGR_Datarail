@@ -6,14 +6,12 @@
 //! (increment 2 durability), the moat over an in-memory store.
 
 use std::io::{Read, Write};
-use std::net::TcpStream;
+use std::net::{TcpListener, TcpStream};
 use std::process::{Child, Command};
 use std::time::{Duration, Instant};
 
 use datarail_kafka::codec::{Reader, Writer};
 use datarail_kafka::produce::parse_record_batch;
-
-const PORT: u16 = 19_093;
 
 fn req_header(api_key: i16, api_version: i16, correlation_id: i32) -> Writer {
     let mut w = Writer::new();
@@ -24,8 +22,12 @@ fn req_header(api_key: i16, api_version: i16, correlation_id: i32) -> Writer {
     w
 }
 
-/// A non-idempotent v2 `RecordBatch` blob carrying `values` (`producer_id` = -1).
-fn record_batch(values: &[&[u8]]) -> Vec<u8> {
+fn record_batch_with_coord(
+    values: &[&[u8]],
+    producer_id: i64,
+    producer_epoch: i16,
+    base_sequence: i32,
+) -> Vec<u8> {
     let mut recs = Writer::new();
     for (i, v) in values.iter().enumerate() {
         let mut r = Writer::new();
@@ -49,9 +51,9 @@ fn record_batch(values: &[&[u8]]) -> Vec<u8> {
     b.int32(i32::try_from(values.len().saturating_sub(1)).unwrap());
     b.int64(0);
     b.int64(0);
-    b.int64(-1);
-    b.int16(-1);
-    b.int32(-1);
+    b.int64(producer_id);
+    b.int16(producer_epoch);
+    b.int32(base_sequence);
     b.int32(i32::try_from(values.len()).unwrap());
     b.raw(&records);
     let mut after = b.into_bytes();
@@ -66,8 +68,15 @@ fn record_batch(values: &[&[u8]]) -> Vec<u8> {
     full.into_bytes()
 }
 
-fn produce_req(correlation_id: i32, topic: &str, values: &[&[u8]]) -> Vec<u8> {
-    let batch = record_batch(values);
+fn idempotent_produce_req(
+    correlation_id: i32,
+    topic: &str,
+    values: &[&[u8]],
+    producer_id: i64,
+    producer_epoch: i16,
+    base_sequence: i32,
+) -> Vec<u8> {
+    let batch = record_batch_with_coord(values, producer_id, producer_epoch, base_sequence);
     let mut w = req_header(0, 7, correlation_id);
     w.nullable_string(None);
     w.int16(-1);
@@ -78,6 +87,20 @@ fn produce_req(correlation_id: i32, topic: &str, values: &[&[u8]]) -> Vec<u8> {
     w.int32(0);
     w.bytes(&batch);
     Writer::frame(&w.into_bytes())
+}
+
+fn produce_ack(resp: &[u8]) -> (i64, i16) {
+    let mut r = Reader::new(resp);
+    let _corr = r.int32().unwrap();
+    let topic_count = r.int32().unwrap();
+    assert_eq!(topic_count, 1);
+    let _name = r.string().unwrap();
+    let part_count = r.int32().unwrap();
+    assert_eq!(part_count, 1);
+    let _partition = r.int32().unwrap();
+    let error = r.int16().unwrap();
+    let base = r.int64().unwrap();
+    (base, error)
 }
 
 fn fetch_req(correlation_id: i32, topic: &str, fetch_offset: i64) -> Vec<u8> {
@@ -135,7 +158,11 @@ fn fetch_values(resp: &[u8]) -> Vec<Vec<u8>> {
     let record_set = r.nullable_bytes().unwrap();
     match record_set {
         None => Vec::new(),
-        Some(blob) => parse_record_batch(&blob).expect("parse fetched batch").values,
+        Some(blob) => {
+            parse_record_batch(&blob)
+                .expect("parse fetched batch")
+                .values
+        }
     }
 }
 
@@ -161,30 +188,44 @@ impl Drop for Daemon {
     }
 }
 
-/// Spawn `datarail kafka-broker` on `PORT` over `data_dir`, and return the daemon + a connected stream once it is
+/// Spawn `datarail kafka-broker` on `port` over `data_dir`, and return the daemon + a connected stream once it is
 /// listening. (Killing the returned `Daemon` and calling this again with the same `data_dir` simulates a restart.)
-fn spawn_broker(rail: &std::path::Path, data_dir: &std::path::Path) -> (Daemon, TcpStream) {
+fn spawn_broker(
+    rail: &std::path::Path,
+    data_dir: &std::path::Path,
+    port: u16,
+) -> (Daemon, TcpStream) {
     let child = Command::new(env!("CARGO_BIN_EXE_datarail"))
         .args([
             "kafka-broker",
             rail.to_str().unwrap(),
             "--listen",
-            &format!("127.0.0.1:{PORT}"),
+            &format!("127.0.0.1:{port}"),
             "--data-dir",
             data_dir.to_str().unwrap(),
         ])
         .spawn()
         .expect("spawn datarail kafka-broker");
-    let daemon = Daemon(child);
+    let mut daemon = Daemon(child);
     let deadline = Instant::now() + Duration::from_secs(10);
     let stream = loop {
-        if let Ok(s) = TcpStream::connect(("127.0.0.1", PORT)) {
+        if let Ok(s) = TcpStream::connect(("127.0.0.1", port)) {
             break s;
         }
-        assert!(Instant::now() < deadline, "kafka-broker never started listening");
+        match daemon.0.try_wait() {
+            Ok(Some(status)) => panic!("kafka-broker exited before listening: {status}"),
+            Ok(None) => {}
+            Err(error) => panic!("failed to poll kafka-broker startup: {error}"),
+        }
+        assert!(
+            Instant::now() < deadline,
+            "kafka-broker never started listening"
+        );
         std::thread::sleep(Duration::from_millis(100));
     };
-    stream.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
     (daemon, stream)
 }
 
@@ -209,13 +250,28 @@ fn produce_then_fetch_round_trips_and_survives_a_broker_restart() {
     .expect("write rail.toml");
     let data_dir = std::env::temp_dir().join(format!("kafka-broker-data-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&data_dir);
+    let reservation = TcpListener::bind(("127.0.0.1", 0)).expect("reserve a loopback port");
+    let port = reservation
+        .local_addr()
+        .expect("read reserved loopback port")
+        .port();
+    drop(reservation);
 
     // ---- PHASE 1: produce + fetch through a live broker ----
     {
-        let (_daemon, mut stream) = spawn_broker(&rail, &data_dir);
+        let (_daemon, mut stream) = spawn_broker(&rail, &data_dir, port);
 
         // PRODUCE 3 records (sealed + durably stored by the broker).
-        stream.write_all(&produce_req(1, "events", &[b"evt:m0", b"evt:m1", b"evt:m2"])).unwrap();
+        stream
+            .write_all(&idempotent_produce_req(
+                1,
+                "events",
+                &[b"evt:m0", b"evt:m1", b"evt:m2"],
+                41,
+                2,
+                0,
+            ))
+            .unwrap();
         let _ = read_frame(&mut stream);
 
         // FETCH from offset 0 → the original plaintext back (un-sealed at the edge).
@@ -231,7 +287,10 @@ fn produce_then_fetch_round_trips_and_survives_a_broker_restart() {
         // FETCH a suffix (offset 1) → m1, m2.
         stream.write_all(&fetch_req(3, "events", 1)).unwrap();
         let resp = read_frame(&mut stream);
-        assert_eq!(fetch_values(&resp), vec![b"evt:m1".to_vec(), b"evt:m2".to_vec()]);
+        assert_eq!(
+            fetch_values(&resp),
+            vec![b"evt:m1".to_vec(), b"evt:m2".to_vec()]
+        );
 
         // LISTOFFSETS latest → 3.
         stream.write_all(&list_offsets_req(4, "events")).unwrap();
@@ -244,29 +303,56 @@ fn produce_then_fetch_round_trips_and_survives_a_broker_restart() {
     let on_disk = read_all_under(&data_dir);
     assert!(!on_disk.is_empty(), "the durable log persisted to disk");
     assert!(
-        !contains(&on_disk, b"evt:m0") && !contains(&on_disk, b"evt:m1") && !contains(&on_disk, b"evt:m2"),
+        !contains(&on_disk, b"evt:m0")
+            && !contains(&on_disk, b"evt:m1")
+            && !contains(&on_disk, b"evt:m2"),
         "on-disk bytes are sealed ciphertext, never plaintext (provider-blind across restart)"
     );
 
-    // ---- PHASE 2: restart the broker on the SAME data dir → every acked record is recovered ----
-    {
-        let (_daemon, mut stream) = spawn_broker(&rail, &data_dir);
-
-        stream.write_all(&list_offsets_req(5, "events")).unwrap();
-        let resp = read_frame(&mut stream);
-        assert_eq!(list_offset_latest(&resp), 3, "all acked records recovered after a real broker restart");
-
-        stream.write_all(&fetch_req(6, "events", 0)).unwrap();
-        let resp = read_frame(&mut stream);
-        assert_eq!(
-            fetch_values(&resp),
-            vec![b"evt:m0".to_vec(), b"evt:m1".to_vec(), b"evt:m2".to_vec()],
-            "a consumer fetches the original plaintext back AFTER the broker restarted (durable provider-blind)"
-        );
-    }
+    exercise_idempotent_restart(&rail, &data_dir, port);
 
     let _ = std::fs::remove_file(&rail);
     let _ = std::fs::remove_dir_all(&data_dir);
+}
+
+fn exercise_idempotent_restart(rail: &std::path::Path, data_dir: &std::path::Path, port: u16) {
+    let (_daemon, mut stream) = spawn_broker(rail, data_dir, port);
+    stream
+        .write_all(&idempotent_produce_req(
+            5,
+            "events",
+            &[b"evt:m0", b"evt:m1", b"evt:m2"],
+            41,
+            2,
+            0,
+        ))
+        .unwrap();
+    let (base, error) = produce_ack(&read_frame(&mut stream));
+    assert_eq!(error, 0, "retry of committed sequence must ack cleanly");
+    assert_eq!(base, 0, "retry must return original stable base offset");
+    stream
+        .write_all(&idempotent_produce_req(6, "events", &[b"evt:m3"], 41, 2, 3))
+        .unwrap();
+    let (base, error) = produce_ack(&read_frame(&mut stream));
+    assert_eq!(error, 0);
+    assert_eq!(base, 3, "new sequence appends at stable next offset");
+    stream.write_all(&list_offsets_req(7, "events")).unwrap();
+    assert_eq!(list_offset_latest(&read_frame(&mut stream)), 4);
+    stream.write_all(&fetch_req(8, "events", 0)).unwrap();
+    assert_eq!(
+        fetch_values(&read_frame(&mut stream)),
+        vec![
+            b"evt:m0".to_vec(),
+            b"evt:m1".to_vec(),
+            b"evt:m2".to_vec(),
+            b"evt:m3".to_vec(),
+        ]
+    );
+    stream.write_all(&fetch_req(9, "events", 3)).unwrap();
+    assert_eq!(
+        fetch_values(&read_frame(&mut stream)),
+        vec![b"evt:m3".to_vec()]
+    );
 }
 
 /// Recursively read+concatenate every file under `dir` (for the on-disk provider-blind check).
