@@ -90,16 +90,30 @@ fn two_process_tcp_transfer_delivers_to_a_separate_recv() {
 
     // Both records landed at the destination's sink, intact, across two real OS processes.
     let out = std::fs::read_to_string(&sink).expect("read sink");
-    assert!(out.contains("evt:cross-process-1"), "sink missing record 1: {out:?}");
-    assert!(out.contains("evt:cross-process-2"), "sink missing record 2: {out:?}");
+    assert!(
+        out.contains("evt:cross-process-1"),
+        "sink missing record 1: {out:?}"
+    );
+    assert!(
+        out.contains("evt:cross-process-2"),
+        "sink missing record 2: {out:?}"
+    );
 
     let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// Mint a Noise static keypair via the real `datarail keygen --noise`, returning `(secret_hex, public_hex)`.
 fn keygen_noise() -> (String, String) {
-    let out = Command::new(BIN).arg("keygen").arg("--noise").output().expect("keygen --noise");
-    assert!(out.status.success(), "keygen failed: {}", String::from_utf8_lossy(&out.stderr));
+    let out = Command::new(BIN)
+        .arg("keygen")
+        .arg("--noise")
+        .output()
+        .expect("keygen --noise");
+    assert!(
+        out.status.success(),
+        "keygen failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let text = String::from_utf8_lossy(&out.stdout);
     let mut secret = None;
     let mut public = None;
@@ -185,8 +199,14 @@ fn two_process_noise_protected_transfer_delivers() {
 
     // Records crossed the Noise_KK-protected channel between two processes, intact.
     let out = std::fs::read_to_string(&sink).expect("read sink");
-    assert!(out.contains("evt:noise-1"), "sink missing record 1: {out:?}");
-    assert!(out.contains("evt:noise-2"), "sink missing record 2: {out:?}");
+    assert!(
+        out.contains("evt:noise-1"),
+        "sink missing record 1: {out:?}"
+    );
+    assert!(
+        out.contains("evt:noise-2"),
+        "sink missing record 2: {out:?}"
+    );
 
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -221,7 +241,10 @@ fn two_process_remote_pairing_agrees_on_a_secret() {
     let addr = loop {
         let mut line = String::new();
         let n = reader.read_line(&mut line).expect("read resp stdout");
-        assert!(n > 0, "responder closed stdout before announcing its address");
+        assert!(
+            n > 0,
+            "responder closed stdout before announcing its address"
+        );
         if let Some(rest) = line.strip_prefix("DATARAIL-LISTENING ") {
             break rest.trim().to_owned();
         }
@@ -245,12 +268,20 @@ fn two_process_remote_pairing_agrees_on_a_secret() {
 
     // Drain the responder's remaining output + reap it.
     let mut resp_rest = String::new();
-    reader.read_to_string(&mut resp_rest).expect("read responder result");
-    assert!(resp.wait().expect("wait resp").success(), "responder pairing failed");
+    reader
+        .read_to_string(&mut resp_rest)
+        .expect("read responder result");
+    assert!(
+        resp.wait().expect("wait resp").success(),
+        "responder pairing failed"
+    );
 
     let init_fpr = extract_fpr(&init_out).expect("initiator fpr");
     let resp_fpr = extract_fpr(&resp_rest).expect("responder fpr");
-    assert_eq!(init_fpr, resp_fpr, "both processes must derive the same shared secret");
+    assert_eq!(
+        init_fpr, resp_fpr,
+        "both processes must derive the same shared secret"
+    );
     assert!(init_out.contains("paired (initiator)"), "{init_out}");
     assert!(resp_rest.contains("paired (responder)"), "{resp_rest}");
 }
