@@ -1119,7 +1119,10 @@ impl BrokerInner {
         // Reserve the whole batch's seq range up front (we hold the broker Mutex), then seal WITHOUT mutating
         // the terminal — which is what lets the seal fan out across cores (2026-07-01 bench: the per-record
         // seal inside this lock was the broker's throughput ceiling, with NEGATIVE multi-producer scaling).
-        let start_seq = self.src.reserve_seqs(u64::try_from(records.len()).unwrap_or(u64::MAX));
+        let partition_id = u64::try_from(partition).expect("partition index must be non-negative");
+        let start_seq = self
+            .src
+            .reserve_seqs(partition_id, u64::try_from(records.len()).unwrap_or(u64::MAX));
         let sealed = seal_batch(&self.src, topic, partition, base, start_seq, records)?;
         self.partition_log(topic, partition)?.append_durable(&sealed)
     }
