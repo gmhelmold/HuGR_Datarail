@@ -103,7 +103,8 @@ fn take_varint_bytes(reader: &mut Reader) -> io::Result<Option<Vec<u8>>> {
     if len < 0 {
         return Ok(None);
     }
-    let n = usize::try_from(len).map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "bad varint length"))?;
+    let n = usize::try_from(len)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "bad varint length"))?;
     Ok(Some(reader.take(n)?.to_vec()))
 }
 
@@ -116,7 +117,11 @@ pub fn crc32c(data: &[u8]) -> u32 {
     for &byte in data {
         crc ^= u32::from(byte);
         for _ in 0..8 {
-            crc = if crc & 1 != 0 { (crc >> 1) ^ 0x82F6_3B78 } else { crc >> 1 };
+            crc = if crc & 1 != 0 {
+                (crc >> 1) ^ 0x82F6_3B78
+            } else {
+                crc >> 1
+            };
         }
     }
     !crc
@@ -189,8 +194,10 @@ pub fn parse_record_batch(blob: &[u8]) -> Result<ParsedRecords, ParseError> {
     while !reader.is_empty() {
         let _offset = reader.int64()?; // baseOffset (v2) / offset (legacy)
         let length = reader.int32()?; // batchLength (v2) / messageSize (legacy)
-        // batchLength counts from HERE (partitionLeaderEpoch) to the end of the batch's records.
-        let batch_end = reader.position().saturating_add(usize::try_from(length).unwrap_or(0));
+                                      // batchLength counts from HERE (partitionLeaderEpoch) to the end of the batch's records.
+        let batch_end = reader
+            .position()
+            .saturating_add(usize::try_from(length).unwrap_or(0));
         let _crc_or_epoch = reader.uint32()?; // partitionLeaderEpoch (v2) / crc (legacy)
         let magic = reader.int8()?;
         match magic {
@@ -238,7 +245,10 @@ fn parse_v2_records(
     let crc_start = reader.position();
     let crc_end = batch_end.min(blob.len());
     let covered = blob.get(crc_start..crc_end).ok_or_else(|| {
-        io::Error::new(io::ErrorKind::InvalidData, "record batch length runs past the buffer")
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "record batch length runs past the buffer",
+        )
     })?;
     let computed = crc32c(covered);
     if computed != stored_crc {
@@ -324,10 +334,17 @@ fn parse_records_into(reader: &mut Reader, n: usize, values: &mut Vec<Vec<u8>>) 
 /// but it is a CRC-32 over the IEEE polynomial — a DIFFERENT algorithm from the CRC-32C the codec implements and
 /// that v2 batches use. Validating it would need a second, distinct CRC just for a legacy fallback path; that is
 /// not worth the code, so legacy CRCs are intentionally left unvalidated (only v2 batches are CRC-checked).
-fn parse_legacy_message(reader: &mut Reader, magic: i8, values: &mut Vec<Vec<u8>>) -> io::Result<()> {
+fn parse_legacy_message(
+    reader: &mut Reader,
+    magic: i8,
+    values: &mut Vec<Vec<u8>>,
+) -> io::Result<()> {
     let attributes = reader.int8()?;
     if attributes & 0x07 != 0 {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "compressed messages not supported"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "compressed messages not supported",
+        ));
     }
     if magic >= 1 {
         let _timestamp = reader.int64()?;
@@ -379,7 +396,12 @@ pub fn parse_produce(reader: &mut Reader, version: i16) -> io::Result<ProducedRe
                 },
                 None => (Vec::new(), None, None),
             };
-            partitions.push(ProducedPartition { partition, values, eos, error_code });
+            partitions.push(ProducedPartition {
+                partition,
+                values,
+                eos,
+                error_code,
+            });
         }
         topics.push(ProducedTopic { name, partitions });
     }
@@ -516,7 +538,11 @@ mod tests {
         let bytes = req.into_bytes();
         let mut reader = crate::codec::Reader::new(&bytes);
         let req = parse_produce(&mut reader, 7).expect("bounded parse, no over-alloc");
-        assert!(req.topics.len() < 1024, "count must be bounded by remaining bytes, got {}", req.topics.len());
+        assert!(
+            req.topics.len() < 1024,
+            "count must be bounded by remaining bytes, got {}",
+            req.topics.len()
+        );
     }
 
     /// Build a v2 `RecordBatch` with an explicit idempotent-producer identity (`producer_id` / `base_sequence`).
@@ -563,14 +589,24 @@ mod tests {
         let blob = legacy_messageset(b"evt:legacy");
         let parsed = parse_record_batch(&blob).expect("parse legacy");
         assert_eq!(parsed.values, vec![b"evt:legacy".to_vec()]);
-        assert_eq!(parsed.eos, None, "legacy MessageSet has no idempotent identity");
+        assert_eq!(
+            parsed.eos, None,
+            "legacy MessageSet has no idempotent identity"
+        );
     }
 
     #[test]
     fn record_batch_values_extracted() {
         let blob = record_batch(&[b"evt:one", b"evt:two", b"evt:three"]);
         let parsed = parse_record_batch(&blob).expect("parse");
-        assert_eq!(parsed.values, vec![b"evt:one".to_vec(), b"evt:two".to_vec(), b"evt:three".to_vec()]);
+        assert_eq!(
+            parsed.values,
+            vec![
+                b"evt:one".to_vec(),
+                b"evt:two".to_vec(),
+                b"evt:three".to_vec()
+            ]
+        );
         // The reference helper uses producer_id = -1 (non-idempotent) → no EOS coord.
         assert_eq!(parsed.eos, None);
     }
@@ -593,7 +629,11 @@ mod tests {
         // And the embedded CRC matches a recompute over the covered range (attributes..records).
         // Layout: base_offset(8) batch_len(4) ple(4) magic(1) crc(4) then the covered bytes.
         let crc_stored = u32::from_be_bytes([blob[17], blob[18], blob[19], blob[20]]);
-        assert_eq!(crc_stored, super::crc32c(&blob[21..]), "stored CRC-32C covers attributes..records");
+        assert_eq!(
+            crc_stored,
+            super::crc32c(&blob[21..]),
+            "stored CRC-32C covers attributes..records"
+        );
     }
 
     #[test]
@@ -601,7 +641,9 @@ mod tests {
         let blob = idempotent_batch(7, 100, &[b"evt:a", b"evt:b", b"evt:c"]);
         let parsed = parse_record_batch(&blob).expect("parse idempotent");
         assert_eq!(parsed.values.len(), 3);
-        let eos = parsed.eos.expect("an idempotent batch must surface its coordinate");
+        let eos = parsed
+            .eos
+            .expect("an idempotent batch must surface its coordinate");
         assert_eq!(eos.producer_id, 7);
         assert_eq!(eos.base_sequence, 100);
         assert_eq!(eos.count, 3, "the sequence range is [100, 103)");
@@ -633,11 +675,20 @@ mod tests {
 
         let mut reader = crate::codec::Reader::new(&bytes);
         let parsed = parse_produce(&mut reader, 7).expect("parse produce");
-        assert_eq!(parsed.acks, 1, "acks is parsed and threaded out of parse_produce");
+        assert_eq!(
+            parsed.acks, 1,
+            "acks is parsed and threaded out of parse_produce"
+        );
         assert_eq!(parsed.topics.len(), 1);
         assert_eq!(parsed.topics[0].name, "events");
-        assert_eq!(parsed.topics[0].partitions[0].values, vec![b"evt:a".to_vec(), b"evt:b".to_vec()]);
-        assert_eq!(parsed.topics[0].partitions[0].error_code, None, "a valid CRC → no parse error");
+        assert_eq!(
+            parsed.topics[0].partitions[0].values,
+            vec![b"evt:a".to_vec(), b"evt:b".to_vec()]
+        );
+        assert_eq!(
+            parsed.topics[0].partitions[0].error_code, None,
+            "a valid CRC → no parse error"
+        );
     }
 
     #[test]
@@ -688,7 +739,11 @@ mod tests {
     fn parse_gzip_compressed_v2_batch_decompresses_and_yields_values() {
         // Reuse the proven uncompressed builder, then GZIP its records section (header is 61 bytes; attributes at
         // [21..23]; batchLength at [8..12] counts from offset 12) and re-frame as a gzip (codec 1) batch.
-        let values = vec![b"evt:gz-a".to_vec(), b"evt:gz-b".to_vec(), b"evt:gz-c".to_vec()];
+        let values = vec![
+            b"evt:gz-a".to_vec(),
+            b"evt:gz-b".to_vec(),
+            b"evt:gz-c".to_vec(),
+        ];
         let plain = super::build_record_batch(0, &values);
         let compressed = gzip(&plain[61..]);
         let mut out = plain[..61].to_vec();
@@ -702,7 +757,10 @@ mod tests {
         out[17..21].copy_from_slice(&crc.to_be_bytes());
 
         let parsed = parse_record_batch(&out).expect("gzip batch parses");
-        assert_eq!(parsed.values, values, "gzip records were decompressed + parsed in order");
+        assert_eq!(
+            parsed.values, values,
+            "gzip records were decompressed + parsed in order"
+        );
     }
 
     #[test]
@@ -710,13 +768,18 @@ mod tests {
     fn gzip_decompress_rejects_a_zip_bomb_past_the_cap() {
         let big = vec![0u8; 1 << 20]; // 1 MiB of zeros → tiny gzip, expands past a small cap
         let compressed = gzip(&big);
-        let err = crate::compress::decompress(1, &compressed, 1024).expect_err("must reject over-cap");
+        let err =
+            crate::compress::decompress(1, &compressed, 1024).expect_err("must reject over-cap");
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
     }
 
     /// Re-frame a plain (uncompressed) v2 batch as a compressed one: set the attributes codec + swap in the
     /// compressed records blob + fix batchLength. Header is 61 bytes; attributes at [21..23]; batchLength at [8..12].
-    #[cfg(any(feature = "compression-lz4", feature = "compression-zstd", feature = "compression-snappy"))]
+    #[cfg(any(
+        feature = "compression-lz4",
+        feature = "compression-zstd",
+        feature = "compression-snappy"
+    ))]
     fn reframe_compressed(plain: &[u8], codec: i16, compressed: &[u8]) -> Vec<u8> {
         let mut out = plain[..61].to_vec();
         out[21..23].copy_from_slice(&codec.to_be_bytes());
@@ -740,7 +803,10 @@ mod tests {
         enc.write_all(&plain[61..]).expect("lz4 write");
         let compressed = enc.finish().expect("lz4 finish");
         let out = reframe_compressed(&plain, 3, &compressed);
-        assert_eq!(parse_record_batch(&out).expect("lz4 batch parses").values, values);
+        assert_eq!(
+            parse_record_batch(&out).expect("lz4 batch parses").values,
+            values
+        );
     }
 
     #[test]
@@ -751,7 +817,10 @@ mod tests {
         let values = vec![b"evt:zs-a".to_vec(), b"evt:zs-b".to_vec()];
         let plain = super::build_record_batch(0, &values);
         let records = &plain[61..];
-        assert!(records.len() < 256, "test payload fits a 1-byte content size");
+        assert!(
+            records.len() < 256,
+            "test payload fits a 1-byte content size"
+        );
         let mut zstd = vec![0x28, 0xB5, 0x2F, 0xFD]; // zstd magic
         zstd.push(0x20); // FHD: single-segment → 1-byte Frame_Content_Size, no checksum/dict
         zstd.push(u8::try_from(records.len()).expect("fits")); // content size
@@ -759,7 +828,10 @@ mod tests {
         zstd.extend_from_slice(&block_header.to_le_bytes()[..3]);
         zstd.extend_from_slice(records);
         let out = reframe_compressed(&plain, 4, &zstd);
-        assert_eq!(parse_record_batch(&out).expect("zstd batch parses").values, values);
+        assert_eq!(
+            parse_record_batch(&out).expect("zstd batch parses").values,
+            values
+        );
     }
 
     #[test]
@@ -768,14 +840,21 @@ mod tests {
         // Kafka snappy = xerial/snappy-java framing: magic + version + compat-version + [block_len][raw-snappy block].
         let values = vec![b"evt:sn-a".to_vec(), b"evt:sn-b".to_vec()];
         let plain = super::build_record_batch(0, &values);
-        let block = snap::raw::Encoder::new().compress_vec(&plain[61..]).expect("snappy compress");
+        let block = snap::raw::Encoder::new()
+            .compress_vec(&plain[61..])
+            .expect("snappy compress");
         let mut xerial = vec![0x82u8, b'S', b'N', b'A', b'P', b'P', b'Y', 0x00];
         xerial.extend_from_slice(&1i32.to_be_bytes()); // version
         xerial.extend_from_slice(&1i32.to_be_bytes()); // compatible version
         xerial.extend_from_slice(&i32::try_from(block.len()).expect("len").to_be_bytes());
         xerial.extend_from_slice(&block);
         let out = reframe_compressed(&plain, 2, &xerial);
-        assert_eq!(parse_record_batch(&out).expect("snappy batch parses").values, values);
+        assert_eq!(
+            parse_record_batch(&out)
+                .expect("snappy batch parses")
+                .values,
+            values
+        );
     }
 
     #[test]
@@ -784,8 +863,15 @@ mod tests {
         // Some producers send a single RAW snappy block (no xerial framing) — unsnappy must accept that too.
         let values = vec![b"evt:raw-a".to_vec(), b"evt:raw-b".to_vec()];
         let plain = super::build_record_batch(0, &values);
-        let raw = snap::raw::Encoder::new().compress_vec(&plain[61..]).expect("snappy compress");
+        let raw = snap::raw::Encoder::new()
+            .compress_vec(&plain[61..])
+            .expect("snappy compress");
         let out = reframe_compressed(&plain, 2, &raw);
-        assert_eq!(parse_record_batch(&out).expect("raw snappy batch parses").values, values);
+        assert_eq!(
+            parse_record_batch(&out)
+                .expect("raw snappy batch parses")
+                .values,
+            values
+        );
     }
 }
