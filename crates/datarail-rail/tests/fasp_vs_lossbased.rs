@@ -253,7 +253,9 @@ fn fasp_delay_cc_holds_throughput_where_loss_based_collapses() {
     let loss_rates = [0.05, 0.15, 0.30];
 
     let mut ratios = Vec::new();
-    println!("\nFASP delay-based vs loss-based AIMD (TCP-Reno) over a 100ms / 64-cofre BDP WAN link:");
+    println!(
+        "\nFASP delay-based vs loss-based AIMD (TCP-Reno) over a 100ms / 64-cofre BDP WAN link:"
+    );
     println!(
         "  {:>6}  {:>14}  {:>14}  {:>10}",
         "loss", "delay-goodput", "loss-goodput", "ratio"
@@ -337,7 +339,10 @@ fn delay_based_window_is_loss_invariant_while_loss_based_is_not() {
         }
     }
 
-    assert!(loss_events > 0, "the seeded schedule must produce loss events");
+    assert!(
+        loss_events > 0,
+        "the seeded schedule must produce loss events"
+    );
     assert!(
         (delay.window() - delay_window_before).abs() < f64::EPSILON,
         "delay-based window must be invariant to loss (was {delay_window_before}, now {} after {loss_events} losses)",
