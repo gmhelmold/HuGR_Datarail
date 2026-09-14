@@ -50,13 +50,24 @@ impl MoverEngine for DatarailEngine {
 
     fn ship(&mut self, records: &[Vec<u8>]) -> Vec<Vec<u8>> {
         let mut src = SourceTerminal::new(config(), contract(), SRC_SEED);
-        let mut dst = DestTerminal::new(config(), contract(), verifying_key(&SRC_SEED), DST_SEED, DST_X);
+        let mut dst = DestTerminal::new(
+            config(),
+            contract(),
+            verifying_key(&SRC_SEED),
+            DST_SEED,
+            DST_X,
+        );
         let mut rail = LoopbackSubstrate::new();
         let refs: Vec<&[u8]> = records.iter().map(Vec::as_slice).collect();
-        let cofre = src.board(&refs, b"fairness-1").expect("board conforming workload");
+        let cofre = src
+            .board(&refs, b"fairness-1")
+            .expect("board conforming workload");
         rail.send(&cofre).expect("send");
         let received = rail.recv().expect("recv").expect("a cofre");
-        assert_eq!(dst.offload(&received).expect("offload"), Disposition::Delivered);
+        assert_eq!(
+            dst.offload(&received).expect("offload"),
+            Disposition::Delivered
+        );
         dst.sink().committed().to_vec()
     }
 }
@@ -78,7 +89,10 @@ impl MoverEngine for PassthroughEngine {
 /// The anti-cheat gate: every engine must deliver **byte-equal** to `workload`. Returns the names of any
 /// engines that failed (empty ⇒ all correct, timing may proceed). Cold-starts each engine (fresh `ship`).
 #[must_use]
-pub fn byte_equal_failures(engines: &mut [&mut dyn MoverEngine], workload: &[Vec<u8>]) -> Vec<&'static str> {
+pub fn byte_equal_failures(
+    engines: &mut [&mut dyn MoverEngine],
+    workload: &[Vec<u8>],
+) -> Vec<&'static str> {
     let mut failed = Vec::new();
     for engine in engines.iter_mut() {
         if engine.ship(workload).as_slice() != workload {
@@ -91,12 +105,16 @@ pub fn byte_equal_failures(engines: &mut [&mut dyn MoverEngine], workload: &[Vec
 /// A conforming workload of `n` records (`evt:` prefix, distinct payloads) for the rig.
 #[must_use]
 pub fn workload(n: usize) -> Vec<Vec<u8>> {
-    (0..n).map(|i| format!("evt:record-{i:05}").into_bytes()).collect()
+    (0..n)
+        .map(|i| format!("evt:record-{i:05}").into_bytes())
+        .collect()
 }
 
 /// Print the fairness-rig status for the bench binary (DIRECTIONAL; the real bake-off needs external engines).
 pub fn report() {
-    println!("\nAC-10 fairness rig (byte-equal-before-timing; real competitor engines = external, #20):");
+    println!(
+        "\nAC-10 fairness rig (byte-equal-before-timing; real competitor engines = external, #20):"
+    );
     let work = workload(64);
     let mut datarail = DatarailEngine;
     let mut baseline = PassthroughEngine;
@@ -107,8 +125,12 @@ pub fn report() {
     } else {
         println!("  byte-equal gate: FAIL for {failures:?} — timing withheld (anti-cheat)");
     }
-    println!("  (datarail adds sealing + delivery proof + effectively-once over the raw-copy baseline;");
-    println!("   the fair comparison vs Kafka/MFT/Fivetran per corner needs those real engines — #20.)");
+    println!(
+        "  (datarail adds sealing + delivery proof + effectively-once over the raw-copy baseline;"
+    );
+    println!(
+        "   the fair comparison vs Kafka/MFT/Fivetran per corner needs those real engines — #20.)"
+    );
 }
 
 #[cfg(test)]
@@ -122,7 +144,10 @@ mod tests {
         let mut baseline = PassthroughEngine;
         let mut engines: [&mut dyn MoverEngine; 2] = [&mut datarail, &mut baseline];
         let failures = byte_equal_failures(&mut engines, &work);
-        assert!(failures.is_empty(), "correct engines deliver byte-equal: {failures:?}");
+        assert!(
+            failures.is_empty(),
+            "correct engines deliver byte-equal: {failures:?}"
+        );
     }
 
     #[test]
@@ -144,6 +169,10 @@ mod tests {
         let mut cheat = DropsLast;
         let mut engines: [&mut dyn MoverEngine; 1] = [&mut cheat];
         let failures = byte_equal_failures(&mut engines, &work);
-        assert_eq!(failures, vec!["cheater (drops the last record)"], "the gate disqualifies a wrong engine");
+        assert_eq!(
+            failures,
+            vec!["cheater (drops the last record)"],
+            "the gate disqualifies a wrong engine"
+        );
     }
 }
