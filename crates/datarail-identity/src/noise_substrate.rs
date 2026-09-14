@@ -235,7 +235,11 @@ fn read_framed(rx: &mut TcpStream) -> std::io::Result<Vec<u8>> {
 }
 
 /// Fill `buf` exactly, tolerating short reads / timeouts until `deadline`.
-fn read_exact_deadline(rx: &mut TcpStream, buf: &mut [u8], deadline: Instant) -> std::io::Result<()> {
+fn read_exact_deadline(
+    rx: &mut TcpStream,
+    buf: &mut [u8],
+    deadline: Instant,
+) -> std::io::Result<()> {
     let mut filled = 0;
     while filled < buf.len() {
         match rx.read(&mut buf[filled..]) {
@@ -317,7 +321,10 @@ mod tests {
         src.send(&cofre).expect("send through noise channel");
         let got = server.join().expect("server thread");
 
-        assert_eq!(got, expected, "the sealed cofre survived the Noise_KK channel byte-for-byte");
+        assert_eq!(
+            got, expected,
+            "the sealed cofre survived the Noise_KK channel byte-for-byte"
+        );
     }
 
     #[test]
@@ -340,6 +347,9 @@ mod tests {
         // The initiator may error here, or succeed locally while the responder rejects — either way the
         // responder side must report failure (mutual auth held).
         let _ = NoiseSubstrate::initiator(cs, &a, b_pub);
-        assert!(server.join().expect("server thread"), "responder must reject an impostor-pinned peer");
+        assert!(
+            server.join().expect("server thread"),
+            "responder must reject an impostor-pinned peer"
+        );
     }
 }
