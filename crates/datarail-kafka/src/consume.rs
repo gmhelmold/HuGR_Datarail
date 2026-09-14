@@ -69,7 +69,11 @@ pub fn parse_fetch(reader: &mut Reader, version: i16) -> io::Result<Vec<FetchTop
                 let _log_start_offset = reader.int64()?;
             }
             let max_bytes = reader.int32()?;
-            partitions.push(FetchPartition { partition, fetch_offset, max_bytes });
+            partitions.push(FetchPartition {
+                partition,
+                fetch_offset,
+                max_bytes,
+            });
         }
         topics.push(FetchTopic { name, partitions });
     }
@@ -174,7 +178,10 @@ pub fn parse_list_offsets(reader: &mut Reader, version: i16) -> io::Result<Vec<L
             if version == 0 {
                 let _max_num_offsets = reader.int32()?;
             }
-            partitions.push(ListOffsetPartition { partition, timestamp });
+            partitions.push(ListOffsetPartition {
+                partition,
+                timestamp,
+            });
         }
         topics.push(ListOffsetTopic { name, partitions });
     }
@@ -201,7 +208,11 @@ pub struct ListOffsetTopicResult {
 
 /// Build a `ListOffsets` response (response header v0 + body) at `version`.
 #[must_use]
-pub fn list_offsets_response(version: i16, correlation_id: i32, topics: &[ListOffsetTopicResult]) -> Vec<u8> {
+pub fn list_offsets_response(
+    version: i16,
+    correlation_id: i32,
+    topics: &[ListOffsetTopicResult],
+) -> Vec<u8> {
     let mut w = Writer::new();
     write_response_header(&mut w, correlation_id, false);
     if version >= 2 {
@@ -230,8 +241,8 @@ pub fn list_offsets_response(version: i16, correlation_id: i32, topics: &[ListOf
 #[cfg(test)]
 mod tests {
     use super::{
-        fetch_response, list_offsets_response, parse_fetch, parse_list_offsets, FetchPartitionResult,
-        FetchTopicResult, ListOffsetResult, ListOffsetTopicResult,
+        fetch_response, list_offsets_response, parse_fetch, parse_list_offsets,
+        FetchPartitionResult, FetchTopicResult, ListOffsetResult, ListOffsetTopicResult,
     };
     use crate::codec::{Reader, Writer};
 
@@ -311,8 +322,16 @@ mod tests {
         assert_eq!(r.int16().unwrap(), 0, "error_code");
         assert_eq!(r.int64().unwrap(), 3, "high_watermark");
         assert_eq!(r.int64().unwrap(), 3, "last_stable_offset (v4)");
-        assert_eq!(r.int32().unwrap(), 0, "aborted_transactions must be an EMPTY array (0), never null (-1)");
-        assert_eq!(r.int32().unwrap(), 0, "empty record set must be size 0, never -1");
+        assert_eq!(
+            r.int32().unwrap(),
+            0,
+            "aborted_transactions must be an EMPTY array (0), never null (-1)"
+        );
+        assert_eq!(
+            r.int32().unwrap(),
+            0,
+            "empty record set must be size 0, never -1"
+        );
     }
 
     #[test]
@@ -334,7 +353,10 @@ mod tests {
             9,
             &[ListOffsetTopicResult {
                 name: "events".to_owned(),
-                partitions: vec![ListOffsetResult { partition: 0, offset: 42 }],
+                partitions: vec![ListOffsetResult {
+                    partition: 0,
+                    offset: 42,
+                }],
             }],
         );
         assert!(!resp.is_empty());
