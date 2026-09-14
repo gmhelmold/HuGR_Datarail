@@ -72,7 +72,12 @@ pub trait TxnSink {
     ///
     /// # Errors
     /// Propagates the underlying sink/transaction error (the transaction is rolled back).
-    fn commit_at_seq(&mut self, records: &[Vec<u8>], stream: &[u8], watermark: u64) -> io::Result<()>;
+    fn commit_at_seq(
+        &mut self,
+        records: &[Vec<u8>],
+        stream: &[u8],
+        watermark: u64,
+    ) -> io::Result<()>;
 
     /// The sink's durable watermark for `stream` (`0` if none) — where to resume after a restart. No external
     /// dedup state is consulted: the sink IS the dedup store.
@@ -182,7 +187,10 @@ impl LineFileSink {
     /// # Errors
     /// [`io::Error`] if the file cannot be opened.
     pub fn create(path: impl AsRef<Path>) -> io::Result<Self> {
-        let file = std::fs::OpenOptions::new().create(true).append(true).open(path)?;
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)?;
         Ok(Self { file })
     }
 }
@@ -231,12 +239,22 @@ mod tests {
         let mut src = LineFileSource::open(&in_path).expect("open source");
         let mut sink = LineFileSink::create(&out_path).expect("create sink");
         while let Some(recs) = src.next_batch().expect("next") {
-            assert_eq!(recs, vec![b"evt:one".to_vec(), b"evt:two".to_vec(), b"evt:three".to_vec()]);
+            assert_eq!(
+                recs,
+                vec![
+                    b"evt:one".to_vec(),
+                    b"evt:two".to_vec(),
+                    b"evt:three".to_vec()
+                ]
+            );
             sink.commit(&recs).expect("commit");
         }
 
         let out = std::fs::read(&out_path).expect("read output");
-        assert_eq!(out, b"evt:one\nevt:two\nevt:three\n", "records land as lines, in order");
+        assert_eq!(
+            out, b"evt:one\nevt:two\nevt:three\n",
+            "records land as lines, in order"
+        );
         let _ = std::fs::remove_file(&in_path);
         let _ = std::fs::remove_file(&out_path);
     }

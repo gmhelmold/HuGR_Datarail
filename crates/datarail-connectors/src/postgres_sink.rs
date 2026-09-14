@@ -105,7 +105,8 @@ impl PostgresSink {
 
     /// Land `records` via `COPY <table>(<column>) FROM STDIN` (text format). Caller guarantees non-empty + NUL-free.
     fn copy_in(&mut self, records: &[Vec<u8>]) -> io::Result<()> {
-        let mut query = format!("COPY \"{}\" (\"{}\") FROM STDIN", self.table, self.column).into_bytes();
+        let mut query =
+            format!("COPY \"{}\" (\"{}\") FROM STDIN", self.table, self.column).into_bytes();
         query.push(0); // simple Query is a NUL-terminated C string
         send(&mut self.stream, b'Q', &query)?;
         // Wait for CopyInResponse ('G'). On an error, DRAIN to ReadyForQuery ('Z') before returning — the wire
@@ -136,7 +137,7 @@ impl PostgresSink {
             send(&mut self.stream, b'd', &frame)?;
         }
         send(&mut self.stream, b'c', &[])?; // CopyDone
-        // Drain to ReadyForQuery ('Z'), capturing any ErrorResponse (do not early-return — see above).
+                                            // Drain to ReadyForQuery ('Z'), capturing any ErrorResponse (do not early-return — see above).
         let mut err: Option<io::Error> = None;
         loop {
             let (tag, body) = read_msg(&mut self.stream)?;
@@ -161,11 +162,20 @@ impl PostgresSink {
     /// grown and re-presents a *larger* batch (e.g. a whole file read as one batch) — only the suffix past the
     /// stored watermark is landed. Re-presenting an identical or smaller prefix is a clean no-op. This is what
     /// makes the land idempotent at record granularity, not merely batch granularity.
-    fn txn_body(&mut self, stream_hex: &str, lock_key: i64, watermark: i64, records: &[Vec<u8>]) -> io::Result<()> {
+    fn txn_body(
+        &mut self,
+        stream_hex: &str,
+        lock_key: i64,
+        watermark: i64,
+        records: &[Vec<u8>],
+    ) -> io::Result<()> {
         // Serialize concurrent commit_at on the same stream — `SELECT … FOR UPDATE` locks NO row when the
         // watermark row does not exist yet, so two first-batches would both land (audit C2). A transaction-scoped
         // advisory lock has no such gap; it is released on COMMIT/ROLLBACK.
-        query_simple(&mut self.stream, &format!("SELECT pg_advisory_xact_lock({lock_key})"))?;
+        query_simple(
+            &mut self.stream,
+            &format!("SELECT pg_advisory_xact_lock({lock_key})"),
+        )?;
         let current = read_watermark(&mut self.stream, stream_hex, true)?; // FOR UPDATE
         if current.is_some_and(|c| c >= watermark) {
             return Ok(()); // already fully landed (idempotent replay) — the COMMIT makes it a clean no-op
@@ -173,7 +183,8 @@ impl PostgresSink {
         // `base` = the landed-count BEFORE `records`. The stored watermark, when present and above `base`, marks
         // how many of `records` already landed; land only the rest. (`base >= 0` because watermark is cumulative
         // and `records` is a suffix of it; `already` is clamped into `[0, records.len())` since `current < watermark`.)
-        let len_i64 = i64::try_from(records.len()).map_err(|_| invalid("batch too large to land atomically"))?;
+        let len_i64 = i64::try_from(records.len())
+            .map_err(|_| invalid("batch too large to land atomically"))?;
         let base = watermark - len_i64;
         let already = usize::try_from(current.map_or(0, |c| (c - base).max(0))).unwrap_or(0);
         let to_land = records.get(already..).unwrap_or(&[]);
@@ -193,8 +204,17 @@ impl PostgresSink {
     /// otherwise land ALL `records` and set the watermark to `watermark`. No partial-suffix landing — the source
     /// guarantees whole-batch, in-order presentation, so the stored watermark is always a clean batch boundary
     /// (`KAFKA-EOS-DESIGN.md`).
-    fn txn_body_seq(&mut self, stream_hex: &str, lock_key: i64, watermark: i64, records: &[Vec<u8>]) -> io::Result<()> {
-        query_simple(&mut self.stream, &format!("SELECT pg_advisory_xact_lock({lock_key})"))?;
+    fn txn_body_seq(
+        &mut self,
+        stream_hex: &str,
+        lock_key: i64,
+        watermark: i64,
+        records: &[Vec<u8>],
+    ) -> io::Result<()> {
+        query_simple(
+            &mut self.stream,
+            &format!("SELECT pg_advisory_xact_lock({lock_key})"),
+        )?;
         let current = read_watermark(&mut self.stream, stream_hex, true)?; // FOR UPDATE
         if current.is_some_and(|c| c >= watermark) {
             return Ok(()); // already processed (idempotent retry / replay) — clean no-op on COMMIT
@@ -221,14 +241,22 @@ fn ensure_watermark_table(stream: &mut (impl Read + Write)) -> io::Result<()> {
 /// must NOT collapse (a `0` watermark is a real, distinct value; treating "absent" as `0` silently loses the
 /// first batch / re-lands, audit H3/M4). A present-but-unparsable value is a hard error. `stream_hex` is a hex
 /// string (no injection); the seq is an integer. `for_update` locks the row inside a transaction.
-fn read_watermark(stream: &mut (impl Read + Write), stream_hex: &str, for_update: bool) -> io::Result<Option<i64>> {
+fn read_watermark(
+    stream: &mut (impl Read + Write),
+    stream_hex: &str,
+    for_update: bool,
+) -> io::Result<Option<i64>> {
     let lock = if for_update { " FOR UPDATE" } else { "" };
     let sql = format!("SELECT seq FROM datarail_watermark WHERE stream = '\\x{stream_hex}'{lock}");
     match query_simple(stream, &sql)? {
         None => Ok(None),
         Some(bytes) => {
-            let text = std::str::from_utf8(&bytes).map_err(|_| invalid("non-utf8 watermark value"))?;
-            let seq = text.trim().parse::<i64>().map_err(|_| invalid("unparsable watermark value"))?;
+            let text =
+                std::str::from_utf8(&bytes).map_err(|_| invalid("non-utf8 watermark value"))?;
+            let seq = text
+                .trim()
+                .parse::<i64>()
+                .map_err(|_| invalid("unparsable watermark value"))?;
             Ok(Some(seq))
         }
     }
@@ -238,7 +266,11 @@ fn read_watermark(stream: &mut (impl Read + Write), stream_hex: &str, for_update
 /// the same stream even when its watermark row does not exist yet (a `SELECT … FOR UPDATE` locks no missing row).
 fn lock_key_for(stream: &[u8]) -> i64 {
     let h = md5(stream);
-    i64::from_le_bytes(h.get(0..8).and_then(|b| <[u8; 8]>::try_from(b).ok()).unwrap_or([0u8; 8]))
+    i64::from_le_bytes(
+        h.get(0..8)
+            .and_then(|b| <[u8; 8]>::try_from(b).ok())
+            .unwrap_or([0u8; 8]),
+    )
 }
 
 /// Run a simple `Query`, draining to `ReadyForQuery`. Returns the first field of the first `DataRow` (if any) —
@@ -278,11 +310,17 @@ fn query_simple(stream: &mut (impl Read + Write), sql: &str) -> io::Result<Optio
 /// Parse the first field of a `DataRow` body: `int16 field-count`, then per field `[int32 len][bytes]` (`len -1`
 /// = NULL → empty). Returns `None` if the body is too short to hold the declared first field (a malformed row).
 fn parse_first_field(body: &[u8]) -> Option<Vec<u8>> {
-    let nfields = body.get(0..2).and_then(|b| <[u8; 2]>::try_from(b).ok()).map(i16::from_be_bytes)?;
+    let nfields = body
+        .get(0..2)
+        .and_then(|b| <[u8; 2]>::try_from(b).ok())
+        .map(i16::from_be_bytes)?;
     if nfields < 1 {
         return Some(Vec::new()); // a row with zero fields → treat as empty
     }
-    let len = body.get(2..6).and_then(|b| <[u8; 4]>::try_from(b).ok()).map(i32::from_be_bytes)?;
+    let len = body
+        .get(2..6)
+        .and_then(|b| <[u8; 4]>::try_from(b).ok())
+        .map(i32::from_be_bytes)?;
     if len < 0 {
         return Some(Vec::new()); // NULL field
     }
@@ -301,7 +339,9 @@ impl crate::Sink for PostgresSink {
         // The COPY text format cannot represent a NUL byte; reject up front with a clear error rather than
         // letting a single crafted record fail mid-COPY (which would also leave the connection mid-stream).
         if records.iter().any(|r| r.contains(&0)) {
-            return Err(invalid("record contains a NUL byte, which the Postgres text COPY format cannot carry"));
+            return Err(invalid(
+                "record contains a NUL byte, which the Postgres text COPY format cannot carry",
+            ));
         }
         self.copy_in(records)
     }
@@ -312,7 +352,9 @@ impl crate::TxnSink for PostgresSink {
     /// in ONE Postgres transaction. Idempotent — a replayed batch (`watermark <= stored`) is a committed no-op.
     fn commit_at(&mut self, records: &[Vec<u8>], stream: &[u8], watermark: u64) -> io::Result<()> {
         if records.iter().any(|r| r.contains(&0)) {
-            return Err(invalid("record contains a NUL byte, which the Postgres text COPY format cannot carry"));
+            return Err(invalid(
+                "record contains a NUL byte, which the Postgres text COPY format cannot carry",
+            ));
         }
         let stream_hex = hex(stream);
         let wm = i64::try_from(watermark).map_err(|_| invalid("watermark exceeds i64::MAX"))?;
@@ -332,9 +374,16 @@ impl crate::TxnSink for PostgresSink {
     /// Kafka-EOS sequence model (see `KAFKA-EOS-DESIGN.md`): land `records` + advance the per-substream watermark
     /// to `watermark` (the producer's `base_sequence + count`) in ONE transaction; a replayed/retried batch
     /// (`watermark <= stored`) is a committed no-op. Whole-batch atomic — no partial-suffix landing.
-    fn commit_at_seq(&mut self, records: &[Vec<u8>], stream: &[u8], watermark: u64) -> io::Result<()> {
+    fn commit_at_seq(
+        &mut self,
+        records: &[Vec<u8>],
+        stream: &[u8],
+        watermark: u64,
+    ) -> io::Result<()> {
         if records.iter().any(|r| r.contains(&0)) {
-            return Err(invalid("record contains a NUL byte, which the Postgres text COPY format cannot carry"));
+            return Err(invalid(
+                "record contains a NUL byte, which the Postgres text COPY format cannot carry",
+            ));
         }
         let stream_hex = hex(stream);
         let wm = i64::try_from(watermark).map_err(|_| invalid("watermark exceeds i64::MAX"))?;
@@ -564,13 +613,21 @@ mod scram {
         let client_first = format!("n,,{client_first_bare}");
         // The PG SASLInitialResponse 'p' body is: mechanism name (NUL-terminated) + Int32 length of the SASL
         // initial-response data + the data itself. (Later SASLResponse 'p' messages carry the raw data alone.)
-        send(stream, b'p', &sasl_initial_response(client_first.as_bytes()))?;
+        send(
+            stream,
+            b'p',
+            &sasl_initial_response(client_first.as_bytes()),
+        )?;
 
         // --- server-first-message (AuthenticationSASLContinue, code 11) ---
         let server_first_bytes = read_sasl_message(stream, 11)?;
         let server_first = std::str::from_utf8(&server_first_bytes)
             .map_err(|_| invalid("SCRAM server-first-message is not valid UTF-8"))?;
-        let ServerFirst { nonce, salt, iterations } = parse_server_first(server_first, &client_nonce)?;
+        let ServerFirst {
+            nonce,
+            salt,
+            iterations,
+        } = parse_server_first(server_first, &client_nonce)?;
 
         // --- client-final-message ---
         // channel-binding `c=biws` is base64("n,,") — restates the gs2 header, proving it was not tampered with.
@@ -643,7 +700,9 @@ mod scram {
         match tag {
             b'R' => {
                 if read_be_i32(&body, 0)? != code {
-                    return Err(invalid("unexpected authentication message during SCRAM exchange"));
+                    return Err(invalid(
+                        "unexpected authentication message during SCRAM exchange",
+                    ));
                 }
                 Ok(body.get(4..).unwrap_or(&[]).to_vec())
             }
@@ -665,7 +724,11 @@ mod scram {
                 Some(b's') => salt_b64 = attr.get(2..),
                 Some(b'i') => iters = attr.get(2..),
                 // 'm' (mandatory extension) would appear before 'r'; RFC 5802 requires clients to fail on it.
-                Some(b'm') => return Err(invalid("SCRAM server requested an unsupported mandatory extension")),
+                Some(b'm') => {
+                    return Err(invalid(
+                        "SCRAM server requested an unsupported mandatory extension",
+                    ))
+                }
                 _ => {}
             }
         }
@@ -673,16 +736,29 @@ mod scram {
         if !nonce.starts_with(client_nonce) || nonce.len() == client_nonce.len() {
             // The full nonce MUST be our client nonce with the server's part appended; a prefix mismatch (or
             // no server part at all) means we are not talking to the server we challenged. Abort.
-            return Err(invalid("SCRAM server nonce does not extend the client nonce"));
+            return Err(invalid(
+                "SCRAM server nonce does not extend the client nonce",
+            ));
         }
-        let salt_b64 = salt_b64.ok_or_else(|| invalid("SCRAM server-first-message missing salt"))?;
-        let salt = base64_decode(salt_b64).ok_or_else(|| invalid("SCRAM salt is not valid base64"))?;
-        let iters = iters.ok_or_else(|| invalid("SCRAM server-first-message missing iteration count"))?;
-        let iterations: u32 = iters.parse().map_err(|_| invalid("SCRAM iteration count is not a number"))?;
+        let salt_b64 =
+            salt_b64.ok_or_else(|| invalid("SCRAM server-first-message missing salt"))?;
+        let salt =
+            base64_decode(salt_b64).ok_or_else(|| invalid("SCRAM salt is not valid base64"))?;
+        let iters =
+            iters.ok_or_else(|| invalid("SCRAM server-first-message missing iteration count"))?;
+        let iterations: u32 = iters
+            .parse()
+            .map_err(|_| invalid("SCRAM iteration count is not a number"))?;
         if !(MIN_ITERATIONS..=MAX_ITERATIONS).contains(&iterations) {
-            return Err(invalid("SCRAM iteration count is out of the accepted range"));
+            return Err(invalid(
+                "SCRAM iteration count is out of the accepted range",
+            ));
         }
-        Ok(ServerFirst { nonce: nonce.to_owned(), salt, iterations })
+        Ok(ServerFirst {
+            nonce: nonce.to_owned(),
+            salt,
+            iterations,
+        })
     }
 
     /// Parse a `server-final-message`. Success form: `v=<ServerSignature-b64>`. An error form `e=<reason>`
@@ -699,7 +775,9 @@ mod scram {
                 ));
             }
         }
-        Err(invalid("SCRAM server-final-message missing ServerSignature"))
+        Err(invalid(
+            "SCRAM server-final-message missing ServerSignature",
+        ))
     }
 
     /// Build the body of a PG `SASLInitialResponse` frontend message (sent under tag `'p'`):
@@ -709,8 +787,8 @@ mod scram {
         let mut body = Vec::with_capacity(client_first.len() + 24);
         body.extend_from_slice(b"SCRAM-SHA-256");
         body.push(0); // NUL terminator for the mechanism name
-        // The length is bounded by the small client-first-message; the cast is safe for any real message and
-        // clamps a pathological one to i32::MAX rather than emitting a bogus negative length.
+                      // The length is bounded by the small client-first-message; the cast is safe for any real message and
+                      // clamps a pathological one to i32::MAX rather than emitting a bogus negative length.
         let len = i32::try_from(client_first.len()).unwrap_or(i32::MAX);
         body.extend_from_slice(&len.to_be_bytes());
         body.extend_from_slice(client_first);
@@ -792,7 +870,8 @@ mod scram {
     }
 
     /// Standard base64 alphabet (RFC 4648 §4).
-    const B64_ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    const B64_ALPHABET: &[u8; 64] =
+        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
     /// Encode `data` as standard base64 with `=` padding (RFC 4648 §4).
     fn base64_encode(data: &[u8]) -> String {
@@ -804,8 +883,16 @@ mod scram {
             let n = (u32::from(b0) << 16) | (u32::from(b1) << 8) | u32::from(b2);
             out.push(B64_ALPHABET[(n >> 18) as usize & 0x3f]);
             out.push(B64_ALPHABET[(n >> 12) as usize & 0x3f]);
-            out.push(if chunk.len() > 1 { B64_ALPHABET[(n >> 6) as usize & 0x3f] } else { b'=' });
-            out.push(if chunk.len() > 2 { B64_ALPHABET[n as usize & 0x3f] } else { b'=' });
+            out.push(if chunk.len() > 1 {
+                B64_ALPHABET[(n >> 6) as usize & 0x3f]
+            } else {
+                b'='
+            });
+            out.push(if chunk.len() > 2 {
+                B64_ALPHABET[n as usize & 0x3f]
+            } else {
+                b'='
+            });
         }
         // Every output byte is ASCII from the alphabet or '=' — UTF-8 by construction.
         String::from_utf8(out).unwrap_or_default()
@@ -866,7 +953,8 @@ mod scram {
     mod tests {
         use super::{
             base64_decode, base64_encode, constant_time_eq, hmac_sha256, parse_server_final,
-            parse_server_first, pbkdf2_hmac_sha256, require_plain_scram, sasl_initial_response, sha256,
+            parse_server_first, pbkdf2_hmac_sha256, require_plain_scram, sasl_initial_response,
+            sha256,
         };
         use std::fmt::Write;
 
@@ -924,10 +1012,22 @@ mod scram {
 
         #[test]
         fn base64_rejects_garbage() {
-            assert!(base64_decode("****").is_none(), "non-alphabet bytes rejected");
-            assert!(base64_decode("A").is_none(), "a single leftover char cannot decode");
-            assert!(base64_decode("Zm9vYg=x").is_none(), "non-'=' after the first pad byte rejected");
-            assert!(base64_decode("Zg=x").is_none(), "data after padding rejected");
+            assert!(
+                base64_decode("****").is_none(),
+                "non-alphabet bytes rejected"
+            );
+            assert!(
+                base64_decode("A").is_none(),
+                "a single leftover char cannot decode"
+            );
+            assert!(
+                base64_decode("Zm9vYg=x").is_none(),
+                "non-'=' after the first pad byte rejected"
+            );
+            assert!(
+                base64_decode("Zg=x").is_none(),
+                "data after padding rejected"
+            );
             // Lax padding (2 symbols with no explicit '=') still decodes to the 1 byte it encodes.
             assert_eq!(base64_decode("Zg").expect("lax"), b"f");
         }
@@ -973,8 +1073,14 @@ mod scram {
 
             let client_key = hmac_sha256(&salted, b"Client Key");
             let stored_key = sha256(&client_key);
-            assert_eq!(hex(&client_key), "a60fc923d67e8644a92d16b96eda5ef4656b0c725c484374be25535576996e8b");
-            assert_eq!(hex(&stored_key), "586e5df283e6dceb5c3e791d8b8528ec191e664045ce971792e2e6b5bb13e2a6");
+            assert_eq!(
+                hex(&client_key),
+                "a60fc923d67e8644a92d16b96eda5ef4656b0c725c484374be25535576996e8b"
+            );
+            assert_eq!(
+                hex(&stored_key),
+                "586e5df283e6dceb5c3e791d8b8528ec191e664045ce971792e2e6b5bb13e2a6"
+            );
             let auth_message = format!(
                 "{RFC7677_CLIENT_FIRST_BARE},{RFC7677_SERVER_FIRST},{RFC7677_CLIENT_FINAL_NO_PROOF}"
             );
@@ -987,7 +1093,10 @@ mod scram {
             let server_signature = hmac_sha256(&server_key, auth_message.as_bytes());
 
             // Base64 values quoted directly in RFC 7677 §3.
-            assert_eq!(super::base64_encode(&client_proof), "dHzbZapWIk4jUhN+Ute9ytag9zjfMHgsqmmiz7AndVQ=");
+            assert_eq!(
+                super::base64_encode(&client_proof),
+                "dHzbZapWIk4jUhN+Ute9ytag9zjfMHgsqmmiz7AndVQ="
+            );
             assert_eq!(
                 super::base64_encode(&server_signature),
                 "6rriTRBi23WpRR/wtup+mMhUZUn/dB5nLTJRsjl95G4="
@@ -1009,7 +1118,10 @@ mod scram {
         fn parse_server_first_accepts_and_extracts() {
             let parsed =
                 parse_server_first(RFC7677_SERVER_FIRST, "rOprNGfwEbeRWgbNEkqO").expect("parse");
-            assert_eq!(parsed.nonce, "rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0");
+            assert_eq!(
+                parsed.nonce,
+                "rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0"
+            );
             assert_eq!(parsed.iterations, 4096);
             assert_eq!(super::base64_encode(&parsed.salt), RFC7677_SALT_B64);
         }
@@ -1025,7 +1137,10 @@ mod scram {
 
         #[test]
         fn parse_server_final_extracts_signature_and_surfaces_errors() {
-            assert_eq!(parse_server_final("v=6rriTRBi23WpRR/wtup+mMhUZUn/dB5nLTJRsjl95G4=").expect("v"), "6rriTRBi23WpRR/wtup+mMhUZUn/dB5nLTJRsjl95G4=");
+            assert_eq!(
+                parse_server_final("v=6rriTRBi23WpRR/wtup+mMhUZUn/dB5nLTJRsjl95G4=").expect("v"),
+                "6rriTRBi23WpRR/wtup+mMhUZUn/dB5nLTJRsjl95G4="
+            );
             assert!(parse_server_final("e=invalid-proof").is_err());
             assert!(parse_server_final("x=nothing").is_err());
         }
@@ -1045,11 +1160,17 @@ mod scram {
         fn require_plain_scram_rejects_plus_only() {
             // NUL-separated list terminated by an empty element (as PG frames it).
             let plus_only = b"SCRAM-SHA-256-PLUS\0\0";
-            assert!(require_plain_scram(plus_only).is_err(), "PLUS-only must be rejected (no TLS binding)");
+            assert!(
+                require_plain_scram(plus_only).is_err(),
+                "PLUS-only must be rejected (no TLS binding)"
+            );
             let with_plain = b"SCRAM-SHA-256\0\0";
             assert!(require_plain_scram(with_plain).is_ok());
             let both = b"SCRAM-SHA-256-PLUS\0SCRAM-SHA-256\0\0";
-            assert!(require_plain_scram(both).is_ok(), "plain offered alongside PLUS is accepted");
+            assert!(
+                require_plain_scram(both).is_ok(),
+                "plain offered alongside PLUS is accepted"
+            );
         }
 
         #[test]
@@ -1155,15 +1276,69 @@ const MD5_SHIFTS: [u32; 64] = [
 
 /// Per-round additive constants: `floor(2^32 * abs(sin(i + 1)))`.
 const MD5_K: [u32; 64] = [
-    0xd76a_a478, 0xe8c7_b756, 0x2420_70db, 0xc1bd_ceee, 0xf57c_0faf, 0x4787_c62a, 0xa830_4613,
-    0xfd46_9501, 0x6980_98d8, 0x8b44_f7af, 0xffff_5bb1, 0x895c_d7be, 0x6b90_1122, 0xfd98_7193,
-    0xa679_438e, 0x49b4_0821, 0xf61e_2562, 0xc040_b340, 0x265e_5a51, 0xe9b6_c7aa, 0xd62f_105d,
-    0x0244_1453, 0xd8a1_e681, 0xe7d3_fbc8, 0x21e1_cde6, 0xc337_07d6, 0xf4d5_0d87, 0x455a_14ed,
-    0xa9e3_e905, 0xfcef_a3f8, 0x676f_02d9, 0x8d2a_4c8a, 0xfffa_3942, 0x8771_f681, 0x6d9d_6122,
-    0xfde5_380c, 0xa4be_ea44, 0x4bde_cfa9, 0xf6bb_4b60, 0xbebf_bc70, 0x289b_7ec6, 0xeaa1_27fa,
-    0xd4ef_3085, 0x0488_1d05, 0xd9d4_d039, 0xe6db_99e5, 0x1fa2_7cf8, 0xc4ac_5665, 0xf429_2244,
-    0x432a_ff97, 0xab94_23a7, 0xfc93_a039, 0x655b_59c3, 0x8f0c_cc92, 0xffef_f47d, 0x8584_5dd1,
-    0x6fa8_7e4f, 0xfe2c_e6e0, 0xa301_4314, 0x4e08_11a1, 0xf753_7e82, 0xbd3a_f235, 0x2ad7_d2bb,
+    0xd76a_a478,
+    0xe8c7_b756,
+    0x2420_70db,
+    0xc1bd_ceee,
+    0xf57c_0faf,
+    0x4787_c62a,
+    0xa830_4613,
+    0xfd46_9501,
+    0x6980_98d8,
+    0x8b44_f7af,
+    0xffff_5bb1,
+    0x895c_d7be,
+    0x6b90_1122,
+    0xfd98_7193,
+    0xa679_438e,
+    0x49b4_0821,
+    0xf61e_2562,
+    0xc040_b340,
+    0x265e_5a51,
+    0xe9b6_c7aa,
+    0xd62f_105d,
+    0x0244_1453,
+    0xd8a1_e681,
+    0xe7d3_fbc8,
+    0x21e1_cde6,
+    0xc337_07d6,
+    0xf4d5_0d87,
+    0x455a_14ed,
+    0xa9e3_e905,
+    0xfcef_a3f8,
+    0x676f_02d9,
+    0x8d2a_4c8a,
+    0xfffa_3942,
+    0x8771_f681,
+    0x6d9d_6122,
+    0xfde5_380c,
+    0xa4be_ea44,
+    0x4bde_cfa9,
+    0xf6bb_4b60,
+    0xbebf_bc70,
+    0x289b_7ec6,
+    0xeaa1_27fa,
+    0xd4ef_3085,
+    0x0488_1d05,
+    0xd9d4_d039,
+    0xe6db_99e5,
+    0x1fa2_7cf8,
+    0xc4ac_5665,
+    0xf429_2244,
+    0x432a_ff97,
+    0xab94_23a7,
+    0xfc93_a039,
+    0x655b_59c3,
+    0x8f0c_cc92,
+    0xffef_f47d,
+    0x8584_5dd1,
+    0x6fa8_7e4f,
+    0xfe2c_e6e0,
+    0xa301_4314,
+    0x4e08_11a1,
+    0xf753_7e82,
+    0xbd3a_f235,
+    0x2ad7_d2bb,
     0xeb86_d391,
 ];
 
@@ -1208,10 +1383,7 @@ fn md5(input: &[u8]) -> [u8; 16] {
             let shift = MD5_SHIFTS.get(round).copied().unwrap_or(0);
             let wval = words.get(word_idx).copied().unwrap_or(0);
 
-            mix = mix
-                .wrapping_add(aa)
-                .wrapping_add(kval)
-                .wrapping_add(wval);
+            mix = mix.wrapping_add(aa).wrapping_add(kval).wrapping_add(wval);
             aa = dd;
             dd = cc;
             cc = bb;
