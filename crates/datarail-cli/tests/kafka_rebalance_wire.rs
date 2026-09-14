@@ -66,11 +66,22 @@ fn join_group(stream: &mut TcpStream, group: &str) -> JoinResult {
         members.push(r.string().unwrap());
         let _meta = r.bytes().unwrap();
     }
-    JoinResult { generation, leader, member_id, members }
+    JoinResult {
+        generation,
+        leader,
+        member_id,
+        members,
+    }
 }
 
 /// `SyncGroup`; `assignments` is non-empty only for the leader. Returns this member's assignment bytes.
-fn sync_group(stream: &mut TcpStream, group: &str, generation: i32, member_id: &str, assignments: &[(String, Vec<u8>)]) -> Vec<u8> {
+fn sync_group(
+    stream: &mut TcpStream,
+    group: &str,
+    generation: i32,
+    member_id: &str,
+    assignments: &[(String, Vec<u8>)],
+) -> Vec<u8> {
     let mut w = req_header(14, 2, 2);
     w.string(group);
     w.int32(generation);
@@ -122,7 +133,10 @@ fn run_member(group: &str) -> (String, i32, String, Vec<u8>, i16) {
     let is_leader = jr.member_id == jr.leader;
     // The leader assigns each member its OWN id as opaque bytes (the broker only routes assignment bytes).
     let assignments: Vec<(String, Vec<u8>)> = if is_leader {
-        jr.members.iter().map(|m| (m.clone(), m.clone().into_bytes())).collect()
+        jr.members
+            .iter()
+            .map(|m| (m.clone(), m.clone().into_bytes()))
+            .collect()
     } else {
         Vec::new()
     };
@@ -196,7 +210,10 @@ fn two_consumers_join_one_generation_and_get_assignments() {
     assert_eq!(a_gen, b_gen, "both members share ONE generation");
     assert_eq!(a_leader, b_leader, "both agree on the leader");
     assert_ne!(a_id, b_id, "distinct member ids");
-    assert!(a_leader == a_id || a_leader == b_id, "the leader is one of the two members");
+    assert!(
+        a_leader == a_id || a_leader == b_id,
+        "the leader is one of the two members"
+    );
     // Each member received the leader's assignment for ITSELF (its own id bytes) — assignments were routed.
     assert_eq!(a_assign, a_id.as_bytes(), "member a got its assignment");
     assert_eq!(b_assign, b_id.as_bytes(), "member b got its assignment");

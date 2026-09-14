@@ -1,17 +1,23 @@
 //! FULL-CHAIN transactional-EOS proof: spawn the real `datarail kafka-broker` and drive a TRANSACTIONAL producer
 //! through `InitProducerId`(`transactional_id`) → `AddPartitionsToTxn` → (transactional) Produce → `EndTxn`. Asserts:
-//! buffered records are INVISIBLE before commit; a COMMIT makes them visible ATOMICALLY across two partitions; an
+//! buffered records are INVISIBLE before commit; a successful COMMIT makes them visible across two partitions; an
 //! ABORT discards them (never visible). `KAFKA-TXN-DESIGN.md` (buffer-until-commit model). Runs in normal CI.
 
 use std::io::{Read, Write};
-use std::net::TcpStream;
+use std::net::{TcpListener, TcpStream};
 use std::process::{Child, Command};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use datarail_kafka::codec::{Reader, Writer};
 use datarail_kafka::produce::parse_record_batch;
 
-const PORT: u16 = 19_097;
+static BROKER_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+fn free_port() -> u16 {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind ephemeral port");
+    listener.local_addr().expect("read ephemeral port").port()
+}
 
 fn req_header(api_key: i16, api_version: i16, correlation_id: i32) -> Writer {
     let mut w = Writer::new();
@@ -91,7 +97,14 @@ fn init_producer_id(resp: &[u8]) -> (i64, i16) {
     (pid, epoch)
 }
 
-fn add_partitions_req(correlation_id: i32, tid: &str, pid: i64, epoch: i16, topic: &str, partitions: &[i32]) -> Vec<u8> {
+fn add_partitions_req(
+    correlation_id: i32,
+    tid: &str,
+    pid: i64,
+    epoch: i16,
+    topic: &str,
+    partitions: &[i32],
+) -> Vec<u8> {
     let mut w = req_header(24, 1, correlation_id);
     w.string(tid);
     w.int64(pid);
@@ -105,7 +118,14 @@ fn add_partitions_req(correlation_id: i32, tid: &str, pid: i64, epoch: i16, topi
     Writer::frame(&w.into_bytes())
 }
 
-fn produce_txn_req(correlation_id: i32, topic: &str, partition: i32, pid: i64, epoch: i16, values: &[&[u8]]) -> Vec<u8> {
+fn produce_txn_req(
+    correlation_id: i32,
+    topic: &str,
+    partition: i32,
+    pid: i64,
+    epoch: i16,
+    values: &[&[u8]],
+) -> Vec<u8> {
     let batch = txn_record_batch(values, pid, epoch, 0);
     let mut w = req_header(0, 7, correlation_id);
     w.nullable_string(Some("tx-1")); // transactional_id on the Produce request (v3+)
@@ -126,6 +146,62 @@ fn end_txn_req(correlation_id: i32, tid: &str, pid: i64, epoch: i16, committed: 
     w.int16(epoch);
     w.int8(i8::from(committed));
     Writer::frame(&w.into_bytes())
+}
+
+fn add_offsets_req(correlation_id: i32, tid: &str, pid: i64, epoch: i16, group: &str) -> Vec<u8> {
+    let mut w = req_header(25, 1, correlation_id);
+    w.string(tid);
+    w.int64(pid);
+    w.int16(epoch);
+    w.string(group);
+    Writer::frame(&w.into_bytes())
+}
+
+fn txn_offset_commit_req(
+    correlation_id: i32,
+    tid: &str,
+    group: &str,
+    pid: i64,
+    epoch: i16,
+) -> Vec<u8> {
+    let mut w = req_header(28, 1, correlation_id);
+    w.string(tid);
+    w.string(group);
+    w.int64(pid);
+    w.int16(epoch);
+    w.int32(1);
+    w.string("events");
+    w.int32(2);
+    for partition in 0..2 {
+        w.int32(partition);
+        w.int64(i64::from(partition + 7));
+        w.nullable_string(None);
+    }
+    Writer::frame(&w.into_bytes())
+}
+
+fn offset_fetch_req(correlation_id: i32, group: &str, partition: i32) -> Vec<u8> {
+    let mut w = req_header(9, 2, correlation_id);
+    w.string(group);
+    w.int32(1);
+    w.string("events");
+    w.int32(1);
+    w.int32(partition);
+    Writer::frame(&w.into_bytes())
+}
+
+fn fetched_offset(resp: &[u8]) -> i64 {
+    let mut r = Reader::new(resp);
+    let _corr = r.int32().unwrap();
+    assert_eq!(r.int32().unwrap(), 1);
+    let _topic = r.string().unwrap();
+    assert_eq!(r.int32().unwrap(), 1);
+    let _partition = r.int32().unwrap();
+    let offset = r.int64().unwrap();
+    let _metadata = r.nullable_string().unwrap();
+    assert_eq!(r.int16().unwrap(), 0, "partition error NONE");
+    assert_eq!(r.int16().unwrap(), 0, "top-level error NONE");
+    offset
 }
 
 fn fetch_req(correlation_id: i32, topic: &str, partition: i32, fetch_offset: i64) -> Vec<u8> {
@@ -158,7 +234,11 @@ fn fetch_values(resp: &[u8]) -> Vec<Vec<u8>> {
     let _aborted = r.int32().unwrap();
     match r.nullable_bytes().unwrap() {
         None => Vec::new(),
-        Some(blob) => parse_record_batch(&blob).expect("parse fetched batch").values,
+        Some(blob) => {
+            parse_record_batch(&blob)
+                .expect("parse fetched batch")
+                .values
+        }
     }
 }
 
@@ -170,8 +250,270 @@ impl Drop for Daemon {
     }
 }
 
+fn spawn_fault_broker(
+    rail: &std::path::Path,
+    data_dir: &std::path::Path,
+    port: u16,
+    fault_point: Option<u8>,
+    journal_cut: Option<usize>,
+    journal_sync_error: bool,
+) -> (Daemon, TcpStream) {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_datarail"));
+    command.args([
+        "kafka-broker",
+        rail.to_str().unwrap(),
+        "--listen",
+        &format!("127.0.0.1:{port}"),
+        "--advertised",
+        "127.0.0.1",
+        "--data-dir",
+        data_dir.to_str().unwrap(),
+        "--partitions",
+        "2",
+    ]);
+    if let Some(point) = fault_point {
+        command
+            .env("DATARAIL_TXN_FAULT_POINT", point.to_string())
+            .env("DATARAIL_TXN_FAULT_ABORT", "1");
+    }
+    if let Some(cut) = journal_cut {
+        command.env("DATARAIL_TXN_JOURNAL_CUT", format!("commit:{cut}"));
+    }
+    if journal_sync_error {
+        command.env("DATARAIL_TXN_JOURNAL_SYNC_ERROR", "commit");
+    }
+    let child = command.spawn().expect("spawn datarail kafka-broker");
+    let mut daemon = Daemon(child);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let stream = loop {
+        if let Ok(s) = TcpStream::connect(("127.0.0.1", port)) {
+            break s;
+        }
+        if let Ok(Some(status)) = daemon.0.try_wait() {
+            panic!("kafka-broker exited before listening: {status}");
+        }
+        assert!(Instant::now() < deadline, "broker never started");
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    (daemon, stream)
+}
+
+fn write_fault_rail(tag: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+    let rail =
+        std::env::temp_dir().join(format!("kafka-txn-fault-{tag}-{}.toml", std::process::id()));
+    std::fs::write(
+        &rail,
+        "[route]\n\
+         route_id = \"0x03030303030303030303030303030303\"\n\
+         stream_id = \"0x04040404040404040404040404040404\"\n\
+         aead = \"gcm-siv-256\"\n\
+         guarantee = \"exactly-once\"\n\
+         [onboarding]\nmax_record_len = 1024\nrequired_prefix = \"evt:\"\n\
+         [offloading]\nmax_record_len = 1024\nrequired_prefix = \"evt:\"\n\
+         [keys]\n\
+         source_seed = \"0x2222222222222222222222222222222222222222222222222222222222222222\"\n\
+         dest_seed = \"0x2222222222222222222222222222222222222222222222222222222222222222\"\n\
+         dest_x25519_secret = \"0x2222222222222222222222222222222222222222222222222222222222222222\"\n\
+         tenant_secret = \"0x2222222222222222222222222222222222222222222222222222222222222222\"\n",
+    )
+    .expect("write fault rail");
+    let data_dir =
+        std::env::temp_dir().join(format!("kafka-txn-fault-data-{tag}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&data_dir);
+    (rail, data_dir)
+}
+
+fn drive_faulted_commit(stream: &mut TcpStream) {
+    stream.write_all(&init_producer_id_req(1, "tx-1")).unwrap();
+    let (pid, epoch) = init_producer_id(&read_frame(stream));
+    stream
+        .write_all(&add_partitions_req(
+            2,
+            "tx-1",
+            pid,
+            epoch,
+            "events",
+            &[0, 1],
+        ))
+        .unwrap();
+    let _ = read_frame(stream);
+    for (correlation_id, partition, values) in [
+        (3, 0, vec![b"evt:fault-0".as_slice()]),
+        (4, 1, vec![b"evt:fault-1".as_slice()]),
+    ] {
+        stream
+            .write_all(&produce_txn_req(
+                correlation_id,
+                "events",
+                partition,
+                pid,
+                epoch,
+                &values,
+            ))
+            .unwrap();
+        let _ = read_frame(stream);
+    }
+    stream
+        .write_all(&add_offsets_req(5, "tx-1", pid, epoch, "fault-group"))
+        .unwrap();
+    let response_bytes = read_frame(stream);
+    let mut response = Reader::new(&response_bytes);
+    let _corr = response.int32().unwrap();
+    let _throttle = response.int32().unwrap();
+    assert_eq!(response.int16().unwrap(), 0, "AddOffsetsToTxn error NONE");
+    stream
+        .write_all(&txn_offset_commit_req(6, "tx-1", "fault-group", pid, epoch))
+        .unwrap();
+    let response_bytes = read_frame(stream);
+    let mut response = Reader::new(&response_bytes);
+    let _corr = response.int32().unwrap();
+    let _throttle = response.int32().unwrap();
+    assert_eq!(response.int32().unwrap(), 1);
+    let _topic = response.string().unwrap();
+    assert_eq!(response.int32().unwrap(), 2);
+    for _ in 0..2 {
+        let _partition = response.int32().unwrap();
+        assert_eq!(response.int16().unwrap(), 0, "TxnOffsetCommit error NONE");
+    }
+    stream
+        .write_all(&end_txn_req(7, "tx-1", pid, epoch, true))
+        .unwrap();
+    let mut byte = [0u8; 1];
+    let _ = stream.read(&mut byte);
+}
+
 #[test]
-fn transactional_commit_is_visible_atomically_and_abort_is_hidden() {
+fn process_crash_at_each_transaction_boundary_recovers_all_or_none() {
+    let _lock = BROKER_TEST_LOCK.lock().unwrap();
+    for point in 0..=6 {
+        let (rail, data_dir) = write_fault_rail(&point.to_string());
+        let port = free_port();
+        let (mut daemon, mut stream) =
+            spawn_fault_broker(&rail, &data_dir, port, Some(point), None, false);
+        drive_faulted_commit(&mut stream);
+        let status = daemon
+            .0
+            .wait()
+            .expect("wait for injected transaction crash");
+        assert!(!status.success(), "fault point {point} did not stop broker");
+
+        let (_daemon, mut stream) = spawn_fault_broker(&rail, &data_dir, port, None, None, false);
+        for partition in 0..2 {
+            stream
+                .write_all(&fetch_req(10 + partition, "events", partition, 0))
+                .unwrap();
+            let values = fetch_values(&read_frame(&mut stream));
+            if point == 5 {
+                assert_eq!(values, vec![format!("evt:fault-{partition}").into_bytes()]);
+            } else {
+                assert!(values.is_empty(), "fault point {point} left committed data");
+            }
+            stream
+                .write_all(&offset_fetch_req(20 + partition, "fault-group", partition))
+                .unwrap();
+            let offset = fetched_offset(&read_frame(&mut stream));
+            if point == 5 {
+                assert_eq!(offset, i64::from(partition + 7));
+            } else {
+                assert_eq!(offset, -1, "fault point {point} left committed offset");
+            }
+        }
+        let _ = std::fs::remove_file(&rail);
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+}
+
+#[test]
+fn process_crash_during_ambiguous_commit_write_recovers_all_or_none() {
+    let _lock = BROKER_TEST_LOCK.lock().unwrap();
+    // 0 and 64 are partial prefixes; usize::MAX writes the complete frame but crashes before fsync.
+    for cut in [0, 1, 16, 64, usize::MAX] {
+        let tag = format!("journal-cut-{cut}");
+        let (rail, data_dir) = write_fault_rail(&tag);
+        let port = free_port();
+        let (mut daemon, mut stream) =
+            spawn_fault_broker(&rail, &data_dir, port, None, Some(cut), false);
+        drive_faulted_commit(&mut stream);
+        let status = daemon
+            .0
+            .wait()
+            .expect("wait for ambiguous journal-write crash");
+        assert!(!status.success(), "journal cut {cut} did not stop broker");
+
+        let (_daemon, mut stream) = spawn_fault_broker(&rail, &data_dir, port, None, None, false);
+        for partition in 0..2 {
+            stream
+                .write_all(&fetch_req(10 + partition, "events", partition, 0))
+                .unwrap();
+            let values = fetch_values(&read_frame(&mut stream));
+            if cut == usize::MAX {
+                assert_eq!(values, vec![format!("evt:fault-{partition}").into_bytes()]);
+            } else {
+                assert!(
+                    values.is_empty(),
+                    "partial Commit left committed data at cut {cut}"
+                );
+            }
+            stream
+                .write_all(&offset_fetch_req(20 + partition, "fault-group", partition))
+                .unwrap();
+            let offset = fetched_offset(&read_frame(&mut stream));
+            if cut == usize::MAX {
+                assert_eq!(offset, i64::from(partition + 7));
+            } else {
+                assert_eq!(
+                    offset, -1,
+                    "partial Commit left committed offset at cut {cut}"
+                );
+            }
+        }
+        let _ = std::fs::remove_file(&rail);
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+}
+
+#[test]
+fn commit_sync_error_fail_stops_and_recovery_keeps_transaction_atomic() {
+    let _lock = BROKER_TEST_LOCK.lock().unwrap();
+    let tag = "journal-sync-error";
+    let (rail, data_dir) = write_fault_rail(tag);
+    let port = free_port();
+    let (mut daemon, mut stream) = spawn_fault_broker(&rail, &data_dir, port, None, None, true);
+    drive_faulted_commit(&mut stream);
+    let status = daemon.0.wait().expect("wait for ambiguous fsync failure");
+    assert!(
+        !status.success(),
+        "ambiguous fsync failure did not stop broker"
+    );
+
+    let (_daemon, mut stream) = spawn_fault_broker(&rail, &data_dir, port, None, None, false);
+    for partition in 0..2 {
+        stream
+            .write_all(&fetch_req(10 + partition, "events", partition, 0))
+            .unwrap();
+        assert_eq!(
+            fetch_values(&read_frame(&mut stream)),
+            vec![format!("evt:fault-{partition}").into_bytes()]
+        );
+        stream
+            .write_all(&offset_fetch_req(20 + partition, "fault-group", partition))
+            .unwrap();
+        assert_eq!(
+            fetched_offset(&read_frame(&mut stream)),
+            i64::from(partition + 7)
+        );
+    }
+    let _ = std::fs::remove_file(&rail);
+    let _ = std::fs::remove_dir_all(&data_dir);
+}
+
+#[test]
+fn transactional_commit_is_visible_after_success_and_abort_is_hidden() {
+    let _lock = BROKER_TEST_LOCK.lock().unwrap();
+    let port = free_port();
     let rail = std::env::temp_dir().join(format!("kafka-txn-{}.toml", std::process::id()));
     std::fs::write(
         &rail,
@@ -192,97 +534,144 @@ fn transactional_commit_is_visible_atomically_and_abort_is_hidden() {
     let data_dir = std::env::temp_dir().join(format!("kafka-txn-data-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&data_dir);
 
-    let child = Command::new(env!("CARGO_BIN_EXE_datarail"))
-        .args([
-            "kafka-broker",
-            rail.to_str().unwrap(),
-            "--listen",
-            &format!("127.0.0.1:{PORT}"),
-            "--advertised",
-            "127.0.0.1",
-            "--data-dir",
-            data_dir.to_str().unwrap(),
-            "--partitions",
-            "2",
-        ])
-        .spawn()
-        .expect("spawn datarail kafka-broker");
-    let _daemon = Daemon(child);
-    let mut stream = {
-        let deadline = Instant::now() + Duration::from_secs(10);
-        loop {
-            if let Ok(s) = TcpStream::connect(("127.0.0.1", PORT)) {
-                break s;
-            }
-            assert!(Instant::now() < deadline, "broker never started");
-            std::thread::sleep(Duration::from_millis(100));
-        }
-    };
-    stream.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    let (_daemon, mut stream) = spawn_fault_broker(&rail, &data_dir, port, None, None, false);
 
-    // --- a transactional producer, COMMIT path ---
-    stream.write_all(&init_producer_id_req(1, "tx-1")).unwrap();
-    let (pid, epoch) = init_producer_id(&read_frame(&mut stream));
-
-    stream.write_all(&add_partitions_req(2, "tx-1", pid, epoch, "events", &[0, 1])).unwrap();
-    let _ = read_frame(&mut stream);
-
-    // Produce transactional batches to BOTH partitions (buffered, not yet visible).
-    stream.write_all(&produce_txn_req(3, "events", 0, pid, epoch, &[b"evt:p0a", b"evt:p0b"])).unwrap();
-    let _ = read_frame(&mut stream);
-    stream.write_all(&produce_txn_req(4, "events", 1, pid, epoch, &[b"evt:p1a"])).unwrap();
-    let _ = read_frame(&mut stream);
-
-    // Before commit: BOTH partitions are EMPTY (records buffered, invisible).
-    stream.write_all(&fetch_req(5, "events", 0, 0)).unwrap();
-    assert!(fetch_values(&read_frame(&mut stream)).is_empty(), "p0 invisible before commit");
-    stream.write_all(&fetch_req(6, "events", 1, 0)).unwrap();
-    assert!(fetch_values(&read_frame(&mut stream)).is_empty(), "p1 invisible before commit");
-
-    // COMMIT → both partitions become visible atomically.
-    stream.write_all(&end_txn_req(7, "tx-1", pid, epoch, true)).unwrap();
-    let _ = read_frame(&mut stream);
-    stream.write_all(&fetch_req(8, "events", 0, 0)).unwrap();
-    assert_eq!(fetch_values(&read_frame(&mut stream)), vec![b"evt:p0a".to_vec(), b"evt:p0b".to_vec()], "p0 visible after commit");
-    stream.write_all(&fetch_req(9, "events", 1, 0)).unwrap();
-    assert_eq!(fetch_values(&read_frame(&mut stream)), vec![b"evt:p1a".to_vec()], "p1 visible after commit (atomic)");
-
-    // --- a second transaction, ABORT path (re-init bumps the epoch) ---
-    stream.write_all(&init_producer_id_req(10, "tx-1")).unwrap();
-    let (pid2, epoch2) = init_producer_id(&read_frame(&mut stream));
-    stream.write_all(&add_partitions_req(11, "tx-1", pid2, epoch2, "events", &[0])).unwrap();
-    let _ = read_frame(&mut stream);
-    stream.write_all(&produce_txn_req(12, "events", 0, pid2, epoch2, &[b"evt:doomed"])).unwrap();
-    let _ = read_frame(&mut stream);
-    // ABORT → the doomed record is discarded.
-    stream.write_all(&end_txn_req(13, "tx-1", pid2, epoch2, false)).unwrap();
-    let _ = read_frame(&mut stream);
-    // p0 still shows ONLY the committed records — the aborted one never appears.
-    stream.write_all(&fetch_req(14, "events", 0, 0)).unwrap();
-    assert_eq!(
-        fetch_values(&read_frame(&mut stream)),
-        vec![b"evt:p0a".to_vec(), b"evt:p0b".to_vec()],
-        "aborted record is never visible"
-    );
-
-    // --- ZOMBIE FENCE (audit CRITICAL): a stale-epoch Produce must NOT be committed ---
-    stream.write_all(&init_producer_id_req(15, "tx-1")).unwrap();
-    let (pid3, epoch3) = init_producer_id(&read_frame(&mut stream)); // epoch bumped again; pid2/epoch2 now fenced
-    stream.write_all(&add_partitions_req(16, "tx-1", pid3, epoch3, "events", &[0])).unwrap();
-    let _ = read_frame(&mut stream);
-    // A legit record at the CURRENT epoch.
-    stream.write_all(&produce_txn_req(17, "events", 0, pid3, epoch3, &[b"evt:legit"])).unwrap();
-    let _ = read_frame(&mut stream);
-    // A ZOMBIE record at the OLD (fenced) epoch — must be rejected, never buffered.
-    stream.write_all(&produce_txn_req(18, "events", 0, pid2, epoch2, &[b"evt:zombie"])).unwrap();
-    let _ = read_frame(&mut stream);
-    stream.write_all(&end_txn_req(19, "tx-1", pid3, epoch3, true)).unwrap();
-    let _ = read_frame(&mut stream);
-    stream.write_all(&fetch_req(20, "events", 0, 0)).unwrap();
-    let got = fetch_values(&read_frame(&mut stream));
-    assert!(got.contains(&b"evt:legit".to_vec()), "the current-epoch record committed");
-    assert!(!got.contains(&b"evt:zombie".to_vec()), "the fenced stale-epoch record was NEVER committed");
+    let _ = commit_transaction(&mut stream);
+    abort_and_fence_transaction(&mut stream);
 
     let _ = std::fs::remove_file(&rail);
     let _ = std::fs::remove_dir_all(&data_dir);
+}
+
+fn commit_transaction(stream: &mut TcpStream) -> (i64, i16) {
+    stream.write_all(&init_producer_id_req(1, "tx-1")).unwrap();
+    let (pid, epoch) = init_producer_id(&read_frame(stream));
+    stream
+        .write_all(&add_partitions_req(
+            2,
+            "tx-1",
+            pid,
+            epoch,
+            "events",
+            &[0, 1],
+        ))
+        .unwrap();
+    let _ = read_frame(stream);
+    for (correlation_id, partition, values) in [
+        (3, 0, vec![b"evt:p0a".as_slice(), b"evt:p0b".as_slice()]),
+        (4, 1, vec![b"evt:p1a".as_slice()]),
+    ] {
+        stream
+            .write_all(&produce_txn_req(
+                correlation_id,
+                "events",
+                partition,
+                pid,
+                epoch,
+                &values,
+            ))
+            .unwrap();
+        let _ = read_frame(stream);
+    }
+    for (correlation_id, partition) in [(5, 0), (6, 1)] {
+        stream
+            .write_all(&fetch_req(correlation_id, "events", partition, 0))
+            .unwrap();
+        assert!(
+            fetch_values(&read_frame(stream)).is_empty(),
+            "buffered record became visible"
+        );
+    }
+    stream
+        .write_all(&end_txn_req(7, "tx-1", pid, epoch, true))
+        .unwrap();
+    let _ = read_frame(stream);
+    stream.write_all(&fetch_req(8, "events", 0, 0)).unwrap();
+    assert_eq!(
+        fetch_values(&read_frame(stream)),
+        vec![b"evt:p0a".to_vec(), b"evt:p0b".to_vec()]
+    );
+    stream.write_all(&fetch_req(9, "events", 1, 0)).unwrap();
+    assert_eq!(fetch_values(&read_frame(stream)), vec![b"evt:p1a".to_vec()]);
+    (pid, epoch)
+}
+
+fn abort_and_fence_transaction(stream: &mut TcpStream) {
+    stream.write_all(&init_producer_id_req(10, "tx-1")).unwrap();
+    let (pid2, epoch2) = init_producer_id(&read_frame(stream));
+    stream
+        .write_all(&add_partitions_req(
+            11,
+            "tx-1",
+            pid2,
+            epoch2,
+            "events",
+            &[0],
+        ))
+        .unwrap();
+    let _ = read_frame(stream);
+    stream
+        .write_all(&produce_txn_req(
+            12,
+            "events",
+            0,
+            pid2,
+            epoch2,
+            &[b"evt:doomed"],
+        ))
+        .unwrap();
+    let _ = read_frame(stream);
+    stream
+        .write_all(&end_txn_req(13, "tx-1", pid2, epoch2, false))
+        .unwrap();
+    let _ = read_frame(stream);
+    stream.write_all(&fetch_req(14, "events", 0, 0)).unwrap();
+    assert_eq!(
+        fetch_values(&read_frame(stream)),
+        vec![b"evt:p0a".to_vec(), b"evt:p0b".to_vec()]
+    );
+
+    stream.write_all(&init_producer_id_req(15, "tx-1")).unwrap();
+    let (pid3, epoch3) = init_producer_id(&read_frame(stream));
+    stream
+        .write_all(&add_partitions_req(
+            16,
+            "tx-1",
+            pid3,
+            epoch3,
+            "events",
+            &[0],
+        ))
+        .unwrap();
+    let _ = read_frame(stream);
+    stream
+        .write_all(&produce_txn_req(
+            17,
+            "events",
+            0,
+            pid3,
+            epoch3,
+            &[b"evt:legit"],
+        ))
+        .unwrap();
+    let _ = read_frame(stream);
+    stream
+        .write_all(&produce_txn_req(
+            18,
+            "events",
+            0,
+            pid2,
+            epoch2,
+            &[b"evt:zombie"],
+        ))
+        .unwrap();
+    let _ = read_frame(stream);
+    stream
+        .write_all(&end_txn_req(19, "tx-1", pid3, epoch3, true))
+        .unwrap();
+    let _ = read_frame(stream);
+    stream.write_all(&fetch_req(20, "events", 0, 0)).unwrap();
+    let got = fetch_values(&read_frame(stream));
+    assert!(got.contains(&b"evt:legit".to_vec()));
+    assert!(!got.contains(&b"evt:zombie".to_vec()));
 }

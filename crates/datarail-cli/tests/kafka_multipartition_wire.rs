@@ -145,7 +145,11 @@ fn fetch_values(resp: &[u8]) -> Vec<Vec<u8>> {
     let _aborted = r.int32().unwrap();
     match r.nullable_bytes().unwrap() {
         None => Vec::new(),
-        Some(blob) => parse_record_batch(&blob).expect("parse fetched batch").values,
+        Some(blob) => {
+            parse_record_batch(&blob)
+                .expect("parse fetched batch")
+                .values
+        }
     }
 }
 
@@ -206,27 +210,47 @@ fn broker_advertises_and_serves_multiple_partitions_independently() {
             std::thread::sleep(Duration::from_millis(100));
         }
     };
-    stream.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
 
     // Metadata advertises 3 partitions for the topic.
     stream.write_all(&metadata_req(1, "events")).unwrap();
-    assert_eq!(metadata_partition_count(&read_frame(&mut stream)), 3, "broker advertises 3 partitions");
+    assert_eq!(
+        metadata_partition_count(&read_frame(&mut stream)),
+        3,
+        "broker advertises 3 partitions"
+    );
 
     // Produce to partition 2 ONLY.
-    stream.write_all(&produce_req(2, "events", 2, &[b"evt:p2a", b"evt:p2b"])).unwrap();
+    stream
+        .write_all(&produce_req(2, "events", 2, &[b"evt:p2a", b"evt:p2b"]))
+        .unwrap();
     let _ = read_frame(&mut stream);
 
     // Fetch partition 2 → the two records; partition 0 is an independent (empty) offset space.
     stream.write_all(&fetch_req(3, "events", 2, 0)).unwrap();
-    assert_eq!(fetch_values(&read_frame(&mut stream)), vec![b"evt:p2a".to_vec(), b"evt:p2b".to_vec()]);
+    assert_eq!(
+        fetch_values(&read_frame(&mut stream)),
+        vec![b"evt:p2a".to_vec(), b"evt:p2b".to_vec()]
+    );
     stream.write_all(&fetch_req(4, "events", 0, 0)).unwrap();
-    assert!(fetch_values(&read_frame(&mut stream)).is_empty(), "partition 0 is independent and empty");
+    assert!(
+        fetch_values(&read_frame(&mut stream)).is_empty(),
+        "partition 0 is independent and empty"
+    );
 
     // Produce to partition 0 → it has its OWN offset 0 (not continuing partition 2's).
-    stream.write_all(&produce_req(5, "events", 0, &[b"evt:p0a"])).unwrap();
+    stream
+        .write_all(&produce_req(5, "events", 0, &[b"evt:p0a"]))
+        .unwrap();
     let _ = read_frame(&mut stream);
     stream.write_all(&fetch_req(6, "events", 0, 0)).unwrap();
-    assert_eq!(fetch_values(&read_frame(&mut stream)), vec![b"evt:p0a".to_vec()], "partition 0 offset space is its own");
+    assert_eq!(
+        fetch_values(&read_frame(&mut stream)),
+        vec![b"evt:p0a".to_vec()],
+        "partition 0 offset space is its own"
+    );
 
     let _ = std::fs::remove_file(&rail);
     let _ = std::fs::remove_dir_all(&data_dir);
