@@ -229,7 +229,12 @@ impl Pairing {
         initiator_pk: [u8; STATIC_PUBLIC_LEN],
         responder_pk: [u8; STATIC_PUBLIC_LEN],
     ) -> Result<(Self, Vec<u8>), PairingError> {
-        Ok(Self::start(code, initiator_pk, responder_pk, Side::Initiator))
+        Ok(Self::start(
+            code,
+            initiator_pk,
+            responder_pk,
+            Side::Initiator,
+        ))
     }
 
     /// Start the **responder** side. Arguments mirror [`start_initiator`](Self::start_initiator) — both sides
@@ -243,7 +248,12 @@ impl Pairing {
         initiator_pk: [u8; STATIC_PUBLIC_LEN],
         responder_pk: [u8; STATIC_PUBLIC_LEN],
     ) -> Result<(Self, Vec<u8>), PairingError> {
-        Ok(Self::start(code, initiator_pk, responder_pk, Side::Responder))
+        Ok(Self::start(
+            code,
+            initiator_pk,
+            responder_pk,
+            Side::Responder,
+        ))
     }
 
     fn start(
@@ -451,7 +461,10 @@ mod tests {
         let key_i = init.confirm(&tag_r).expect("initiator should confirm");
         let key_r = resp.confirm(&tag_i).expect("responder should confirm");
 
-        assert_eq!(key_i, key_r, "matching code+identities must yield one secret");
+        assert_eq!(
+            key_i, key_r,
+            "matching code+identities must yield one secret"
+        );
         assert_ne!(key_i, [0u8; 32]);
         assert!(init.is_done() && resp.is_done());
     }
@@ -484,21 +497,27 @@ mod tests {
         // Failure 1 of MAX_ATTEMPTS (=3): two left.
         assert_eq!(
             ours.confirm(&peer_tag).unwrap_err(),
-            PairingError::ConfirmFailed { attempts_remaining: 2 }
+            PairingError::ConfirmFailed {
+                attempts_remaining: 2
+            }
         );
         assert!(!ours.is_burned());
 
         // Failure 2: one left.
         assert_eq!(
             ours.confirm(&peer_tag).unwrap_err(),
-            PairingError::ConfirmFailed { attempts_remaining: 1 }
+            PairingError::ConfirmFailed {
+                attempts_remaining: 1
+            }
         );
         assert!(!ours.is_burned());
 
         // Failure 3: budget hits zero and the code burns.
         assert_eq!(
             ours.confirm(&peer_tag).unwrap_err(),
-            PairingError::ConfirmFailed { attempts_remaining: 0 }
+            PairingError::ConfirmFailed {
+                attempts_remaining: 0
+            }
         );
         assert!(ours.is_burned());
 
@@ -537,7 +556,10 @@ mod tests {
         let code = ShortCode::from_bytes([0x01; 16]);
         let (mut init, _pake_i) = Pairing::start_initiator(&code, PK_I, PK_R).unwrap();
         // confirm before derive
-        assert_eq!(init.confirm(&[0u8; 32]).unwrap_err(), PairingError::WrongState);
+        assert_eq!(
+            init.confirm(&[0u8; 32]).unwrap_err(),
+            PairingError::WrongState
+        );
 
         let (_resp, pake_r) = Pairing::start_responder(&code, PK_I, PK_R).unwrap();
         init.derive(&pake_r).unwrap();
@@ -550,6 +572,9 @@ mod tests {
     fn malformed_peer_message_is_rejected() {
         let code = ShortCode::from_bytes([0x07; 16]);
         let (mut init, _pake_i) = Pairing::start_initiator(&code, PK_I, PK_R).unwrap();
-        assert_eq!(init.derive(b"too-short").unwrap_err(), PairingError::BadPeerMessage);
+        assert_eq!(
+            init.derive(b"too-short").unwrap_err(),
+            PairingError::BadPeerMessage
+        );
     }
 }
