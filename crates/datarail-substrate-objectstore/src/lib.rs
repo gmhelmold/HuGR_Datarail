@@ -198,9 +198,9 @@ impl Substrate for ObjectStoreSubstrate {
 /// Whether a stream directory has no remaining `*.cofre` objects (its delivered history is fully GC'd).
 fn stream_drained(dir: &Path) -> bool {
     match std::fs::read_dir(dir) {
-        Ok(entries) => !entries.flatten().any(|e| {
-            e.path().extension().is_some_and(|x| x == "cofre")
-        }),
+        Ok(entries) => !entries
+            .flatten()
+            .any(|e| e.path().extension().is_some_and(|x| x == "cofre")),
         Err(_) => false,
     }
 }
@@ -292,7 +292,10 @@ mod tests {
             );
             dst.ack(got.etiqueta.cofre_id).expect("ack + GC");
         }
-        assert!(dst.recv().expect("drain").is_none(), "bucket fully drained after GC");
+        assert!(
+            dst.recv().expect("drain").is_none(),
+            "bucket fully drained after GC"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -307,7 +310,10 @@ mod tests {
 
         let got = store.recv().expect("GET").expect("one cofre");
         assert_eq!(got, cofre);
-        assert!(store.recv().expect("drain").is_none(), "re-PUT produced exactly one object, not two");
+        assert!(
+            store.recv().expect("drain").is_none(),
+            "re-PUT produced exactly one object, not two"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -325,7 +331,10 @@ mod tests {
         // Without acking a, recv must advance to seq 1 (not redeliver seq 0).
         let b = store.recv().expect("GET 1").expect("cofre 1");
         assert_eq!(b, testsupport::cofre_seq(1));
-        assert!(store.recv().expect("drain").is_none(), "both delivered, none redelivered");
+        assert!(
+            store.recv().expect("drain").is_none(),
+            "both delivered, none redelivered"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -358,8 +367,15 @@ mod tests {
         // WP7 audit C1 fix: a FULLY-DRAINED stream reclaims its cursor too — bookkeeping returns to ZERO, not a
         // lingering per-stream entry. This is the truly-O(live-streams) bound (drained ≠ live), and it refutes the
         // audit's "cursors never removed" finding directly.
-        assert_eq!(store.bookkeeping_len(), 0, "drained stream ⇒ cursor GC'd too (O(LIVE streams), not lifetime)");
-        assert!(store.recv().expect("drain").is_none(), "bucket fully drained");
+        assert_eq!(
+            store.bookkeeping_len(),
+            0,
+            "drained stream ⇒ cursor GC'd too (O(LIVE streams), not lifetime)"
+        );
+        assert!(
+            store.recv().expect("drain").is_none(),
+            "bucket fully drained"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -381,15 +397,27 @@ mod tests {
         while let Some(c) = store.recv().expect("recv") {
             ids.push(c.etiqueta.cofre_id);
         }
-        assert_eq!(ids.len(), usize::try_from(N).expect("fits"), "all delivered");
+        assert_eq!(
+            ids.len(),
+            usize::try_from(N).expect("fits"),
+            "all delivered"
+        );
         // 1 stream cursor + N in-flight.
-        assert_eq!(store.bookkeeping_len(), 1 + ids.len(), "backlog ⇒ O(in-flight) bookkeeping");
+        assert_eq!(
+            store.bookkeeping_len(),
+            1 + ids.len(),
+            "backlog ⇒ O(in-flight) bookkeeping"
+        );
         // Ack everything → the in-flight map is released, and the now-fully-drained stream reclaims its cursor
         // too (WP7 audit C1 fix), so bookkeeping returns to ZERO — O(LIVE streams), and there are none left.
         for id in &ids {
             store.ack(*id).expect("ack");
         }
-        assert_eq!(store.bookkeeping_len(), 0, "ack reclaims in-flight AND the drained stream's cursor");
+        assert_eq!(
+            store.bookkeeping_len(),
+            0,
+            "ack reclaims in-flight AND the drained stream's cursor"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
