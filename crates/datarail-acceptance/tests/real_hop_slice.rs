@@ -38,7 +38,13 @@ fn source() -> SourceTerminal {
 }
 
 fn dest() -> DestTerminal {
-    DestTerminal::new(config(), contract(), verifying_key(&SOURCE_SEED), DEST_SEED, DEST_X_SECRET)
+    DestTerminal::new(
+        config(),
+        contract(),
+        verifying_key(&SOURCE_SEED),
+        DEST_SEED,
+        DEST_X_SECRET,
+    )
 }
 
 #[test]
@@ -56,8 +62,14 @@ fn vertical_slice_over_quic_hop_delivers() {
             break c;
         }
     };
-    assert_eq!(received, cofre, "the cofre survived the QUIC transport byte-for-byte");
-    assert_eq!(dst.offload(&received).expect("offload"), Disposition::Delivered);
+    assert_eq!(
+        received, cofre,
+        "the cofre survived the QUIC transport byte-for-byte"
+    );
+    assert_eq!(
+        dst.offload(&received).expect("offload"),
+        Disposition::Delivered
+    );
     rail.ack(received.etiqueta.cofre_id).expect("ack");
     assert_eq!(
         dst.sink().committed().to_vec(),
@@ -82,8 +94,14 @@ fn vertical_slice_over_shmem_hop_delivers() {
             break c;
         }
     };
-    assert_eq!(received, cofre, "the cofre survived the shared-memory ring byte-for-byte");
-    assert_eq!(dst.offload(&received).expect("offload"), Disposition::Delivered);
+    assert_eq!(
+        received, cofre,
+        "the cofre survived the shared-memory ring byte-for-byte"
+    );
+    assert_eq!(
+        dst.offload(&received).expect("offload"),
+        Disposition::Delivered
+    );
     rail.ack(received.etiqueta.cofre_id).expect("ack");
     assert_eq!(
         dst.sink().committed().to_vec(),
@@ -122,8 +140,14 @@ fn vertical_slice_over_object_store_hop_delivers_decoupled() {
             break c;
         }
     };
-    assert_eq!(received, cofre, "the cofre survived the object-store hop byte-for-byte");
-    assert_eq!(dst.offload(&received).expect("offload"), Disposition::Delivered);
+    assert_eq!(
+        received, cofre,
+        "the cofre survived the object-store hop byte-for-byte"
+    );
+    assert_eq!(
+        dst.offload(&received).expect("offload"),
+        Disposition::Delivered
+    );
     store.ack(received.etiqueta.cofre_id).expect("ack + GC");
     assert_eq!(
         dst.sink().committed().to_vec(),

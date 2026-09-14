@@ -38,7 +38,9 @@ impl MemBlob {
     /// A new empty store.
     #[must_use]
     pub fn new() -> Self {
-        Self { map: BTreeMap::new() }
+        Self {
+            map: BTreeMap::new(),
+        }
     }
 }
 impl BlobStore for MemBlob {
@@ -50,7 +52,12 @@ impl BlobStore for MemBlob {
         Ok(self.map.get(key).cloned())
     }
     fn list(&self, prefix: &str) -> Result<Vec<String>, std::io::Error> {
-        Ok(self.map.keys().filter(|k| k.starts_with(prefix)).cloned().collect())
+        Ok(self
+            .map
+            .keys()
+            .filter(|k| k.starts_with(prefix))
+            .cloned()
+            .collect())
     }
     fn delete(&mut self, key: &str) -> Result<bool, std::io::Error> {
         Ok(self.map.remove(key).is_some())
@@ -156,8 +163,11 @@ impl FsBlob {
     /// A unique temp-file path within the root (same filesystem ⇒ atomic rename).
     fn tmp_path(&self) -> PathBuf {
         let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
-        let nanos = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_nanos());
-        self.root.join(format!(".tmp.{}.{nanos}.{seq}", std::process::id()))
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        self.root
+            .join(format!(".tmp.{}.{nanos}.{seq}", std::process::id()))
     }
 }
 
@@ -193,7 +203,9 @@ impl BlobStore for FsBlob {
             let entry = entry?;
             let name = entry.file_name();
             let Some(name) = name.to_str() else { continue };
-            let Some(key) = decode_key(name) else { continue };
+            let Some(key) = decode_key(name) else {
+                continue;
+            };
             if key.starts_with(prefix) {
                 out.push(key);
             }
@@ -225,7 +237,10 @@ mod tests {
         fn new(tag: &str) -> Self {
             let seq = DIR_SEQ.fetch_add(1, Ordering::Relaxed);
             let mut p = std::env::temp_dir();
-            p.push(format!("datarail-fsblob-{}-{tag}-{seq}", std::process::id()));
+            p.push(format!(
+                "datarail-fsblob-{}-{tag}-{seq}",
+                std::process::id()
+            ));
             Self(p)
         }
         fn path(&self) -> &std::path::Path {
@@ -293,7 +308,10 @@ mod tests {
             fsb.put("durable/key", b"survives").unwrap();
         }
         let reopened = FsBlob::open(dir.path()).unwrap();
-        assert_eq!(reopened.get("durable/key").unwrap().as_deref(), Some(&b"survives"[..]));
+        assert_eq!(
+            reopened.get("durable/key").unwrap().as_deref(),
+            Some(&b"survives"[..])
+        );
     }
 
     #[test]

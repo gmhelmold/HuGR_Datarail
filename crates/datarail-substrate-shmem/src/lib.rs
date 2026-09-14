@@ -88,10 +88,16 @@ impl ShmemRing {
     /// # Errors
     /// [`io::Error`] if the file cannot be opened or mapped, or is smaller than the header.
     pub fn open(path: impl AsRef<Path>) -> io::Result<Self> {
-        let file = std::fs::OpenOptions::new().read(true).write(true).open(path)?;
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)?;
         let map = map_file(&file)?;
         if map.len() <= HEADER_LEN {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "ring file smaller than header"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "ring file smaller than header",
+            ));
         }
         let capacity = map.len() - HEADER_LEN;
         Ok(Self {
@@ -165,32 +171,50 @@ impl Substrate for ShmemRing {
     fn send(&mut self, cofre: &Cofre) -> Result<(), Self::Error> {
         let bytes = datarail_cofre::encode(cofre);
         if bytes.len() > MAX_COFRE_WIRE_LEN {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, "cofre exceeds the maximum wire size"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "cofre exceeds the maximum wire size",
+            ));
         }
         let len = u32::try_from(bytes.len())
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "cofre exceeds u32 frame"))?;
         let total = 4 + bytes.len();
         if total > self.capacity {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, "frame larger than the ring"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "frame larger than the ring",
+            ));
         }
         let read = self.cell(READ_OFF).load(Ordering::Acquire); // consumer progress — PEER-CONTROLLABLE
         let write = self.cell(WRITE_OFF).load(Ordering::Relaxed); // our own
-        // The consumer's `read` cursor lives in the shared segment and is untrusted (a hostile/corrupt same-host
-        // consumer): `write - read` must not underflow (`read > write` → usize wraparound → a bogus "free" that
-        // bypasses back-pressure and publishes a corrupt cursor), mirroring the guard in `recv`. Both subtractions
-        // are checked.
+                                                                  // The consumer's `read` cursor lives in the shared segment and is untrusted (a hostile/corrupt same-host
+                                                                  // consumer): `write - read` must not underflow (`read > write` → usize wraparound → a bogus "free" that
+                                                                  // bypasses back-pressure and publishes a corrupt cursor), mirroring the guard in `recv`. Both subtractions
+                                                                  // are checked.
         let Some(used) = write.checked_sub(read) else {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "corrupt shmem ring cursors (read > write)"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "corrupt shmem ring cursors (read > write)",
+            ));
         };
         let Some(free) = self.capacity.checked_sub(used) else {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "corrupt shmem ring cursors (used > capacity)"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "corrupt shmem ring cursors (used > capacity)",
+            ));
         };
         if total > free {
-            return Err(io::Error::new(io::ErrorKind::WouldBlock, "shmem ring full (back-pressure)"));
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "shmem ring full (back-pressure)",
+            ));
         }
         // `write` also lives in the shared segment; guard the advance against a corrupted cursor (checked_add).
         let Some(next_write) = write.checked_add(total) else {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "corrupt shmem ring cursor (write overflow)"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "corrupt shmem ring cursor (write overflow)",
+            ));
         };
         let mut frame = Vec::with_capacity(total);
         frame.extend_from_slice(&len.to_le_bytes());
@@ -209,11 +233,14 @@ impl Substrate for ShmemRing {
     fn recv(&mut self) -> Result<Option<Cofre>, Self::Error> {
         let write = self.cell(WRITE_OFF).load(Ordering::Acquire); // producer progress
         let read = self.cell(READ_OFF).load(Ordering::Relaxed); // our own
-        // The cursors live in the shared segment and are PEER-CONTROLLABLE (a hostile/corrupt same-host writer):
-        // treat them as untrusted. `write - read` must not underflow (audit: `read > write` → usize wraparound to
-        // a huge `avail` that bypasses every gate below), so use a checked subtraction.
+                                                                // The cursors live in the shared segment and are PEER-CONTROLLABLE (a hostile/corrupt same-host writer):
+                                                                // treat them as untrusted. `write - read` must not underflow (audit: `read > write` → usize wraparound to
+                                                                // a huge `avail` that bypasses every gate below), so use a checked subtraction.
         let Some(avail) = write.checked_sub(read) else {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "corrupt shmem ring cursors (read > write)"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "corrupt shmem ring cursors (read > write)",
+            ));
         };
         if avail < 4 {
             return Ok(None);
@@ -222,13 +249,19 @@ impl Substrate for ShmemRing {
         self.read_ring(read, &mut len_bytes);
         let len = u32::from_le_bytes(len_bytes) as usize;
         if len > MAX_COFRE_WIRE_LEN {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "ring frame exceeds the maximum cofre size"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "ring frame exceeds the maximum cofre size",
+            ));
         }
         let total = 4 + len;
         // Cap the frame against the ACTUAL ring capacity (the `send` side does this; `recv` must too, or a
         // peer-declared `len > capacity` drives `read_ring` past the mapping → OOB slice panic). audit CRITICAL.
         if total > self.capacity {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "ring frame exceeds the ring capacity"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "ring frame exceeds the ring capacity",
+            ));
         }
         if avail < total {
             return Ok(None); // frame not fully written yet
@@ -273,9 +306,13 @@ mod tests {
         let mut ring = ShmemRing::anon(64).expect("anon"); // 64-byte capacity
         let len: u32 = 60_000;
         ring.write_ring(0, &len.to_le_bytes());
-        ring.cell(super::WRITE_OFF).store(4 + usize::try_from(len).unwrap(), Ordering::Release);
+        ring.cell(super::WRITE_OFF)
+            .store(4 + usize::try_from(len).unwrap(), Ordering::Release);
         ring.cell(super::READ_OFF).store(0, Ordering::Release);
-        assert!(ring.recv().is_err(), "an oversized hostile frame must error, not panic");
+        assert!(
+            ring.recv().is_err(),
+            "an oversized hostile frame must error, not panic"
+        );
     }
 
     #[test]
@@ -284,7 +321,10 @@ mod tests {
         let mut ring = ShmemRing::anon(64).expect("anon");
         ring.cell(super::READ_OFF).store(100, Ordering::Release);
         ring.cell(super::WRITE_OFF).store(0, Ordering::Release);
-        assert!(ring.recv().is_err(), "corrupt cursors (read > write) must error, not underflow");
+        assert!(
+            ring.recv().is_err(),
+            "corrupt cursors (read > write) must error, not underflow"
+        );
     }
 
     #[test]
@@ -309,7 +349,10 @@ mod tests {
                 break c;
             }
         };
-        assert_eq!(got, sent, "the cofre crossed two independent mappings via shared memory, byte-for-byte");
+        assert_eq!(
+            got, sent,
+            "the cofre crossed two independent mappings via shared memory, byte-for-byte"
+        );
         let _ = std::fs::remove_file(&path);
     }
 
@@ -321,7 +364,9 @@ mod tests {
         let one = 4 + datarail_cofre::encode(&cofre).len();
         let mut ring = ShmemRing::anon(one + one / 2).expect("anon"); // room for ~1.5 frames
         ring.send(&cofre).expect("first send fits");
-        let err = ring.send(&cofre).expect_err("second send must hit back-pressure");
+        let err = ring
+            .send(&cofre)
+            .expect_err("second send must hit back-pressure");
         assert_eq!(err.kind(), std::io::ErrorKind::WouldBlock);
     }
 

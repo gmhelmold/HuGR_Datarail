@@ -151,7 +151,9 @@ mod tests {
 
     /// A spread of distinct key hashes (counter → avalanche) for the statistical gates.
     fn keys(n: u64) -> Vec<u64> {
-        (0..n).map(|i| super::mix64(i.wrapping_mul(0x9e37_79b9_7f4a_7c15).wrapping_add(1))).collect()
+        (0..n)
+            .map(|i| super::mix64(i.wrapping_mul(0x9e37_79b9_7f4a_7c15).wrapping_add(1)))
+            .collect()
     }
 
     #[test]
@@ -191,7 +193,10 @@ mod tests {
             // Within ±10% of an even split — no hot partitions, no manual partition count.
             let lo = ideal - ideal / 10;
             let hi = ideal + ideal / 10;
-            assert!(c >= lo && c <= hi, "node {node} got {c}, expected ~{ideal} (±10%)");
+            assert!(
+                c >= lo && c <= hi,
+                "node {node} got {c}, expected ~{ideal} (±10%)"
+            );
         }
     }
 
@@ -211,11 +216,17 @@ mod tests {
             if a != b {
                 moved += 1;
                 // The ONLY allowed move is onto the new node (monotonicity — no reshuffle among the old 5).
-                assert_eq!(*a, new_node, "a key moved between two pre-existing nodes — that's a reshuffle");
+                assert_eq!(
+                    *a, new_node,
+                    "a key moved between two pre-existing nodes — that's a reshuffle"
+                );
             }
         }
         // Expected churn ≈ K/(N+1) = 60000/6 = 10000. Allow a generous statistical band (0.12–0.21 of 60000).
-        assert!((7_200..=12_600).contains(&moved), "churn {moved}/60000 not ~1/(N+1)≈10000");
+        assert!(
+            (7_200..=12_600).contains(&moved),
+            "churn {moved}/60000 not ~1/(N+1)≈10000"
+        );
     }
 
     /// Ledger #6: removing a node remaps ONLY the keys it owned — every other key keeps its node. No barrier.
@@ -233,7 +244,10 @@ mod tests {
                 assert_ne!(*a, victim, "key still routed to a removed node");
             } else {
                 // A key NOT owned by the victim must be completely undisturbed.
-                assert_eq!(*a, *b, "removing a node disturbed an unrelated key — that's a reshuffle");
+                assert_eq!(
+                    *a, *b,
+                    "removing a node disturbed an unrelated key — that's a reshuffle"
+                );
             }
         }
     }
@@ -244,10 +258,18 @@ mod tests {
         let k = fnv1a(b"some-key");
         let ranked = r.rank_keyhash(k);
         assert_eq!(ranked.len(), 4);
-        assert_eq!(Some(ranked[0]), r.route_keyhash(k), "rank[0] must equal route");
+        assert_eq!(
+            Some(ranked[0]),
+            r.route_keyhash(k),
+            "rank[0] must equal route"
+        );
         // After the owner leaves, the key must land on the previous rank[1].
         let mut r2 = r.clone();
         r2.remove_node(ranked[0]);
-        assert_eq!(r2.route_keyhash(k), Some(ranked[1]), "failover did not go to rank[1]");
+        assert_eq!(
+            r2.route_keyhash(k),
+            Some(ranked[1]),
+            "failover did not go to rank[1]"
+        );
     }
 }

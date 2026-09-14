@@ -56,7 +56,10 @@ impl NetBlob {
         write_frame(&mut stream, body)?;
         match read_frame(&mut stream)? {
             Some(resp) => Ok(resp),
-            None => Err(io::Error::new(ErrorKind::UnexpectedEof, "server closed without responding")),
+            None => Err(io::Error::new(
+                ErrorKind::UnexpectedEof,
+                "server closed without responding",
+            )),
         }
     }
 }
@@ -96,8 +99,9 @@ impl BlobStore for NetBlob {
         for _ in 0..count {
             let len = usize_of(reader.u32()?);
             let raw = reader.take(len)?;
-            let s = std::str::from_utf8(raw)
-                .map_err(|_| io::Error::new(ErrorKind::InvalidData, "non-utf8 key in list response"))?;
+            let s = std::str::from_utf8(raw).map_err(|_| {
+                io::Error::new(ErrorKind::InvalidData, "non-utf8 key in list response")
+            })?;
             out.push(s.to_owned());
         }
         Ok(out)
@@ -222,7 +226,10 @@ fn apply<B: BlobStore>(body: &[u8], store: &Mutex<B>) -> io::Result<Vec<u8>> {
             let existed = lock(store)?.delete(&key)?;
             Ok(vec![STATUS_OK, u8::from(existed)])
         }
-        other => Err(io::Error::new(ErrorKind::InvalidData, format!("unknown op tag {other}"))),
+        other => Err(io::Error::new(
+            ErrorKind::InvalidData,
+            format!("unknown op tag {other}"),
+        )),
     }
 }
 
@@ -231,7 +238,9 @@ fn apply<B: BlobStore>(body: &[u8], store: &Mutex<B>) -> io::Result<Vec<u8>> {
 /// # Errors
 /// If the mutex is poisoned by a panicking handler.
 fn lock<B: BlobStore>(store: &Mutex<B>) -> io::Result<std::sync::MutexGuard<'_, B>> {
-    store.lock().map_err(|_| io::Error::other("store lock poisoned"))
+    store
+        .lock()
+        .map_err(|_| io::Error::other("store lock poisoned"))
 }
 
 /// Write `body` as a length-prefixed frame and flush.
@@ -260,7 +269,10 @@ fn read_frame(stream: &mut impl Read) -> io::Result<Option<Vec<u8>>> {
     // WP4 audit CRITICAL C1 fix: reject an over-large advertised length BEFORE allocating, so a hostile 4-byte
     // prefix can't make us commit gigabytes of zeroed RAM (an OOM/DoS with no body bytes sent).
     if len > MAX_FRAME {
-        return Err(io::Error::new(ErrorKind::InvalidData, "netblob frame exceeds the maximum size"));
+        return Err(io::Error::new(
+            ErrorKind::InvalidData,
+            "netblob frame exceeds the maximum size",
+        ));
     }
     let mut body = vec![0u8; len];
     stream.read_exact(&mut body)?;
@@ -294,7 +306,10 @@ fn ok_payload(resp: &[u8]) -> io::Result<&[u8]> {
         Some((&STATUS_ERR, msg)) => {
             Err(io::Error::other(String::from_utf8_lossy(msg).into_owned()))
         }
-        _ => Err(io::Error::new(ErrorKind::InvalidData, "empty or malformed response frame")),
+        _ => Err(io::Error::new(
+            ErrorKind::InvalidData,
+            "empty or malformed response frame",
+        )),
     }
 }
 
@@ -315,7 +330,10 @@ impl<'a> Reader<'a> {
     /// If fewer than `n` bytes remain.
     fn take(&mut self, n: usize) -> io::Result<&'a [u8]> {
         if self.buf.len() < n {
-            return Err(io::Error::new(ErrorKind::UnexpectedEof, "frame body truncated"));
+            return Err(io::Error::new(
+                ErrorKind::UnexpectedEof,
+                "frame body truncated",
+            ));
         }
         let (head, tail) = self.buf.split_at(n);
         self.buf = tail;
@@ -328,7 +346,8 @@ impl<'a> Reader<'a> {
     /// If too few bytes remain or they are not valid UTF-8.
     fn take_str(&mut self, n: usize) -> io::Result<&'a str> {
         let raw = self.take(n)?;
-        std::str::from_utf8(raw).map_err(|_| io::Error::new(ErrorKind::InvalidData, "non-utf8 string field"))
+        std::str::from_utf8(raw)
+            .map_err(|_| io::Error::new(ErrorKind::InvalidData, "non-utf8 string field"))
     }
 
     /// Take one byte.
@@ -393,11 +412,17 @@ mod tests {
 
         // Overwrite is visible remotely.
         client.put("a/1", b"one-overwritten").unwrap();
-        assert_eq!(client.get("a/1").unwrap().as_deref(), Some(&b"one-overwritten"[..]));
+        assert_eq!(
+            client.get("a/1").unwrap().as_deref(),
+            Some(&b"one-overwritten"[..])
+        );
 
         // List by prefix, sorted (MemBlob/BTreeMap order).
         assert_eq!(client.list("a/").unwrap(), vec!["a/1", "a/2"]);
-        assert_eq!(client.list("nested/").unwrap(), vec!["nested/key/with/slashes"]);
+        assert_eq!(
+            client.list("nested/").unwrap(),
+            vec!["nested/key/with/slashes"]
+        );
         assert!(client.list("zzz").unwrap().is_empty());
 
         // Absent key is None, not an error.
@@ -417,6 +442,9 @@ mod tests {
 
         // A second, independent client connection sees the same store.
         let reader = NetBlob::new(addr);
-        assert_eq!(reader.get("shared").unwrap().as_deref(), Some(&b"written-by-one"[..]));
+        assert_eq!(
+            reader.get("shared").unwrap().as_deref(),
+            Some(&b"written-by-one"[..])
+        );
     }
 }

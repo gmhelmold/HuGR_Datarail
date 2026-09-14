@@ -44,11 +44,16 @@ fn mf4_board_rail_offload_exactly_once_and_dead_letter() {
 
     // ---- Board a conforming batch → sealed cofre. ----
     let records: [&[u8]; 2] = [b"evt:alpha", b"evt:bravo"];
-    let cofre = source.board(&records, b"order-42").expect("conforming batch boards");
+    let cofre = source
+        .board(&records, b"order-42")
+        .expect("conforming batch boards");
 
     // ---- Ride the (dumb, header-only) loopback rail. ----
     rail.send(&cofre).expect("send");
-    let received = rail.recv().expect("recv ok").expect("a cofre is on the rail");
+    let received = rail
+        .recv()
+        .expect("recv ok")
+        .expect("a cofre is on the rail");
     assert_eq!(received, cofre, "the rail moved the cofre byte-for-byte");
 
     // ---- Offload: verify → open → contract → admit → commit, exactly once. ----
@@ -124,5 +129,9 @@ fn mf4_board_rail_offload_exactly_once_and_dead_letter() {
         2,
         "a tampered cofre never commits"
     );
-    assert_eq!(dest.dead_letters().len(), 1, "tampered cofre is on the siding");
+    assert_eq!(
+        dest.dead_letters().len(),
+        1,
+        "tampered cofre is on the siding"
+    );
 }
