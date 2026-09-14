@@ -173,7 +173,10 @@ fn run_once(seed: u64, streams: u64, per_stream: u64) -> (HashMap<([u8; 16], u64
 
     while !sources.iter().all(Source::done) {
         ticks += 1;
-        assert!(ticks < max_ticks, "seed {seed}: did not quiesce (livelock?)");
+        assert!(
+            ticks < max_ticks,
+            "seed {seed}: did not quiesce (livelock?)"
+        );
 
         // --- Source step: (re)transmit each source's un-acked window (at-least-once), so even under heavy
         // drop a copy eventually gets through. Per-frame DROP and DUPLICATE faults are injected here.
