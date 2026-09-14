@@ -26,10 +26,11 @@
 //! storage-integrity failure outside the crash-consistency model; hardening it (per-record durable logical ids /
 //! an integrity checkpoint that fails loud instead of renumbering) is tracked future work, not claimed here.
 
-use std::io::{self, Read, Seek, SeekFrom};
+use std::fs::OpenOptions;
+use std::io::{self, Read, Write};
 use std::path::Path;
 
-use datarail_replaylog::{ReplayLog, MAX_RECORD};
+use datarail_replaylog::ReplayLog;
 
 /// IEEE CRC-32 (table-free) over a record's `len ‖ bytes`, matching `datarail_replaylog::crc32`.
 fn crc32(parts: &[&[u8]]) -> u32 {
@@ -49,6 +50,298 @@ fn crc32(parts: &[&[u8]]) -> u32 {
 /// Per-partition segment size. The flat-RAM cost scales as `total / segment_bytes` (the per-replay segment-start
 /// list), independent of how much history is retained — see `datarail-replaylog`.
 const SEGMENT_BYTES: u64 = datarail_replaylog::DEFAULT_SEGMENT_BYTES;
+
+const DEDUP_MAGIC: &[u8; 4] = b"DRD1";
+const DEDUP_RECORD_BYTES: usize = 80;
+const DEDUP_PREPARE: u8 = 1;
+const DEDUP_COMMIT: u8 = 2;
+const MAX_DEDUP_ENTRIES: usize = 65_536;
+
+/// The wire identity and durable result for one idempotent produce batch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DedupCoord {
+    pub(crate) producer_id: i64,
+    pub(crate) epoch: i16,
+    pub(crate) base_sequence: i32,
+    pub(crate) count: i32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DedupEntry {
+    pub(crate) coord: DedupCoord,
+    pub(crate) base_offset: i64,
+}
+
+/// Persistent sequence state. Metadata contains only numeric coordinates and offsets, never payload bytes.
+#[derive(Debug)]
+pub(crate) struct DedupState {
+    file: std::fs::File,
+    entries: Vec<DedupEntry>,
+    pending_start: Option<u64>,
+}
+
+impl DedupState {
+    /// Open metadata, reject full-record corruption, and roll back an uncommitted prepare in the partition log.
+    pub(crate) fn open(path: impl AsRef<Path>, log: &mut SealedPartitionLog) -> io::Result<Self> {
+        let path = path.as_ref();
+        let mut file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .append(true)
+            .open(path)?;
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)?;
+        let complete = bytes.len() / DEDUP_RECORD_BYTES * DEDUP_RECORD_BYTES;
+        if bytes.len() != complete {
+            file.set_len(u64::try_from(complete).unwrap_or(u64::MAX))?;
+            file.sync_all()?;
+            bytes.truncate(complete);
+        }
+        let mut entries = Vec::new();
+        let mut pending: Option<(u64, DedupRecord)> = None;
+        let (records, _) = bytes.as_chunks::<DEDUP_RECORD_BYTES>();
+        for (index, raw) in records.iter().enumerate() {
+            let record = decode_dedup_record(raw)?;
+            match record.kind {
+                DEDUP_PREPARE => {
+                    let start =
+                        u64::try_from(index.saturating_mul(DEDUP_RECORD_BYTES)).unwrap_or(u64::MAX);
+                    if pending.replace((start, record)).is_some() {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "dedup metadata has nested prepare",
+                        ));
+                    }
+                }
+                DEDUP_COMMIT => {
+                    let (_, prepared) = pending.take().ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "dedup metadata commit has no prepare",
+                        )
+                    })?;
+                    if prepared.coord != record.coord
+                        || prepared.byte_end != record.byte_end
+                        || prepared.logical_len != record.logical_len
+                    {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "dedup metadata commit does not match prepare",
+                        ));
+                    }
+                    if entries.len() >= MAX_DEDUP_ENTRIES {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "dedup metadata entry limit exceeded",
+                        ));
+                    }
+                    entries.push(DedupEntry {
+                        coord: record.coord,
+                        base_offset: record.base_offset,
+                    });
+                }
+                _ => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "dedup metadata has unknown record kind",
+                    ));
+                }
+            }
+        }
+        if let Some((start, record)) = pending {
+            log.truncate_to(record.byte_end, record.logical_len)?;
+            file.set_len(start)?;
+            file.sync_all()?;
+        }
+        Ok(Self {
+            file,
+            entries,
+            pending_start: None,
+        })
+    }
+
+    pub(crate) fn lookup(&self, coord: DedupCoord) -> io::Result<Option<DedupEntry>> {
+        sequence_high(coord)?;
+        let mut highest_epoch: Option<i16> = None;
+        for entry in &self.entries {
+            if entry.coord.producer_id != coord.producer_id {
+                continue;
+            }
+            highest_epoch =
+                Some(highest_epoch.map_or(entry.coord.epoch, |old| old.max(entry.coord.epoch)));
+        }
+        if highest_epoch.is_some_and(|epoch| coord.epoch < epoch) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "stale idempotent producer epoch",
+            ));
+        }
+        let mut watermark = 0i64;
+        for entry in &self.entries {
+            if entry.coord.producer_id != coord.producer_id {
+                continue;
+            }
+            if entry.coord.epoch == coord.epoch {
+                watermark = watermark.max(sequence_high(entry.coord)?);
+                if entry.coord.base_sequence == coord.base_sequence
+                    && entry.coord.count == coord.count
+                {
+                    return Ok(Some(*entry));
+                }
+            }
+        }
+        if highest_epoch == Some(coord.epoch) && i64::from(coord.base_sequence) < watermark {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "out-of-order idempotent producer sequence",
+            ));
+        }
+        Ok(None)
+    }
+
+    pub(crate) fn prepare(
+        &mut self,
+        coord: DedupCoord,
+        byte_end: u64,
+        logical_len: usize,
+    ) -> io::Result<()> {
+        if self.entries.len() >= MAX_DEDUP_ENTRIES {
+            return Err(io::Error::other("dedup metadata entry limit reached"));
+        }
+        if self.pending_start.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "dedup metadata has an unresolved prepare",
+            ));
+        }
+        let start = self.file.metadata()?.len();
+        let record = DedupRecord {
+            kind: DEDUP_PREPARE,
+            coord,
+            byte_end,
+            logical_len,
+            base_offset: 0,
+        };
+        append_dedup_record(&mut self.file, &record)?;
+        self.pending_start = Some(start);
+        Ok(())
+    }
+
+    pub(crate) fn commit(
+        &mut self,
+        coord: DedupCoord,
+        byte_end: u64,
+        logical_len: usize,
+        base_offset: i64,
+    ) -> io::Result<()> {
+        let record = DedupRecord {
+            kind: DEDUP_COMMIT,
+            coord,
+            byte_end,
+            logical_len,
+            base_offset,
+        };
+        append_dedup_record(&mut self.file, &record)?;
+        self.entries.push(DedupEntry { coord, base_offset });
+        self.pending_start = None;
+        Ok(())
+    }
+
+    pub(crate) fn rollback(&mut self) -> io::Result<()> {
+        if let Some(start) = self.pending_start.take() {
+            self.file.set_len(start)?;
+            self.file.sync_all()?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct DedupRecord {
+    kind: u8,
+    coord: DedupCoord,
+    byte_end: u64,
+    logical_len: usize,
+    base_offset: i64,
+}
+
+fn sequence_high(coord: DedupCoord) -> io::Result<i64> {
+    if coord.count <= 0 || coord.base_sequence < 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid idempotent producer sequence range",
+        ));
+    }
+    i64::from(coord.base_sequence)
+        .checked_add(i64::from(coord.count))
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "idempotent sequence range overflows",
+            )
+        })
+}
+
+fn append_dedup_record(file: &mut std::fs::File, record: &DedupRecord) -> io::Result<()> {
+    let mut bytes = [0u8; DEDUP_RECORD_BYTES];
+    bytes[..4].copy_from_slice(DEDUP_MAGIC);
+    bytes[4] = record.kind;
+    bytes[8..16].copy_from_slice(&record.byte_end.to_be_bytes());
+    bytes[16..24].copy_from_slice(
+        &u64::try_from(record.logical_len)
+            .unwrap_or(u64::MAX)
+            .to_be_bytes(),
+    );
+    bytes[24..32].copy_from_slice(&record.coord.producer_id.to_be_bytes());
+    bytes[32..34].copy_from_slice(&record.coord.epoch.to_be_bytes());
+    bytes[36..40].copy_from_slice(&record.coord.base_sequence.to_be_bytes());
+    bytes[40..44].copy_from_slice(&record.coord.count.to_be_bytes());
+    bytes[48..56].copy_from_slice(&record.base_offset.to_be_bytes());
+    let crc = crc32(&[&bytes[..76]]);
+    bytes[76..80].copy_from_slice(&crc.to_be_bytes());
+    file.write_all(&bytes)?;
+    file.sync_all()
+}
+
+fn decode_dedup_record(bytes: &[u8]) -> io::Result<DedupRecord> {
+    if bytes.len() != DEDUP_RECORD_BYTES || &bytes[..4] != DEDUP_MAGIC {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid dedup metadata header",
+        ));
+    }
+    let stored = u32::from_be_bytes(bytes[76..80].try_into().unwrap_or([0; 4]));
+    if crc32(&[&bytes[..76]]) != stored {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "dedup metadata CRC mismatch",
+        ));
+    }
+    let logical_len = usize::try_from(u64::from_be_bytes(
+        bytes[16..24].try_into().unwrap_or([0; 8]),
+    ))
+    .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "dedup logical length overflows"))?;
+    let record = DedupRecord {
+        kind: bytes[4],
+        byte_end: u64::from_be_bytes(bytes[8..16].try_into().unwrap_or([0; 8])),
+        logical_len,
+        coord: DedupCoord {
+            producer_id: i64::from_be_bytes(bytes[24..32].try_into().unwrap_or([0; 8])),
+            epoch: i16::from_be_bytes(bytes[32..34].try_into().unwrap_or([0; 2])),
+            base_sequence: i32::from_be_bytes(bytes[36..40].try_into().unwrap_or([0; 4])),
+            count: i32::from_be_bytes(bytes[40..44].try_into().unwrap_or([0; 4])),
+        },
+        base_offset: i64::from_be_bytes(bytes[48..56].try_into().unwrap_or([0; 8])),
+    };
+    sequence_high(record.coord)?;
+    if record.base_offset < 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "dedup metadata has negative base offset",
+        ));
+    }
+    Ok(record)
+}
 
 /// Scan the durable log from the start and return the byte offset of every recoverable record, in order — the
 /// authoritative contiguous logical-offset index. Used by both [`SealedPartitionLog::open`] (restart recovery)
@@ -88,6 +381,27 @@ impl SealedPartitionLog {
     /// The number of durably-stored records = the Kafka *latest* (next) logical offset.
     pub(crate) fn len(&self) -> usize {
         self.starts.len()
+    }
+
+    /// Current durable byte end, used as a transaction recovery boundary.
+    pub(crate) fn byte_end(&self) -> u64 {
+        self.log.end_offset()
+    }
+
+    /// Roll back this partition to a journaled byte/logical boundary.
+    ///
+    /// # Errors
+    /// Returns an I/O error if the backing log cannot truncate or the recovered index does not match.
+    pub(crate) fn truncate_to(&mut self, byte_end: u64, logical_len: usize) -> io::Result<()> {
+        self.log.truncate_to(byte_end).map_err(io::Error::other)?;
+        self.starts = scan_starts(&self.log)?;
+        if self.byte_end() != byte_end || self.starts.len() != logical_len {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "partition recovery boundary mismatch",
+            ));
+        }
+        Ok(())
     }
 
     /// Append a batch of already-sealed cofre bytes, `fsync` once, and only THEN publish their logical offsets. The
@@ -152,68 +466,12 @@ impl SealedPartitionLog {
         let Some(&start) = self.starts.get(offset) else {
             return Ok(Vec::new());
         };
-        // FIX REAL: read directly from the correct segment file at byte offset `start` (bypass Replay replay mechanism
-        // which has a seek/replay bug when corrupt frames exist in previous segments — see replaylog crate doc).
-        // Find segment containing byte offset `start` by scanning segment file names from data_dir.
-        let dir = self.log.dir();
-        let mut seg_starts: Vec<u64> = Vec::new();
-        for entry in std::fs::read_dir(dir).map_err(io::Error::other)? {
-            let path = entry.map_err(io::Error::other)?.path();
-            if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                if let Some(s) = name
-                    .strip_suffix(".seg")
-                    .and_then(|s| s.parse::<u64>().ok())
-                {
-                    seg_starts.push(s);
-                }
-            }
-        }
-        seg_starts.sort_unstable();
-        let seg_start = seg_starts
-            .iter()
-            .rfind(|&&s| s <= start)
-            .copied()
-            .unwrap_or(0);
-        let seek_in_file = start.saturating_sub(seg_start);
-        let seg_path = dir.join(format!("{seg_start:020}.seg"));
-        let mut file = std::fs::File::open(&seg_path)
-            .map_err(|e| io::Error::other(format!("segment file open error: {e}")))?;
-        file.seek(SeekFrom::Start(seek_in_file))
-            .map_err(|e| io::Error::other(format!("segment seek error: {e}")))?;
+        let mut replay = self.log.replay_from(start).map_err(io::Error::other)?;
         let mut out = Vec::new();
         let mut bytes_read = 0i64;
-        loop {
-            let mut len_buf = [0u8; 4];
-            match file.read_exact(&mut len_buf) {
-                Ok(()) => {}
-                Err(_) => break, // torn tail / end of segment
-            }
-            let len = u32::from_le_bytes(len_buf) as usize;
-            if len > MAX_RECORD {
-                break; // corrupt length — stop replay (like replaylog resync_or_stop in final segment)
-            }
-            let frame_size = 4 + len + 4;
-            let mut frame_bytes = vec![0u8; frame_size];
-            frame_bytes[..4].copy_from_slice(&len_buf);
-            match file.read_exact(&mut frame_bytes[4..]) {
-                Ok(()) => {}
-                Err(_) => break, // truncated frame
-            }
-            // Validate CRC32 (like replaylog does) — stop at first corrupt frame in final segment.
-            let payload = &frame_bytes[4..4 + len];
-            let stored_crc = u32::from_le_bytes([
-                frame_bytes[4 + len],
-                frame_bytes[4 + len + 1],
-                frame_bytes[4 + len + 2],
-                frame_bytes[4 + len + 3],
-            ]);
-            let computed_crc = crc32(&[&len_buf, payload]);
-            if stored_crc != computed_crc {
-                break; // CRC mismatch — stop replay (like replaylog resync_or_stop in final segment)
-            }
-            let body = payload.to_vec();
+        while let Some((_byte_offset, body)) = replay.read_next().map_err(io::Error::other)? {
+            bytes_read += i64::try_from(body.len()).unwrap_or(i64::MAX);
             out.push(body);
-            bytes_read += i64::try_from(len).unwrap_or(i64::MAX);
             if bytes_read >= max_bytes {
                 break;
             }
@@ -224,7 +482,9 @@ impl SealedPartitionLog {
 
 #[cfg(test)]
 mod tests {
-    use super::SealedPartitionLog;
+    use std::io;
+
+    use super::{DedupCoord, DedupState, SealedPartitionLog};
 
     fn tmpdir(tag: &str) -> std::path::PathBuf {
         let mut d = std::env::temp_dir();
@@ -288,6 +548,75 @@ mod tests {
             reopened.append_durable(&[b"sealed-3".to_vec()]).unwrap(),
             3,
             "logical offset continues past recovery"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn idempotent_sequence_metadata_survives_restart_and_replays_same_offset() {
+        let dir = tmpdir("dedup-restart");
+        let coord = DedupCoord {
+            producer_id: 41,
+            epoch: 2,
+            base_sequence: 7,
+            count: 1,
+        };
+        {
+            let mut log = SealedPartitionLog::open(&dir).unwrap();
+            let mut dedup = DedupState::open(dir.join("dedup.meta"), &mut log).unwrap();
+            dedup.prepare(coord, log.byte_end(), log.len()).unwrap();
+            let base = log.append_durable(&[b"sealed".to_vec()]).unwrap();
+            dedup.commit(coord, 0, 0, base).unwrap();
+        }
+        let mut reopened_log = SealedPartitionLog::open(&dir).unwrap();
+        let reopened = DedupState::open(dir.join("dedup.meta"), &mut reopened_log).unwrap();
+        assert_eq!(
+            reopened.lookup(coord).unwrap().unwrap().base_offset,
+            0,
+            "same sequence resolves to original stable offset"
+        );
+        assert!(
+            reopened.lookup(DedupCoord { epoch: 1, ..coord }).is_err(),
+            "older epoch cannot replay after fencing"
+        );
+        assert!(
+            reopened
+                .lookup(DedupCoord {
+                    base_sequence: 6,
+                    ..coord
+                })
+                .is_err(),
+            "sequence below current watermark cannot append"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn corrupt_complete_idempotent_metadata_fails_closed() {
+        let dir = tmpdir("dedup-corrupt");
+        {
+            let mut log = SealedPartitionLog::open(&dir).unwrap();
+            let mut dedup = DedupState::open(dir.join("dedup.meta"), &mut log).unwrap();
+            let coord = DedupCoord {
+                producer_id: 1,
+                epoch: 0,
+                base_sequence: 0,
+                count: 1,
+            };
+            dedup.prepare(coord, log.byte_end(), log.len()).unwrap();
+            let base = log.append_durable(&[b"sealed".to_vec()]).unwrap();
+            dedup.commit(coord, 0, 0, base).unwrap();
+        }
+        let metadata = dir.join("dedup.meta");
+        let mut bytes = std::fs::read(&metadata).unwrap();
+        bytes[24] ^= 1;
+        std::fs::write(metadata, bytes).unwrap();
+        let mut log = SealedPartitionLog::open(&dir).unwrap();
+        assert_eq!(
+            DedupState::open(dir.join("dedup.meta"), &mut log)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidData
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

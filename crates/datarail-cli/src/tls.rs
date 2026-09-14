@@ -27,15 +27,25 @@ impl TlsConn {
     /// # Errors
     /// [`io::Error`] if a file can't be read, the PEM is malformed, no private key is present, the client-CA has no
     /// usable roots, or the cert/key pair is rejected by rustls.
-    pub fn from_pem(cert_path: &str, key_path: &str, client_ca: Option<String>) -> io::Result<Self> {
-        let bad = |e: &dyn std::fmt::Display| io::Error::new(io::ErrorKind::InvalidData, e.to_string());
+    pub fn from_pem(
+        cert_path: &str,
+        key_path: &str,
+        client_ca: Option<String>,
+    ) -> io::Result<Self> {
+        let bad =
+            |e: &dyn std::fmt::Display| io::Error::new(io::ErrorKind::InvalidData, e.to_string());
         let certs = rustls_pemfile::certs(&mut BufReader::new(File::open(cert_path)?))
             .collect::<Result<Vec<_>, _>>()?;
         if certs.is_empty() {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "no certificate in the cert PEM"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "no certificate in the cert PEM",
+            ));
         }
         let key = rustls_pemfile::private_key(&mut BufReader::new(File::open(key_path)?))?
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "no private key in the key PEM"))?;
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "no private key in the key PEM")
+            })?;
         // Explicit ring provider + safe default protocol versions (TLS 1.3/1.2) — no reliance on a process-global
         // default provider being installed.
         let provider = Arc::new(rustls::crypto::ring::default_provider());
@@ -44,20 +54,27 @@ impl TlsConn {
             .map_err(|e| bad(&e))?;
         let with_verifier = if let Some(ca_path) = client_ca {
             let mut roots = rustls::RootCertStore::empty();
-            for cert in
-                rustls_pemfile::certs(&mut BufReader::new(File::open(&ca_path)?)).collect::<Result<Vec<_>, _>>()?
+            for cert in rustls_pemfile::certs(&mut BufReader::new(File::open(&ca_path)?))
+                .collect::<Result<Vec<_>, _>>()?
             {
                 roots.add(cert).map_err(|e| bad(&e))?;
             }
-            let verifier = rustls::server::WebPkiClientVerifier::builder_with_provider(Arc::new(roots), provider)
-                .build()
-                .map_err(|e| bad(&e))?;
+            let verifier = rustls::server::WebPkiClientVerifier::builder_with_provider(
+                Arc::new(roots),
+                provider,
+            )
+            .build()
+            .map_err(|e| bad(&e))?;
             base.with_client_cert_verifier(verifier)
         } else {
             base.with_no_client_auth()
         };
-        let config = with_verifier.with_single_cert(certs, key).map_err(|e| bad(&e))?;
-        Ok(Self { config: Arc::new(config) })
+        let config = with_verifier
+            .with_single_cert(certs, key)
+            .map_err(|e| bad(&e))?;
+        Ok(Self {
+            config: Arc::new(config),
+        })
     }
 }
 

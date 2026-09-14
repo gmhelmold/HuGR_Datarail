@@ -15,6 +15,7 @@ path = "src/main.rs"
 workspace = true
 
 [features]
+default = ["per_partition_locking"]
 # QUIC pulls quinn+tokio+ring (heavy); keep the default binary featherweight (G2), QUIC one flag away.
 quic = ["dep:datarail-substrate-quic"]
 # TLS on the Kafka hop (KAFKA-TLS-DESIGN.md): reuses rustls (already vetted + in Cargo.lock via the quic
@@ -23,7 +24,8 @@ tls = ["dep:rustls", "dep:rustls-pemfile"]
 # Accept COMPRESSED Kafka producer batches (KAFKA-COMPRESSION-DESIGN.md) — forwards datarail-kafka's feature so the
 # kafka-broker/kafka-ingest binary decompresses gzip/lz4/zstd/snappy. Off by default (the default binary stays light).
 compression = ["datarail-kafka/compression"]
-
+# Use per-partition locks for broker operations. Disable with `--no-default-features` for rollback testing.
+per_partition_locking = []
 [dependencies]
 datarail-core = { path = "../datarail-core" }
 datarail-crypto = { path = "../datarail-crypto" }
