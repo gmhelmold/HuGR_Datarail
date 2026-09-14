@@ -105,7 +105,10 @@ mod tests {
     fn tmpdir(tag: &str) -> std::path::PathBuf {
         let seq = DIR_SEQ.fetch_add(1, Ordering::Relaxed);
         let mut d = std::env::temp_dir();
-        d.push(format!("datarail-replicated-topic-{tag}-{}-{seq}", std::process::id()));
+        d.push(format!(
+            "datarail-replicated-topic-{tag}-{}-{seq}",
+            std::process::id()
+        ));
         let _ = std::fs::remove_dir_all(&d);
         d
     }
@@ -152,14 +155,22 @@ mod tests {
         let dir = tmpdir("roundtrip");
         let mut rt = open(&dir);
         let records: Vec<(Vec<u8>, Vec<u8>)> = (0..20u32)
-            .map(|i| (format!("key-{i}").into_bytes(), format!("payload-value-{i}").into_bytes()))
+            .map(|i| {
+                (
+                    format!("key-{i}").into_bytes(),
+                    format!("payload-value-{i}").into_bytes(),
+                )
+            })
             .collect();
         let mut offsets = Vec::new();
         for (k, v) in &records {
             offsets.push(rt.produce(k, v).expect("produce"));
         }
         for (off, (k, v)) in offsets.iter().zip(&records) {
-            assert_eq!(rt.reconstruct(*off).expect("reconstruct"), Some((k.clone(), v.clone())));
+            assert_eq!(
+                rt.reconstruct(*off).expect("reconstruct"),
+                Some((k.clone(), v.clone()))
+            );
         }
         let _ = std::fs::remove_dir_all(&dir);
     }
