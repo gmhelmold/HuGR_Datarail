@@ -174,21 +174,41 @@ pub fn aead_seal(
 /// so a cofre is interchangeable across the two backends. Plain `GCM` is sound here only under the per-cofre
 /// fresh-key invariant (no nonce reuse); see the `vaes` feature note in `Cargo.toml`.
 #[cfg(feature = "vaes")]
-fn gcm256_seal(key: &[u8; 32], nonce: &[u8; 12], aad: &[u8], plaintext: &[u8]) -> Result<Vec<u8>, AeadError> {
+fn gcm256_seal(
+    key: &[u8; 32],
+    nonce: &[u8; 12],
+    aad: &[u8],
+    plaintext: &[u8],
+) -> Result<Vec<u8>, AeadError> {
     use ring::aead::{Aad, LessSafeKey, Nonce, UnboundKey, AES_256_GCM};
     let sealing = LessSafeKey::new(UnboundKey::new(&AES_256_GCM, key).map_err(|_| AeadError)?);
     let mut buf = plaintext.to_vec();
     sealing
-        .seal_in_place_append_tag(Nonce::assume_unique_for_key(*nonce), Aad::from(aad), &mut buf)
+        .seal_in_place_append_tag(
+            Nonce::assume_unique_for_key(*nonce),
+            Aad::from(aad),
+            &mut buf,
+        )
         .map_err(|_| AeadError)?;
     Ok(buf)
 }
 
 #[cfg(not(feature = "vaes"))]
-fn gcm256_seal(key: &[u8; 32], nonce: &[u8; 12], aad: &[u8], plaintext: &[u8]) -> Result<Vec<u8>, AeadError> {
+fn gcm256_seal(
+    key: &[u8; 32],
+    nonce: &[u8; 12],
+    aad: &[u8],
+    plaintext: &[u8],
+) -> Result<Vec<u8>, AeadError> {
     aes_gcm::Aes256Gcm::new_from_slice(key)
         .map_err(|_| AeadError)?
-        .encrypt(aes_gcm::Nonce::from_slice(nonce), Payload { msg: plaintext, aad })
+        .encrypt(
+            aes_gcm::Nonce::from_slice(nonce),
+            Payload {
+                msg: plaintext,
+                aad,
+            },
+        )
         .map_err(|_| AeadError)
 }
 
@@ -223,28 +243,49 @@ pub fn aead_open(
 /// `AES-256-GCM` open — `ring` `VAES` asm under `--features vaes`, else `RustCrypto` `AES-NI`. Wire-identical
 /// to [`gcm256_seal`].
 #[cfg(feature = "vaes")]
-fn gcm256_open(key: &[u8; 32], nonce: &[u8; 12], aad: &[u8], ciphertext: &[u8]) -> Result<Vec<u8>, AeadError> {
+fn gcm256_open(
+    key: &[u8; 32],
+    nonce: &[u8; 12],
+    aad: &[u8],
+    ciphertext: &[u8],
+) -> Result<Vec<u8>, AeadError> {
     use ring::aead::{Aad, LessSafeKey, Nonce, UnboundKey, AES_256_GCM};
     let opening = LessSafeKey::new(UnboundKey::new(&AES_256_GCM, key).map_err(|_| AeadError)?);
     let mut buf = ciphertext.to_vec();
     let plaintext = opening
-        .open_in_place(Nonce::assume_unique_for_key(*nonce), Aad::from(aad), &mut buf)
+        .open_in_place(
+            Nonce::assume_unique_for_key(*nonce),
+            Aad::from(aad),
+            &mut buf,
+        )
         .map_err(|_| AeadError)?;
     Ok(plaintext.to_vec())
 }
 
 #[cfg(not(feature = "vaes"))]
-fn gcm256_open(key: &[u8; 32], nonce: &[u8; 12], aad: &[u8], ciphertext: &[u8]) -> Result<Vec<u8>, AeadError> {
+fn gcm256_open(
+    key: &[u8; 32],
+    nonce: &[u8; 12],
+    aad: &[u8],
+    ciphertext: &[u8],
+) -> Result<Vec<u8>, AeadError> {
     aes_gcm::Aes256Gcm::new_from_slice(key)
         .map_err(|_| AeadError)?
-        .decrypt(aes_gcm::Nonce::from_slice(nonce), Payload { msg: ciphertext, aad })
+        .decrypt(
+            aes_gcm::Nonce::from_slice(nonce),
+            Payload {
+                msg: ciphertext,
+                aad,
+            },
+        )
         .map_err(|_| AeadError)
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        aead_open, aead_seal, blake3_256, ctx, hmac_blake3, sign_domain, verify_domain, verifying_key,
+        aead_open, aead_seal, blake3_256, ctx, hmac_blake3, sign_domain, verify_domain,
+        verifying_key,
     };
     use datarail_core::AeadAlg;
 
@@ -268,7 +309,11 @@ mod tests {
         let recipient_secret = [9u8; 32];
         let recipient_pk = super::x25519_public(&recipient_secret);
         let (eph_public, k_src) = super::seal_key(&recipient_pk, &[3u8; 32]).expect("seal");
-        assert_eq!(super::open_key(&recipient_secret, &eph_public), Some(k_src), "dest re-derives the key");
+        assert_eq!(
+            super::open_key(&recipient_secret, &eph_public),
+            Some(k_src),
+            "dest re-derives the key"
+        );
         // A different recipient cannot open it.
         assert_ne!(super::open_key(&[1u8; 32], &eph_public), Some(k_src));
         // A tampered ephemeral public key yields a different (wrong) key — AEAD-open would then fail.
@@ -303,11 +348,23 @@ mod tests {
         ];
         let secret = [7u8; 32];
         // The identity point MUST be rejected by open_key (the offload would dead-letter such a cofre).
-        assert_eq!(super::open_key(&secret, &low_order[0]), None, "all-zero eph_public must be rejected");
+        assert_eq!(
+            super::open_key(&secret, &low_order[0]),
+            None,
+            "all-zero eph_public must be rejected"
+        );
         // seal_key to the identity recipient_pk must also fail closed (a low-order dest key is misconfig).
-        assert_eq!(super::seal_key(&low_order[0], &secret), None, "seal to a low-order recipient must fail");
+        assert_eq!(
+            super::seal_key(&low_order[0], &secret),
+            None,
+            "seal to a low-order recipient must fail"
+        );
         // The order-8 point is likewise non-contributory and must be rejected.
-        assert_eq!(super::open_key(&secret, &low_order[1]), None, "order-8 eph_public must be rejected");
+        assert_eq!(
+            super::open_key(&secret, &low_order[1]),
+            None,
+            "order-8 eph_public must be rejected"
+        );
         // (low_order[2] documents the small-subgroup family; was_contributory covers the whole set.)
         let _ = low_order[2];
     }
@@ -362,7 +419,10 @@ mod tests {
         for b in &ct {
             let _ = write!(hex, "{b:02x}");
         }
-        assert_eq!(hex, EXPECT, "AES-256-GCM ciphertext must match the canonical vector on every backend");
+        assert_eq!(
+            hex, EXPECT,
+            "AES-256-GCM ciphertext must match the canonical vector on every backend"
+        );
         // And it round-trips back to the plaintext.
         let pt = aead_open(AeadAlg::Gcm256, &KEY, &NONCE, b"aad", &ct).unwrap();
         assert_eq!(pt, b"datarail-vaes-kat");
