@@ -23,26 +23,36 @@ impl WebhookSink {
     /// # Errors
     /// [`io::Error`] (`InvalidInput`) if the URL is not a well-formed `http://` URL.
     pub fn post(url: &str) -> io::Result<Self> {
-        let rest = url
-            .strip_prefix("http://")
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "webhook url must start with http://"))?;
+        let rest = url.strip_prefix("http://").ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "webhook url must start with http://",
+            )
+        })?;
         let (authority, path) = match rest.find('/') {
             Some(i) => (&rest[..i], &rest[i..]),
             None => (rest, "/"),
         };
         if authority.is_empty() {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, "webhook url has no host"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "webhook url has no host",
+            ));
         }
         let (host, port) = match authority.rsplit_once(':') {
             Some((h, p)) => {
-                let port = p
-                    .parse::<u16>()
-                    .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "webhook url has a bad port"))?;
+                let port = p.parse::<u16>().map_err(|_| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "webhook url has a bad port")
+                })?;
                 (h.to_owned(), port)
             }
             None => (authority.to_owned(), 80),
         };
-        Ok(Self { host, port, path: path.to_owned() })
+        Ok(Self {
+            host,
+            port,
+            path: path.to_owned(),
+        })
     }
 
     /// Build the request body: records joined by `\n` with a trailing `\n` (NDJSON-style), empty if no records.
@@ -87,7 +97,10 @@ impl crate::Sink for WebhookSink {
 
 /// Parse the numeric status code from an HTTP response's status line (`HTTP/1.1 <code> ...`).
 fn parse_status(response: &[u8]) -> io::Result<u16> {
-    let line_end = response.iter().position(|&b| b == b'\r' || b == b'\n').unwrap_or(response.len());
+    let line_end = response
+        .iter()
+        .position(|&b| b == b'\r' || b == b'\n')
+        .unwrap_or(response.len());
     let line = std::str::from_utf8(&response[..line_end])
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "non-utf8 status line"))?;
     line.split_whitespace()
@@ -136,15 +149,21 @@ mod tests {
                     break;
                 }
             }
-            sock.write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
-                .expect("respond");
+            sock.write_all(
+                b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            )
+            .expect("respond");
             String::from_utf8_lossy(&req).to_string()
         });
         let mut sink = WebhookSink::post(&format!("http://{addr}/ingest")).expect("sink");
-        sink.commit(&[b"evt:one".to_vec(), b"evt:two".to_vec()]).expect("commit");
+        sink.commit(&[b"evt:one".to_vec(), b"evt:two".to_vec()])
+            .expect("commit");
         let req = handle.join().expect("join");
         assert!(req.starts_with("POST /ingest HTTP/1.1"), "request: {req}");
-        assert!(req.contains("Content-Length: 16"), "ndjson body length wrong: {req}");
+        assert!(
+            req.contains("Content-Length: 16"),
+            "ndjson body length wrong: {req}"
+        );
         assert!(req.ends_with("evt:one\nevt:two\n"), "body: {req}");
     }
 
