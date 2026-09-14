@@ -1,11 +1,10 @@
 //! `datarail-substrate-quic` — the SPEC-07 QUIC **cross-host** substrate.
 //!
 //! QUIC carries opaque sealed cofres and provides streams / flow-control / NAT traversal. The **seal — not
-//! TLS — provides confidentiality** (`INV-OPAQUE-CARGO`): the cofre is already AEAD-sealed before it touches
-//! the wire, so the QUIC transport is a *blind relay* (the DERP pattern, SPEC 07). Consequently the client
-//! deliberately **does not verify the server certificate** — authenticity/secrecy ride on the cofre's seal
-//! (Ed25519 + per-cofre key-wrap), never on the transport's TLS. The dev cert embedded here exists only to
-//! satisfy QUIC's mandatory TLS 1.3 handshake; it secures nothing and is not a secret.
+//! TLS — provides cofre confidentiality** (`INV-OPAQUE-CARGO`): the cofre is already AEAD-sealed before it
+//! touches the wire, so payload secrecy does not depend on transport TLS. The production client nevertheless
+//! verifies the configured CA and server name, preventing an active attacker from impersonating the endpoint.
+//! The embedded identity exists only for explicit dev/test constructors.
 //!
 //! The substrate owns a Tokio runtime and drives quinn's async API via `block_on` behind the synchronous
 //! [`Substrate`] trait. Each connection carries **one ordered uni-directional stream** of length-prefixed
@@ -15,34 +14,20 @@
 //! crypto on the cofre** (`INV-DUMB-PIPE`). quinn uses the `ring` backend; this crate quarantines the heavy
 //! QUIC dependency tree out of the std-only rail core (Charter *leveza*).
 //!
-//! ## Security: DEV-ONLY transport identity
+//! ## Security: transport identity
 //!
-//! **This substrate must not be used where transport-layer authentication matters.**
+//! - **Explicit dev/test identity.** `src/dev_cert.der` and `src/dev_key.der` are baked in via
+//!   `include_bytes!`. Both files are committed to the public repository, so the private key is not secret.
+//!   `dev_server`, `dev_connect`, and `dev_loopback_pair` are the only constructors using this identity.
 //!
-//! - **Public, committed cert/key.** `src/dev_cert.der` and `src/dev_key.der` are baked in via
-//!   `include_bytes!` and are the *only* server identity this substrate presents. Both files are committed
-//!   to the public repository, so the private key is not secret in any meaningful sense.
-//!
-//! - **Client accepts any server certificate.** `AcceptAnyServerCert` skips all certificate validation.
-//!   There is no hostname check, no chain verification, and no revocation check.
-//!
-//! - **Active MITM can terminate the QUIC/TLS hop.** Because the server key is public and the client
-//!   performs no certificate verification, an active on-path attacker can impersonate the server, terminate
-//!   the TLS 1.3 handshake, and observe all QUIC transport metadata — route/stream IDs, sequence numbers,
-//!   frame timing, and connection teardown patterns. The attacker can also drop or replay individual QUIC
-//!   frames at will.
+//! - **Production client verification.** `connect` requires caller-provided CA DER and server name. rustls
+//!   validates the certificate chain, validity, key usage, and hostname before completing the QUIC handshake.
 //!
 //! - **Payload confidentiality and integrity still hold end-to-end.** Cofres are AEAD-sealed (ephemeral
 //!   X25519 per-cofre key-wrap → AEAD) and Ed25519-signed before they reach this substrate
 //!   (`INV-OPAQUE-CARGO`). An attacker who terminates
 //!   the transport layer sees only opaque ciphertext and cannot forge or silently modify cofre payloads.
 //!   This is the DERP blind-relay property (SPEC 07): the transport is deliberately untrusted.
-//!
-//! - **Production use requires real certs and real verification.** Deployments that need transport-layer
-//!   peer authentication must replace the embedded cert/key pair with certificates issued by a trusted CA
-//!   and must replace `AcceptAnyServerCert` with a verifier that validates the certificate chain and server
-//!   identity. Until that is done, this substrate provides QUIC framing and flow control only — it provides
-//!   no transport-layer security guarantees whatsoever.
 
 #![forbid(unsafe_code)]
 
@@ -59,6 +44,8 @@ const DEV_CERT_DER: &[u8] = include_bytes!("dev_cert.der");
 const DEV_KEY_DER: &[u8] = include_bytes!("dev_key.der");
 /// Application-layer protocol negotiation token; client and server must agree (QUIC requires ALPN).
 const ALPN: &[u8] = b"datarail-quic-v1";
+/// DNS name in embedded dev certificate.
+const DEV_SERVER_NAME: &str = "datarail";
 /// Per-step await budget so `recv` returns `None` promptly on an idle/empty transport instead of blocking.
 const STEP_TIMEOUT: Duration = Duration::from_millis(500);
 
@@ -115,7 +102,7 @@ impl rustls::client::danger::ServerCertVerifier for AcceptAnyServerCert {
     }
 }
 
-/// Build the quinn server config (TLS 1.3, ALPN, dev cert) over the `ring` provider.
+/// Build the embedded dev server config (TLS 1.3, ALPN) over the `ring` provider.
 fn server_config() -> io::Result<quinn::ServerConfig> {
     let cert = rustls::pki_types::CertificateDer::from(DEV_CERT_DER.to_vec());
     let key = rustls::pki_types::PrivateKeyDer::Pkcs8(rustls::pki_types::PrivatePkcs8KeyDer::from(
@@ -132,8 +119,27 @@ fn server_config() -> io::Result<quinn::ServerConfig> {
     Ok(quinn::ServerConfig::with_crypto(Arc::new(qsc)))
 }
 
-/// Build the quinn client config (TLS 1.3, ALPN, blind-relay cert acceptance) over the `ring` provider.
-fn client_config() -> io::Result<quinn::ClientConfig> {
+/// Build verified client config from one caller-supplied CA certificate.
+fn verified_client_config(ca_cert_der: &[u8]) -> io::Result<quinn::ClientConfig> {
+    let mut roots = rustls::RootCertStore::empty();
+    roots
+        .add(rustls::pki_types::CertificateDer::from(
+            ca_cert_der.to_vec(),
+        ))
+        .map_err(io::Error::other)?;
+    let mut crypto = rustls::ClientConfig::builder_with_provider(ring_provider())
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .map_err(io::Error::other)?
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    crypto.alpn_protocols = vec![ALPN.to_vec()];
+    let qcc =
+        quinn::crypto::rustls::QuicClientConfig::try_from(crypto).map_err(io::Error::other)?;
+    Ok(quinn::ClientConfig::new(Arc::new(qcc)))
+}
+
+/// Build explicit dev client config that accepts any server certificate.
+fn dev_client_config() -> io::Result<quinn::ClientConfig> {
     let provider = ring_provider();
     let mut crypto = rustls::ClientConfig::builder_with_provider(provider.clone())
         .with_protocol_versions(&[&rustls::version::TLS13])
@@ -147,9 +153,9 @@ fn client_config() -> io::Result<quinn::ClientConfig> {
 }
 
 /// A **cross-host** [`Substrate`] over a QUIC connection (quinn). One ordered uni-stream of length-prefixed
-/// cofres per connection. Three shapes: [`loopback_pair`](Self::loopback_pair) holds both ends locally
-/// (conformance + same-host); [`connect`](Self::connect) is the source (send) side; [`server`](Self::server)
-/// is the destination (recv) side — together a real two-host transfer.
+/// cofres per connection. Three shapes: [`dev_loopback_pair`](Self::dev_loopback_pair) holds both ends locally
+/// (conformance + same-host); [`connect`](Self::connect) is the verified source (send) side; [`dev_server`](Self::dev_server)
+/// is the explicit dev destination (recv) side — together a real two-host transfer.
 pub struct QuicSubstrate {
     rt: tokio::runtime::Runtime,
     /// Server endpoint (destination side) — kept for lazy connection-accept in `recv` and to stay alive.
@@ -165,13 +171,12 @@ pub struct QuicSubstrate {
 }
 
 impl QuicSubstrate {
-    /// A same-object loopback pair over `127.0.0.1`: both endpoints + both connection directions held locally,
-    /// so `send` (client → server uni stream) is received by `recv`. Used by the conformance harness and
-    /// same-host hops.
+    /// An explicit dev/test loopback pair over `127.0.0.1` using the embedded identity and accept-any client.
+    /// Both endpoints + both connection directions are held locally, so `send` is received by `recv`.
     ///
     /// # Errors
     /// [`io::Error`] if the runtime, endpoints, TLS config, or the QUIC handshake fail.
-    pub fn loopback_pair() -> io::Result<Self> {
+    pub fn dev_loopback_pair() -> io::Result<Self> {
         let rt = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()?;
@@ -179,13 +184,13 @@ impl QuicSubstrate {
             let server_ep = quinn::Endpoint::server(server_config()?, loopback_any())?;
             let server_addr = server_ep.local_addr()?;
             let mut client_ep = quinn::Endpoint::client(loopback_any())?;
-            client_ep.set_default_client_config(client_config()?);
+            client_ep.set_default_client_config(dev_client_config()?);
             // Accept on a spawned task so the client handshake and the server accept progress concurrently
             // (a bidirectional handshake deadlocks if either side is awaited to completion first).
             let accept_ep = server_ep.clone();
             let accept_task = tokio::spawn(async move { accept_one(&accept_ep).await });
             let send_conn = client_ep
-                .connect(server_addr, "datarail")
+                .connect(server_addr, DEV_SERVER_NAME)
                 .map_err(io::Error::other)?
                 .await
                 .map_err(io::Error::other)?;
@@ -205,19 +210,38 @@ impl QuicSubstrate {
         })
     }
 
-    /// The **source** (send) side: connect to a remote rail endpoint at `addr`.
+    /// The **source** (send) side: connect to a remote rail endpoint with CA and hostname verification.
+    ///
+    /// `ca_cert_der` must contain the DER-encoded trust anchor for the server certificate. `server_name` is
+    /// passed to rustls for SNI and hostname verification; it must match a DNS/IP SAN in the certificate.
     ///
     /// # Errors
     /// [`io::Error`] if the runtime, client endpoint, TLS config, or the QUIC handshake fail.
-    pub fn connect(addr: SocketAddr) -> io::Result<Self> {
+    pub fn connect(addr: SocketAddr, server_name: &str, ca_cert_der: &[u8]) -> io::Result<Self> {
+        Self::connect_with_config(addr, server_name, verified_client_config(ca_cert_der)?)
+    }
+
+    /// The explicit dev/test source side: connect using the embedded identity and accept-any verification.
+    ///
+    /// # Errors
+    /// [`io::Error`] if the runtime, client endpoint, TLS config, or the QUIC handshake fail.
+    pub fn dev_connect(addr: SocketAddr) -> io::Result<Self> {
+        Self::connect_with_config(addr, DEV_SERVER_NAME, dev_client_config()?)
+    }
+
+    fn connect_with_config(
+        addr: SocketAddr,
+        server_name: &str,
+        client_config: quinn::ClientConfig,
+    ) -> io::Result<Self> {
         let rt = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()?;
         let (client_ep, send_conn) = rt.block_on(async {
             let mut client_ep = quinn::Endpoint::client(loopback_any())?;
-            client_ep.set_default_client_config(client_config()?);
+            client_ep.set_default_client_config(client_config);
             let send_conn = client_ep
-                .connect(addr, "datarail")
+                .connect(addr, server_name)
                 .map_err(io::Error::other)?
                 .await
                 .map_err(io::Error::other)?;
@@ -236,13 +260,13 @@ impl QuicSubstrate {
         })
     }
 
-    /// The **destination** (recv) side: bind a server endpoint at `bind` (use port 0 for an ephemeral port;
-    /// read it back with [`local_addr`](Self::local_addr)). The inbound connection + stream are accepted
-    /// lazily on the first [`recv`](Substrate::recv).
+    /// The explicit dev/test destination side: bind an endpoint using the embedded server identity at `bind`
+    /// (use port 0 for an ephemeral port; read it back with [`local_addr`](Self::local_addr)). The inbound
+    /// connection + stream are accepted lazily on the first [`recv`](Substrate::recv).
     ///
     /// # Errors
     /// [`io::Error`] if the runtime, server endpoint, or TLS config fail.
-    pub fn server(bind: SocketAddr) -> io::Result<Self> {
+    pub fn dev_server(bind: SocketAddr) -> io::Result<Self> {
         let rt = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()?;
@@ -261,7 +285,7 @@ impl QuicSubstrate {
     }
 
     /// The local socket address of whichever endpoint this substrate holds (the bound address for a
-    /// [`server`](Self::server), so a source can be pointed at it).
+    /// [`dev_server`](Self::dev_server), so a source can be pointed at it).
     ///
     /// # Errors
     /// [`io::Error`] if no endpoint is held or the address cannot be read.
@@ -452,14 +476,14 @@ mod tests {
     fn ac6_quic_passes_substrate_conformance() {
         // The SAME AC-6 flow over a REAL QUIC connection (loopback) — INV-SUBSTRATE-POLYMORPHIC now holds over
         // quinn too. The single ordered uni stream preserves the FIFO the harness asserts.
-        substrate_conformance(|| QuicSubstrate::loopback_pair().expect("quic loopback pair"));
+        substrate_conformance(|| QuicSubstrate::dev_loopback_pair().expect("quic loopback pair"));
     }
 
     #[test]
     fn quic_two_endpoint_transfers_cofre_byte_for_byte() {
         // A genuine TWO-ENDPOINT transfer (separate server + client across threads, as a cross-host hop would
         // be): a cofre sealed at the source survives the QUIC transport byte-for-byte at the destination.
-        let mut dst = QuicSubstrate::server(super::loopback_any()).expect("bind server");
+        let mut dst = QuicSubstrate::dev_server(super::loopback_any()).expect("bind server");
         let addr = dst.local_addr().expect("server addr");
         let sent = testsupport::cofre_seq(7);
         let expected = sent.clone();
@@ -467,7 +491,8 @@ mod tests {
         // Keep the source alive (its runtime drives transmission) until the dest has the cofre.
         let (done_tx, done_rx) = mpsc::channel::<()>();
         let src = thread::spawn(move || {
-            let mut src = QuicSubstrate::connect(addr).expect("connect");
+            let mut src =
+                QuicSubstrate::connect(addr, "datarail", super::DEV_CERT_DER).expect("connect");
             src.send(&sent).expect("send");
             let _ = done_rx.recv(); // hold the connection open until main signals receipt
         });
@@ -485,5 +510,57 @@ mod tests {
             got, expected,
             "cofre survived a real cross-endpoint QUIC transport byte-for-byte"
         );
+    }
+
+    #[test]
+    fn verified_client_rejects_untrusted_certificate() {
+        let mut dst = QuicSubstrate::dev_server(super::loopback_any()).expect("bind server");
+        let addr = dst.local_addr().expect("server addr");
+        let (result_tx, result_rx) = mpsc::channel();
+        let source = thread::spawn(move || {
+            result_tx
+                .send(QuicSubstrate::connect(
+                    addr,
+                    super::DEV_SERVER_NAME,
+                    include_bytes!("wrong_ca.der"),
+                ))
+                .expect("send connection result");
+        });
+
+        let _ = dst.recv();
+        assert!(
+            result_rx
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .expect("connection result")
+                .is_err(),
+            "trusted CA mismatch must fail handshake"
+        );
+        source.join().expect("source thread");
+    }
+
+    #[test]
+    fn verified_client_rejects_wrong_hostname() {
+        let mut dst = QuicSubstrate::dev_server(super::loopback_any()).expect("bind server");
+        let addr = dst.local_addr().expect("server addr");
+        let (result_tx, result_rx) = mpsc::channel();
+        let source = thread::spawn(move || {
+            result_tx
+                .send(QuicSubstrate::connect(
+                    addr,
+                    "not-datarail",
+                    super::DEV_CERT_DER,
+                ))
+                .expect("send connection result");
+        });
+
+        let _ = dst.recv();
+        assert!(
+            result_rx
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .expect("connection result")
+                .is_err(),
+            "hostname mismatch must fail handshake"
+        );
+        source.join().expect("source thread");
     }
 }
