@@ -57,7 +57,9 @@ fn worker(msg_size: usize, batch: usize, delivered: &Arc<AtomicU64>, stop: &Arc<
     while !stop.load(Ordering::Relaxed) {
         let key = seq.to_le_bytes();
         seq += 1;
-        let Ok(cofre) = src.board(&recs, &key) else { continue };
+        let Ok(cofre) = src.board(&recs, &key) else {
+            continue;
+        };
         if let Ok(Disposition::Delivered) = dst.offload(&cofre) {
             let _ = dst.sink_mut().take_committed(); // drain so the sink does not grow
             pending += batch_u64;
@@ -72,9 +74,10 @@ fn worker(msg_size: usize, batch: usize, delivered: &Arc<AtomicU64>, stop: &Arc<
 
 fn main() {
     let a: Vec<String> = std::env::args().skip(1).collect();
-    let threads: usize = a.first().and_then(|s| s.parse().ok()).unwrap_or_else(|| {
-        thread::available_parallelism().map_or(8, std::num::NonZeroUsize::get)
-    });
+    let threads: usize = a
+        .first()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or_else(|| thread::available_parallelism().map_or(8, std::num::NonZeroUsize::get));
     let msg_size: usize = a.get(1).and_then(|s| s.parse().ok()).unwrap_or(1024);
     let batch: usize = a.get(2).and_then(|s| s.parse().ok()).unwrap_or(128);
     let measure_secs: u64 = a.get(3).and_then(|s| s.parse().ok()).unwrap_or(20);

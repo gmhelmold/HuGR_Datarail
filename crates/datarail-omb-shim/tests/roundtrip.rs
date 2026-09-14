@@ -62,7 +62,11 @@ fn spawn_shim() -> Shim {
     let n = reader.read_line(&mut line).expect("read announce line");
     assert!(n > 0, "shim exited before announcing its bound ports");
     let (ingress_addr, egress_addr) = parse_announce(line.trim_end());
-    Shim { child, ingress_addr, egress_addr }
+    Shim {
+        child,
+        ingress_addr,
+        egress_addr,
+    }
 }
 
 /// Parse `DATARAIL-OMB-SHIM ingress=ADDR egress=ADDR substrate=...` into `(ingress_addr, egress_addr)`.
@@ -89,7 +93,10 @@ fn connect(addr: &str) -> TcpStream {
         match TcpStream::connect(addr) {
             Ok(s) => return s,
             Err(e) => {
-                assert!(Instant::now() < deadline, "could not connect to {addr}: {e}");
+                assert!(
+                    Instant::now() < deadline,
+                    "could not connect to {addr}: {e}"
+                );
                 std::thread::sleep(Duration::from_millis(20));
             }
         }
@@ -154,14 +161,21 @@ fn roundtrip_1000_messages_zero_loss_zero_dup_ts_preserved() {
     let acks = read_acks(&mut producer, N);
     assert_eq!(acks.len(), N, "expected {N} acks");
     for (i, seq) in acks.iter().enumerate() {
-        assert_eq!(*seq, i as u64, "ack {i} should be monotonic seq {i}, got {seq}");
+        assert_eq!(
+            *seq, i as u64,
+            "ack {i} should be monotonic seq {i}, got {seq}"
+        );
     }
 
     // 4) Collect delivered frames from the consumer thread.
     let delivered = consumer_handle.join().expect("consumer thread");
 
     // ---- ASSERTIONS: all N, byte-identical, ts preserved, 0 loss / 0 dup. ----
-    assert_eq!(delivered.len(), N, "consumer must receive all {N} messages (0 loss)");
+    assert_eq!(
+        delivered.len(),
+        N,
+        "consumer must receive all {N} messages (0 loss)"
+    );
 
     // Every message index must appear exactly once (0 dup), with the right payload and ts.
     let mut seen = vec![0u32; N];
@@ -174,7 +188,10 @@ fn roundtrip_1000_messages_zero_loss_zero_dup_ts_preserved() {
         seen[idx] += 1;
     }
     for (idx, count) in seen.iter().enumerate() {
-        assert_eq!(*count, 1, "message {idx} delivered exactly once (got {count}) — 0 loss / 0 dup");
+        assert_eq!(
+            *count, 1,
+            "message {idx} delivered exactly once (got {count}) — 0 loss / 0 dup"
+        );
     }
 }
 
@@ -205,7 +222,9 @@ fn drain_consumer(stream: &mut TcpStream) -> Vec<(Vec<u8>, u64)> {
             break; // timeout / close: return what we have; the test asserts on the count.
         }
         let payload_len = u32::from_be_bytes([hdr[0], hdr[1], hdr[2], hdr[3]]) as usize;
-        let ts = u64::from_be_bytes([hdr[4], hdr[5], hdr[6], hdr[7], hdr[8], hdr[9], hdr[10], hdr[11]]);
+        let ts = u64::from_be_bytes([
+            hdr[4], hdr[5], hdr[6], hdr[7], hdr[8], hdr[9], hdr[10], hdr[11],
+        ]);
         let mut payload = vec![0u8; payload_len];
         if read_exact(stream, &mut payload).is_err() {
             break;

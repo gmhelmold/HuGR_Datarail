@@ -44,18 +44,29 @@ fn broker_codec_never_panics_on_garbage() {
 
 #[test]
 fn broker_request_response_round_trip() {
-    use datarail_broker::{decode_request, decode_response, encode_request, encode_response, Request, Response};
+    use datarail_broker::{
+        decode_request, decode_response, encode_request, encode_response, Request, Response,
+    };
     let mut rng = Rng::new(0x4242);
     for _ in 0..100_000 {
         let req = match rng.below(3) {
-            0 => Request::Produce { key: rng.bytes(40), payload: rng.bytes(80) },
-            1 => Request::Poll { group: String::from_utf8_lossy(&rng.bytes(20)).into_owned() },
+            0 => Request::Produce {
+                key: rng.bytes(40),
+                payload: rng.bytes(80),
+            },
+            1 => Request::Poll {
+                group: String::from_utf8_lossy(&rng.bytes(20)).into_owned(),
+            },
             _ => Request::Commit {
                 group: String::from_utf8_lossy(&rng.bytes(20)).into_owned(),
                 offset: rng.next(),
             },
         };
-        assert_eq!(decode_request(&encode_request(&req)), Some(req.clone()), "request did not round-trip: {req:?}");
+        assert_eq!(
+            decode_request(&encode_request(&req)),
+            Some(req.clone()),
+            "request did not round-trip: {req:?}"
+        );
 
         let resp = match rng.below(4) {
             0 => Response::Produced(rng.next()),
@@ -64,7 +75,11 @@ fn broker_request_response_round_trip() {
             2 => Response::Committed,
             _ => Response::Err(String::from_utf8_lossy(&rng.bytes(30)).into_owned()),
         };
-        assert_eq!(decode_response(&encode_response(&resp)), Some(resp.clone()), "response did not round-trip: {resp:?}");
+        assert_eq!(
+            decode_response(&encode_response(&resp)),
+            Some(resp.clone()),
+            "response did not round-trip: {resp:?}"
+        );
     }
 }
 
@@ -80,7 +95,9 @@ fn erasure_reconstructs_after_random_loss() {
         let m = 1 + rng.below(6);
         let Ok(rs) = Rs::new(k, m) else { continue };
         let shard_len = 1 + rng.below(64);
-        let data: Vec<Vec<u8>> = (0..k).map(|_| (0..shard_len).map(|_| (rng.next() & 0xff) as u8).collect()).collect();
+        let data: Vec<Vec<u8>> = (0..k)
+            .map(|_| (0..shard_len).map(|_| (rng.next() & 0xff) as u8).collect())
+            .collect();
         let refs: Vec<&[u8]> = data.iter().map(Vec::as_slice).collect();
         let parity = rs.encode(&refs).expect("encode");
         // All k+m code shards, then drop a random m of them → k survive.
@@ -93,7 +110,8 @@ fn erasure_reconstructs_after_random_loss() {
             let j = i + rng.below(all.len() - i);
             all.swap(i, j);
         }
-        let survivors: Vec<(usize, &[u8])> = all[..k].iter().map(|(i, b)| (*i, b.as_slice())).collect();
+        let survivors: Vec<(usize, &[u8])> =
+            all[..k].iter().map(|(i, b)| (*i, b.as_slice())).collect();
         let recovered = rs.reconstruct(&survivors).expect("reconstruct");
         assert_eq!(recovered, data, "erasure failed for k={k} m={m}");
     }
@@ -110,8 +128,10 @@ fn erasure_reconstruct_never_panics_on_garbage() {
         // Random number of survivors with random (possibly invalid/duplicate/out-of-range) indices + ragged bytes.
         let n = rng.below(k + m + 2);
         let blobs: Vec<Vec<u8>> = (0..n).map(|_| rng.bytes(40)).collect();
-        let survivors: Vec<(usize, &[u8])> =
-            blobs.iter().map(|b| (rng.below(k + m + 3), b.as_slice())).collect();
+        let survivors: Vec<(usize, &[u8])> = blobs
+            .iter()
+            .map(|b| (rng.below(k + m + 3), b.as_slice()))
+            .collect();
         // Must return Ok/Err — never panic — for any junk.
         let _ = rs.reconstruct(&survivors);
     }
@@ -129,7 +149,19 @@ fn blobstore_adversarial_keys_round_trip_and_never_escape() {
     let mut fb = FsBlob::open(&root).expect("open");
     let mut rng = Rng::new(0x5701);
     // A palette of nasty key fragments, plus random bytes.
-    let nasty = ["..", "/", "../", "..\\", ".", "", "%2e%2e", ".tmp.0", "a/b/../../c", "\u{0}", "k"];
+    let nasty = [
+        "..",
+        "/",
+        "../",
+        "..\\",
+        ".",
+        "",
+        "%2e%2e",
+        ".tmp.0",
+        "a/b/../../c",
+        "\u{0}",
+        "k",
+    ];
     for _ in 0..2_000 {
         let key: String = if rng.below(2) == 0 {
             nasty[rng.below(nasty.len())].to_owned()
@@ -138,7 +170,11 @@ fn blobstore_adversarial_keys_round_trip_and_never_escape() {
         };
         let val = rng.bytes(40);
         fb.put(&key, &val).expect("put");
-        assert_eq!(fb.get(&key).expect("get"), Some(val.clone()), "key did not round-trip: {key:?}");
+        assert_eq!(
+            fb.get(&key).expect("get"),
+            Some(val.clone()),
+            "key did not round-trip: {key:?}"
+        );
         // The escape check: nothing must ever be written OUTSIDE the store root (i.e. directly under `parent`).
         for entry in std::fs::read_dir(&parent).expect("read parent") {
             let p = entry.expect("entry").path();
@@ -171,7 +207,11 @@ fn netblob_server_survives_garbage() {
     // The server is still alive and correct: a real op round-trips.
     let mut client = NetBlob::new(addr);
     client.put("after-flood", b"ok").expect("put after flood");
-    assert_eq!(client.get("after-flood").expect("get"), Some(b"ok".to_vec()), "server died under garbage");
+    assert_eq!(
+        client.get("after-flood").expect("get"),
+        Some(b"ok".to_vec()),
+        "server died under garbage"
+    );
 }
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -182,7 +222,8 @@ fn replaylog_survives_garbage_on_disk() {
     use datarail_replaylog::ReplayLog;
     let mut rng = Rng::new(0x1066);
     for it in 0..200 {
-        let dir = std::env::temp_dir().join(format!("datarail-fuzz-rl-{}-{it}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("datarail-fuzz-rl-{}-{it}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("mkdir");
         // Write a random-bytes file named like the first segment (000…0.seg).
@@ -269,8 +310,8 @@ fn kafka_consume_parsers_never_panic_on_garbage() {
 fn kafka_group_parsers_never_panic_on_garbage() {
     use datarail_kafka::codec::Reader;
     use datarail_kafka::groups::{
-        parse_find_coordinator, parse_heartbeat, parse_join_group, parse_leave_group, parse_offset_commit,
-        parse_offset_fetch, parse_sync_group,
+        parse_find_coordinator, parse_heartbeat, parse_join_group, parse_leave_group,
+        parse_offset_commit, parse_offset_fetch, parse_sync_group,
     };
     let mut rng = Rng::new(0x5EA1_ED00_4B1D);
     for _ in 0..100_000 {
