@@ -150,7 +150,9 @@ fn fetch(target: &Target) -> io::Result<Vec<u8>> {
         decode_chunked(body)
     } else if let Some(len) = content_length {
         if len > body.len() {
-            return Err(invalid_data("HTTP response truncated: body shorter than Content-Length"));
+            return Err(invalid_data(
+                "HTTP response truncated: body shorter than Content-Length",
+            ));
         }
         Ok(body.get(..len).unwrap_or(&[]).to_vec())
     } else {
@@ -182,15 +184,12 @@ fn decode_chunked(mut body: &[u8]) -> io::Result<Vec<u8>> {
             .ok_or_else(|| invalid_data("chunked body missing size line"))?;
         let size_field = body.get(..line_end).unwrap_or(&[]);
         // A chunk size may carry `;ext` extensions — keep only the hex size token.
-        let size_hex = size_field
-            .split(|&b| b == b';')
-            .next()
-            .unwrap_or(&[]);
+        let size_hex = size_field.split(|&b| b == b';').next().unwrap_or(&[]);
         let size_str = std::str::from_utf8(size_hex)
             .map_err(|_| invalid_data("chunk size is not utf-8"))?
             .trim();
-        let size = usize::from_str_radix(size_str, 16)
-            .map_err(|_| invalid_data("invalid chunk size"))?;
+        let size =
+            usize::from_str_radix(size_str, 16).map_err(|_| invalid_data("invalid chunk size"))?;
         let data_start = line_end + 2;
         if size == 0 {
             break;
@@ -254,15 +253,16 @@ mod tests {
     fn drain(url: &str) -> Vec<Vec<u8>> {
         let mut src = HttpSource::get(url).expect("get");
         let batch = src.next_batch().expect("next").expect("some batch");
-        assert!(src.next_batch().expect("drained").is_none(), "drains after one batch");
+        assert!(
+            src.next_batch().expect("drained").is_none(),
+            "drains after one batch"
+        );
         batch
     }
 
     #[test]
     fn connection_close_three_lines() {
-        let url = serve_once(
-            b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\nevt:a\nevt:b\nevt:c\n",
-        );
+        let url = serve_once(b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\nevt:a\nevt:b\nevt:c\n");
         assert_eq!(
             drain(&url),
             vec![b"evt:a".to_vec(), b"evt:b".to_vec(), b"evt:c".to_vec()]
@@ -285,14 +285,15 @@ mod tests {
         let url = serve_once(
             b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\nConnection: close\r\n\r\nevt:a\n",
         );
-        assert!(HttpSource::get(&url).is_err(), "truncated body shorter than Content-Length must error");
+        assert!(
+            HttpSource::get(&url).is_err(),
+            "truncated body shorter than Content-Length must error"
+        );
     }
 
     #[test]
     fn crlf_body_strips_cr() {
-        let url = serve_once(
-            b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\nx:1\r\nx:2\r\n",
-        );
+        let url = serve_once(b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\nx:1\r\nx:2\r\n");
         assert_eq!(drain(&url), vec![b"x:1".to_vec(), b"x:2".to_vec()]);
     }
 
@@ -307,9 +308,8 @@ mod tests {
 
     #[test]
     fn non_2xx_is_error() {
-        let url = serve_once(
-            b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-        );
+        let url =
+            serve_once(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
         let err = HttpSource::get(&url).expect_err("404 must error");
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
     }
