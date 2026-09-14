@@ -433,7 +433,6 @@ version = "0.1.0"
 name = "datarail-manifest"
 version = "0.1.0"
 dependencies = [
- "datarail-core",
  "datarail-crypto",
 ]
 
