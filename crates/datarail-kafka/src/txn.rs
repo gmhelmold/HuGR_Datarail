@@ -119,7 +119,10 @@ impl TxnCoordinator {
     /// allocator's range by the caller).
     #[must_use]
     pub fn new(first_producer_id: i64) -> Self {
-        Self { inner: Mutex::new(TxnInner::default()), next_producer_id: AtomicI64::new(first_producer_id) }
+        Self {
+            inner: Mutex::new(TxnInner::default()),
+            next_producer_id: AtomicI64::new(first_producer_id),
+        }
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, TxnInner> {
@@ -205,7 +208,11 @@ impl TxnCoordinator {
         }
         // One open txn per partition: if ANY requested partition is already claimed by a DIFFERENT txn, reject the
         // whole request (claim nothing) with a retriable CONCURRENT_TRANSACTIONS — the producer retries later.
-        if partitions.iter().any(|p| claimed.get(p).is_some_and(|holder| holder.as_str() != transactional_id)) {
+        if partitions.iter().any(|p| {
+            claimed
+                .get(p)
+                .is_some_and(|holder| holder.as_str() != transactional_id)
+        }) {
             return CONCURRENT_TRANSACTIONS;
         }
         st.ongoing = true;
@@ -217,7 +224,13 @@ impl TxnCoordinator {
     }
 
     /// `AddOffsetsToTxn`: record that this txn will commit offsets for `group` (opening it). Returns an error code.
-    pub fn add_offsets(&self, transactional_id: &str, producer_id: i64, epoch: i16, group: &str) -> i16 {
+    pub fn add_offsets(
+        &self,
+        transactional_id: &str,
+        producer_id: i64,
+        epoch: i16,
+        group: &str,
+    ) -> i16 {
         let mut g = self.lock();
         let Some(st) = g.txns.get_mut(transactional_id) else {
             return INVALID_PRODUCER_EPOCH;
@@ -255,7 +268,13 @@ impl TxnCoordinator {
     /// (on commit) the staged offsets — WITHOUT resetting. The caller flushes/discards the buffers durably and, only
     /// on success, calls [`finish_txn`](Self::finish_txn). Keeping the txn open until the durable flush succeeds is
     /// what lets a failed commit be RETRIED (audit: a swallowed mid-flush error must not be acked as success).
-    pub fn end_txn(&self, transactional_id: &str, producer_id: i64, epoch: i16, commit: bool) -> EndTxnOutcome {
+    pub fn end_txn(
+        &self,
+        transactional_id: &str,
+        producer_id: i64,
+        epoch: i16,
+        commit: bool,
+    ) -> EndTxnOutcome {
         let mut g = self.lock();
         let Some(st) = g.txns.get_mut(transactional_id) else {
             return EndTxnOutcome {
@@ -286,19 +305,31 @@ impl TxnCoordinator {
             };
         }
         let partitions: Vec<(String, i32)> = st.partitions.iter().cloned().collect();
-        let (group, offsets) =
-            if commit { (st.group.clone(), st.staged_offsets.clone()) } else { (None, Vec::new()) };
-        EndTxnOutcome { error_code: NONE, committed: commit, partitions, group, offsets }
+        let (group, offsets) = if commit {
+            (st.group.clone(), st.staged_offsets.clone())
+        } else {
+            (None, Vec::new())
+        };
+        EndTxnOutcome {
+            error_code: NONE,
+            committed: commit,
+            partitions,
+            group,
+            offsets,
+        }
     }
 
     /// Finalize a resolved txn — reset its state (ready for the next) and free its partition claims. Called by the
-    /// serve layer ONLY after the durable flush (commit) / discard (abort) succeeded. Idempotent if the txn is gone.
-    pub fn finish_txn(&self, transactional_id: &str) {
+    /// serve layer ONLY after the durable flush (commit) / discard (abort) succeeded. A stale completion cannot reset
+    /// a newer producer epoch.
+    pub fn finish_txn(&self, transactional_id: &str, producer_id: i64, epoch: i16) {
         let mut g = self.lock();
         if let Some(st) = g.txns.get_mut(transactional_id) {
-            st.reset_txn();
+            if st.producer_id == producer_id && st.epoch == epoch {
+                st.reset_txn();
+                g.release_claims(transactional_id);
+            }
         }
-        g.release_claims(transactional_id);
     }
 }
 
@@ -342,7 +373,11 @@ fn parse_txn_header(reader: &mut Reader) -> io::Result<TxnHeader> {
     let transactional_id = reader.string()?;
     let producer_id = reader.int64()?;
     let epoch = reader.int16()?;
-    Ok(TxnHeader { transactional_id, producer_id, epoch })
+    Ok(TxnHeader {
+        transactional_id,
+        producer_id,
+        epoch,
+    })
 }
 
 /// A parsed `AddPartitionsToTxn` request.
@@ -362,7 +397,10 @@ pub struct AddPartitionsRequest {
 ///
 /// # Errors
 /// [`io::Error`] if malformed.
-pub fn parse_add_partitions(reader: &mut Reader, _version: i16) -> io::Result<AddPartitionsRequest> {
+pub fn parse_add_partitions(
+    reader: &mut Reader,
+    _version: i16,
+) -> io::Result<AddPartitionsRequest> {
     let h = parse_txn_header(reader)?;
     let tc = bounded(reader.int32()?, reader, MIN_TOPIC_BYTES);
     let mut topics = Vec::new();
@@ -375,12 +413,21 @@ pub fn parse_add_partitions(reader: &mut Reader, _version: i16) -> io::Result<Ad
         }
         topics.push((name, parts));
     }
-    Ok(AddPartitionsRequest { transactional_id: h.transactional_id, producer_id: h.producer_id, epoch: h.epoch, topics })
+    Ok(AddPartitionsRequest {
+        transactional_id: h.transactional_id,
+        producer_id: h.producer_id,
+        epoch: h.epoch,
+        topics,
+    })
 }
 
 /// Build an `AddPartitionsToTxn` response mirroring the topics/partitions, each with `error_code`.
 #[must_use]
-pub fn add_partitions_response(correlation_id: i32, topics: &[(String, Vec<i32>)], error_code: i16) -> Vec<u8> {
+pub fn add_partitions_response(
+    correlation_id: i32,
+    topics: &[(String, Vec<i32>)],
+    error_code: i16,
+) -> Vec<u8> {
     let mut w = Writer::new();
     write_response_header(&mut w, correlation_id, false);
     w.int32(0); // throttle_time_ms
@@ -400,7 +447,10 @@ pub fn add_partitions_response(correlation_id: i32, topics: &[(String, Vec<i32>)
 ///
 /// # Errors
 /// [`io::Error`] if malformed.
-pub fn parse_add_offsets(reader: &mut Reader, _version: i16) -> io::Result<(String, i64, i16, String)> {
+pub fn parse_add_offsets(
+    reader: &mut Reader,
+    _version: i16,
+) -> io::Result<(String, i64, i16, String)> {
     let h = parse_txn_header(reader)?;
     let group_id = reader.string()?;
     Ok((h.transactional_id, h.producer_id, h.epoch, group_id))
@@ -437,7 +487,10 @@ pub struct TxnOffsetCommitRequest {
 ///
 /// # Errors
 /// [`io::Error`] if malformed.
-pub fn parse_txn_offset_commit(reader: &mut Reader, _version: i16) -> io::Result<TxnOffsetCommitRequest> {
+pub fn parse_txn_offset_commit(
+    reader: &mut Reader,
+    _version: i16,
+) -> io::Result<TxnOffsetCommitRequest> {
     let transactional_id = reader.string()?;
     let group_id = reader.string()?;
     let producer_id = reader.int64()?;
@@ -458,7 +511,14 @@ pub fn parse_txn_offset_commit(reader: &mut Reader, _version: i16) -> io::Result
         }
         topics.push((name, parts));
     }
-    Ok(TxnOffsetCommitRequest { transactional_id, group_id, producer_id, epoch, offsets, topics })
+    Ok(TxnOffsetCommitRequest {
+        transactional_id,
+        group_id,
+        producer_id,
+        epoch,
+        offsets,
+        topics,
+    })
 }
 
 /// Parse `EndTxn` (v0–v1) → `(transactional_id, producer_id, epoch, committed)`.
@@ -474,9 +534,10 @@ pub fn parse_end_txn(reader: &mut Reader, _version: i16) -> io::Result<(String, 
 #[cfg(test)]
 mod tests {
     use super::{
-        add_partitions_response, init_producer_id_response, parse_add_offsets, parse_add_partitions,
-        parse_end_txn, parse_init_producer_id, parse_txn_offset_commit, throttle_error_response, TxnCoordinator,
-        CONCURRENT_TRANSACTIONS, INVALID_PRODUCER_EPOCH, INVALID_TXN_STATE, NONE,
+        add_partitions_response, init_producer_id_response, parse_add_offsets,
+        parse_add_partitions, parse_end_txn, parse_init_producer_id, parse_txn_offset_commit,
+        throttle_error_response, TxnCoordinator, CONCURRENT_TRANSACTIONS, INVALID_PRODUCER_EPOCH,
+        INVALID_TXN_STATE, NONE,
     };
     use crate::codec::{Reader, Writer};
 
@@ -486,7 +547,10 @@ mod tests {
         let (pa, ea) = c.init_producer_id("tx-A");
         let (pb, eb) = c.init_producer_id("tx-B");
         // A claims events:0.
-        assert_eq!(c.add_partitions("tx-A", pa, ea, &[("events".to_owned(), 0)]), NONE);
+        assert_eq!(
+            c.add_partitions("tx-A", pa, ea, &[("events".to_owned(), 0)]),
+            NONE
+        );
         // B cannot claim the same partition while A's txn is open → retriable CONCURRENT_TRANSACTIONS.
         assert_eq!(
             c.add_partitions("tx-B", pb, eb, &[("events".to_owned(), 0)]),
@@ -494,10 +558,13 @@ mod tests {
             "a second open txn on the same partition is rejected"
         );
         // B CAN claim a different partition.
-        assert_eq!(c.add_partitions("tx-B", pb, eb, &[("events".to_owned(), 1)]), NONE);
+        assert_eq!(
+            c.add_partitions("tx-B", pb, eb, &[("events".to_owned(), 1)]),
+            NONE
+        );
         // After A finishes, B can claim events:0 (claims free on finish_txn, not the prepare).
         assert_eq!(c.end_txn("tx-A", pa, ea, true).error_code, NONE);
-        c.finish_txn("tx-A");
+        c.finish_txn("tx-A", pa, ea);
         assert_eq!(
             c.add_partitions("tx-B", pb, eb, &[("events".to_owned(), 0)]),
             NONE,
@@ -521,7 +588,33 @@ mod tests {
             "a zombie at the old epoch is rejected"
         );
         // The new epoch works.
-        assert_eq!(c.add_partitions("tx-A", pid2, ep2, &[("t".to_owned(), 0)]), NONE);
+        assert_eq!(
+            c.add_partitions("tx-A", pid2, ep2, &[("t".to_owned(), 0)]),
+            NONE
+        );
+    }
+
+    #[test]
+    fn stale_finish_cannot_reset_new_epoch() {
+        let c = TxnCoordinator::new(1000);
+        let (old_pid, old_epoch) = c.init_producer_id("tx-A");
+        assert_eq!(
+            c.add_partitions("tx-A", old_pid, old_epoch, &[("t".to_owned(), 0)]),
+            NONE
+        );
+        assert_eq!(c.end_txn("tx-A", old_pid, old_epoch, true).error_code, NONE);
+
+        let (new_pid, new_epoch) = c.init_producer_id("tx-A");
+        assert_eq!(new_pid, old_pid);
+        assert_eq!(new_epoch, old_epoch + 1);
+        assert_eq!(
+            c.add_partitions("tx-A", new_pid, new_epoch, &[("t".to_owned(), 1)]),
+            NONE
+        );
+
+        c.finish_txn("tx-A", old_pid, old_epoch);
+        assert_eq!(c.produce_check(new_pid, new_epoch, "t", 1), NONE);
+        assert_eq!(c.end_txn("tx-A", new_pid, new_epoch, true).error_code, NONE);
     }
 
     #[test]
@@ -536,21 +629,47 @@ mod tests {
     fn commit_returns_partitions_and_staged_offsets_then_resets() {
         let c = TxnCoordinator::new(1000);
         let (pid, ep) = c.init_producer_id("tx-A");
-        assert_eq!(c.add_partitions("tx-A", pid, ep, &[("events".to_owned(), 0), ("events".to_owned(), 1)]), NONE);
+        assert_eq!(
+            c.add_partitions(
+                "tx-A",
+                pid,
+                ep,
+                &[("events".to_owned(), 0), ("events".to_owned(), 1)]
+            ),
+            NONE
+        );
         assert_eq!(c.add_offsets("tx-A", pid, ep, "grp"), NONE);
-        assert_eq!(c.stage_offsets("tx-A", pid, ep, &[("src".to_owned(), 0, 42)]), NONE);
+        assert_eq!(
+            c.stage_offsets("tx-A", pid, ep, &[("src".to_owned(), 0, 42)]),
+            NONE
+        );
         let out = c.end_txn("tx-A", pid, ep, true);
         assert_eq!(out.error_code, NONE);
         assert!(out.committed);
-        assert_eq!(out.partitions.len(), 2, "both enrolled partitions get a COMMIT marker");
+        assert_eq!(
+            out.partitions.len(),
+            2,
+            "both enrolled partitions get a COMMIT marker"
+        );
         assert_eq!(out.group.as_deref(), Some("grp"));
-        assert_eq!(out.offsets, vec![("src".to_owned(), 0, 42)], "staged offsets committed atomically");
+        assert_eq!(
+            out.offsets,
+            vec![("src".to_owned(), 0, 42)],
+            "staged offsets committed atomically"
+        );
         // EndTxn (prepare) does NOT reset — the txn stays open so a failed durable flush can be retried; a re-prepare
         // still validates.
-        assert_eq!(c.end_txn("tx-A", pid, ep, true).error_code, NONE, "re-prepare is valid until finish");
+        assert_eq!(
+            c.end_txn("tx-A", pid, ep, true).error_code,
+            NONE,
+            "re-prepare is valid until finish"
+        );
         // finish_txn resets it — a subsequent EndTxn has no open txn → INVALID_TXN_STATE.
-        c.finish_txn("tx-A");
-        assert_eq!(c.end_txn("tx-A", pid, ep, true).error_code, INVALID_TXN_STATE);
+        c.finish_txn("tx-A", pid, ep);
+        assert_eq!(
+            c.end_txn("tx-A", pid, ep, true).error_code,
+            INVALID_TXN_STATE
+        );
     }
 
     #[test]
@@ -563,13 +682,24 @@ mod tests {
         // An UNCLAIMED partition → rejected (it was never AddPartitionsToTxn'd).
         assert_eq!(c.produce_check(pid, ep, "events", 1), INVALID_TXN_STATE);
         // A STALE epoch (zombie) → fenced.
-        assert_eq!(c.produce_check(pid, ep - 1, "events", 0), INVALID_PRODUCER_EPOCH);
+        assert_eq!(
+            c.produce_check(pid, ep - 1, "events", 0),
+            INVALID_PRODUCER_EPOCH
+        );
         // After a re-init bumps the epoch, the old epoch is fenced on the produce path too.
         let (pid2, ep2) = c.init_producer_id("tx-A");
         assert_eq!(pid2, pid);
-        assert_eq!(c.produce_check(pid, ep, "events", 0), INVALID_PRODUCER_EPOCH, "old epoch fenced after re-init");
+        assert_eq!(
+            c.produce_check(pid, ep, "events", 0),
+            INVALID_PRODUCER_EPOCH,
+            "old epoch fenced after re-init"
+        );
         // The new incarnation must re-claim before producing.
-        assert_eq!(c.produce_check(pid2, ep2, "events", 0), INVALID_TXN_STATE, "must AddPartitions again");
+        assert_eq!(
+            c.produce_check(pid2, ep2, "events", 0),
+            INVALID_TXN_STATE,
+            "must AddPartitions again"
+        );
         c.add_partitions("tx-A", pid2, ep2, &[("events".to_owned(), 0)]);
         assert_eq!(c.produce_check(pid2, ep2, "events", 0), NONE);
         // An unknown producer id → fenced.
@@ -584,7 +714,10 @@ mod tests {
         w.int32(60_000);
         let body = w.into_bytes();
         let mut r = Reader::new(&body);
-        assert_eq!(parse_init_producer_id(&mut r).unwrap().as_deref(), Some("tx-A"));
+        assert_eq!(
+            parse_init_producer_id(&mut r).unwrap().as_deref(),
+            Some("tx-A")
+        );
         let resp = init_producer_id_response(7, 1000, 3);
         let mut rr = Reader::new(&resp);
         assert_eq!(rr.int32().unwrap(), 7); // corr
@@ -619,7 +752,10 @@ mod tests {
         w.string("grp");
         let body = w.into_bytes();
         let mut r = Reader::new(&body);
-        assert_eq!(parse_add_offsets(&mut r, 1).unwrap(), ("tx-A".to_owned(), 1000, 3, "grp".to_owned()));
+        assert_eq!(
+            parse_add_offsets(&mut r, 1).unwrap(),
+            ("tx-A".to_owned(), 1000, 3, "grp".to_owned())
+        );
         let _ = throttle_error_response(7, NONE);
 
         let mut w = Writer::new();
@@ -629,7 +765,10 @@ mod tests {
         w.int8(1); // committed
         let body = w.into_bytes();
         let mut r = Reader::new(&body);
-        assert_eq!(parse_end_txn(&mut r, 1).unwrap(), ("tx-A".to_owned(), 1000, 3, true));
+        assert_eq!(
+            parse_end_txn(&mut r, 1).unwrap(),
+            ("tx-A".to_owned(), 1000, 3, true)
+        );
 
         // TxnOffsetCommit round-trip.
         let mut w = Writer::new();
@@ -669,7 +808,11 @@ mod tests {
         let out = c.end_txn("tx-A", pid, ep, false);
         assert_eq!(out.error_code, NONE);
         assert!(!out.committed);
-        assert_eq!(out.partitions.len(), 1, "the partition still gets an ABORT marker");
+        assert_eq!(
+            out.partitions.len(),
+            1,
+            "the partition still gets an ABORT marker"
+        );
         assert!(out.offsets.is_empty(), "an aborted txn commits NO offsets");
         assert!(out.group.is_none());
     }

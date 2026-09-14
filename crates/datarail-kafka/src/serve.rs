@@ -17,24 +17,27 @@ use crate::consume::{
     FetchTopicResult, ListOffsetResult, ListOffsetTopicResult, API_FETCH, API_LIST_OFFSETS,
 };
 use crate::coordinator::GroupCoordinator;
-use crate::txn::{
-    add_partitions_response, init_producer_id_response as txn_init_producer_id_response, parse_add_offsets,
-    parse_add_partitions, parse_end_txn, parse_init_producer_id, parse_txn_offset_commit, throttle_error_response,
-    TxnCoordinator, API_ADD_OFFSETS_TO_TXN, API_ADD_PARTITIONS_TO_TXN, API_END_TXN, API_TXN_OFFSET_COMMIT,
-};
 use crate::groups::{
     find_coordinator_response, heartbeat_response, join_group_response, leave_group_response,
-    offset_commit_response, offset_fetch_response, parse_find_coordinator, parse_heartbeat, parse_join_group,
-    parse_leave_group, parse_offset_commit, parse_offset_fetch, parse_sync_group, sync_group_response,
-    JoinGroupResponse, OffsetCommitPartitionResult, OffsetCommitTopicResult, OffsetFetchPartitionResult,
-    OffsetFetchTopicResult, API_FIND_COORDINATOR, API_HEARTBEAT, API_JOIN_GROUP, API_LEAVE_GROUP,
-    API_OFFSET_COMMIT, API_OFFSET_FETCH, API_SYNC_GROUP,
+    offset_commit_response, offset_fetch_response, parse_find_coordinator, parse_heartbeat,
+    parse_join_group, parse_leave_group, parse_offset_commit, parse_offset_fetch, parse_sync_group,
+    sync_group_response, JoinGroupResponse, OffsetCommitPartitionResult, OffsetCommitTopicResult,
+    OffsetFetchPartitionResult, OffsetFetchTopicResult, API_FIND_COORDINATOR, API_HEARTBEAT,
+    API_JOIN_GROUP, API_LEAVE_GROUP, API_OFFSET_COMMIT, API_OFFSET_FETCH, API_SYNC_GROUP,
 };
 use crate::handlers::{
     api_versions_response, init_producer_id_response, metadata_response, parse_metadata_topics,
     API_INIT_PRODUCER_ID, API_METADATA, API_PRODUCE, API_VERSIONS,
 };
-use crate::produce::{build_record_batch, parse_produce, produce_response, EosCoord, ProducedRequest};
+use crate::produce::{
+    build_record_batch, parse_produce, produce_response, EosCoord, ProducedRequest,
+};
+use crate::txn::{
+    add_partitions_response, init_producer_id_response as txn_init_producer_id_response,
+    parse_add_offsets, parse_add_partitions, parse_end_txn, parse_init_producer_id,
+    parse_txn_offset_commit, throttle_error_response, TxnCoordinator, API_ADD_OFFSETS_TO_TXN,
+    API_ADD_PARTITIONS_TO_TXN, API_END_TXN, API_TXN_OFFSET_COMMIT,
+};
 
 /// A connection stream the serve loop reads length-framed requests from and writes responses to. Implemented for
 /// `TcpStream` (plaintext) and — via the CLI's `tls` feature — a rustls TLS stream, so `datarail-kafka` stays
@@ -179,9 +182,13 @@ fn read_frame<R: Read>(stream: &mut R) -> io::Result<Option<Vec<u8>>> {
         Err(e) => return Err(e),
     }
     let len = i32::from_be_bytes(len_buf);
-    let n = usize::try_from(len).map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "negative frame length"))?;
+    let n = usize::try_from(len)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "negative frame length"))?;
     if n > MAX_FRAME {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "frame too large"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "frame too large",
+        ));
     }
     let mut buf = vec![0u8; n];
     stream.read_exact(&mut buf)?;
@@ -199,93 +206,22 @@ fn handle_connection<S: Read + Write>(mut stream: S, shared: &Shared) -> io::Res
             reader.skip_tagged_fields()?;
         }
 
-        // `None` ⇒ write NO response frame for this request. Today only an acks=0 produce is silent (Kafka
-        // fire-and-forget): the records still land durably, but a response would desynchronize the client's
-        // correlation-id stream. Every other request yields `Some(bytes)`.
+        // `None` means silent acks=0 produce; every other request yields `Some(bytes)`.
         let response: Option<Vec<u8>> = match api_key {
             API_VERSIONS => Some(api_versions_response(api_version, correlation_id)),
             API_METADATA => {
                 let topics = parse_metadata_topics(&mut reader)?;
                 // Ingest merges all partitions into one sink, so a single partition is advertised here.
-                Some(metadata_response(api_version, correlation_id, &shared.host, shared.port, &topics, 1))
+                Some(metadata_response(
+                    api_version,
+                    correlation_id,
+                    &shared.host,
+                    shared.port,
+                    &topics,
+                    1,
+                ))
             }
-            API_PRODUCE => {
-                let ProducedRequest { acks, topics } = parse_produce(&mut reader, api_version)?;
-                // ACK-AFTER-DURABLE (audit A): land every partition batch through the integration layer and wait
-                // for its durable-landing result BEFORE building the ack. A landing failure becomes a retriable
-                // error code for that partition — never a false NONE ack that would lose the records on a crash.
-                let mut codes: HashMap<(String, i32), i16> = HashMap::new();
-                for t in &topics {
-                    for p in &t.partitions {
-                        if p.values.is_empty() {
-                            continue; // nothing to land → NONE
-                        }
-                        let (done, done_rx) = std::sync::mpsc::channel();
-                        let sent = shared.tx.send(ProducedBatch {
-                            topic: t.name.clone(),
-                            partition: p.partition,
-                            values: p.values.clone(),
-                            eos: p.eos,
-                            done,
-                        });
-                        // Pick the per-partition error code from the durable-landing result:
-                        //   0  = NONE (durably landed).
-                        //   56 = KAFKA_STORAGE_ERROR (RETRIABLE): the integration layer is gone or the land
-                        //        failed transiently, so the producer retries rather than treating the records as
-                        //        durably stored — never a false NONE ack.
-                        //   87 = INVALID_RECORD (NON-RETRIABLE): a PERMANENT rejection (e.g. a content-contract
-                        //        violation surfaced as `InvalidData`). It must NOT be retried — otherwise
-                        //        librdkafka re-sends the identical, still-rejected batch every ~100ms forever.
-                        let code = match sent {
-                            Err(_) => {
-                                eprintln!(
-                                    "kafka: ingest land unreachable (retriable) topic={} partition={}",
-                                    t.name, p.partition
-                                );
-                                56
-                            }
-                            Ok(()) => match done_rx.recv() {
-                                Ok(Ok(())) => 0,
-                                Ok(Err(e)) => produce_error_code(&t.name, p.partition, &e),
-                                Err(e) => {
-                                    eprintln!(
-                                        "kafka: ingest land result lost (retriable) topic={} partition={} error={e}",
-                                        t.name, p.partition
-                                    );
-                                    56
-                                }
-                            },
-                        };
-                        codes.insert((t.name.clone(), p.partition), code);
-                    }
-                }
-                // Recover from a poisoned lock (the protected state is plain data) so one panicked
-                // connection can't brick produce for the broker's lifetime (audit K5).
-                let mut offsets = shared.offsets.lock().unwrap_or_else(PoisonError::into_inner);
-                // Advance the reported base offsets exactly as an acked produce would (so a later acked request
-                // sees contiguous offsets) — but for acks=0 the built frame is DISCARDED, never written.
-                let built = produce_response(api_version, correlation_id, &topics, &mut |name, part, count| {
-                    let key = (name.to_owned(), part);
-                    let base = *offsets.get(&key).unwrap_or(&0);
-                    let code = codes.get(&key).copied().unwrap_or(0); // read before the insert moves `key`
-                    // Advance the reported base offset ONLY on a durable land (code 0). A failed batch (code 56)
-                    // must NOT consume offsets — else a producer retry sees a non-contiguous gap (audit 4b LOW;
-                    // the sink watermark, not this counter, is the EOS authority, so this is producer-visible
-                    // contiguity, not correctness). Bound the map: past the cap, don't retain new keys (no
-                    // unbounded growth from attacker-chosen identities, audit K1); saturating add (K6).
-                    if code == 0 && (offsets.contains_key(&key) || offsets.len() < MAX_OFFSET_KEYS) {
-                        offsets.insert(key, base.saturating_add(i64::try_from(count).unwrap_or(i64::MAX)));
-                    }
-                    (base, code)
-                });
-                // acks=0 ⇒ fire-and-forget: the records landed above, but we send NO response frame (a response
-                // would shift the client's correlation-id stream by one). acks=1/-1 ⇒ answer normally.
-                if acks == 0 {
-                    None
-                } else {
-                    Some(built)
-                }
-            }
+            API_PRODUCE => handle_ingest_produce(&mut reader, api_version, correlation_id, shared)?,
             API_INIT_PRODUCER_ID => {
                 // Hand out a fresh producer_id so the client can enable idempotence; the request body
                 // (transactional_id / timeout) needs no parsing — each producer just needs a distinct id.
@@ -293,7 +229,9 @@ fn handle_connection<S: Read + Write>(mut stream: S, shared: &Shared) -> io::Res
                 Some(init_producer_id_response(correlation_id, pid))
             }
             other => {
-                return Err(io::Error::other(format!("unsupported Kafka api_key {other}")));
+                return Err(io::Error::other(format!(
+                    "unsupported Kafka api_key {other}"
+                )));
             }
         };
 
@@ -305,6 +243,74 @@ fn handle_connection<S: Read + Write>(mut stream: S, shared: &Shared) -> io::Res
         }
     }
     Ok(())
+}
+
+fn handle_ingest_produce(
+    reader: &mut Reader<'_>,
+    api_version: i16,
+    correlation_id: i32,
+    shared: &Shared,
+) -> io::Result<Option<Vec<u8>>> {
+    let ProducedRequest { acks, topics } = parse_produce(reader, api_version)?;
+    let mut codes: HashMap<(String, i32), i16> = HashMap::new();
+    for topic in &topics {
+        for partition in &topic.partitions {
+            if partition.values.is_empty() {
+                continue;
+            }
+            let (done, done_rx) = std::sync::mpsc::channel();
+            let sent = shared.tx.send(ProducedBatch {
+                topic: topic.name.clone(),
+                partition: partition.partition,
+                values: partition.values.clone(),
+                eos: partition.eos,
+                done,
+            });
+            let code = match sent {
+                Err(_) => {
+                    eprintln!(
+                        "kafka: ingest land unreachable (retriable) topic={} partition={}",
+                        topic.name, partition.partition
+                    );
+                    56
+                }
+                Ok(()) => match done_rx.recv() {
+                    Ok(Ok(())) => 0,
+                    Ok(Err(error)) => produce_error_code(&topic.name, partition.partition, &error),
+                    Err(error) => {
+                        eprintln!(
+                            "kafka: ingest land result lost (retriable) topic={} partition={} error={error}",
+                            topic.name, partition.partition
+                        );
+                        56
+                    }
+                },
+            };
+            codes.insert((topic.name.clone(), partition.partition), code);
+        }
+    }
+    let mut offsets = shared
+        .offsets
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    let response = produce_response(
+        api_version,
+        correlation_id,
+        &topics,
+        &mut |name, partition, count| {
+            let key = (name.to_owned(), partition);
+            let base = *offsets.get(&key).unwrap_or(&0);
+            let code = codes.get(&key).copied().unwrap_or(0);
+            if code == 0 && (offsets.contains_key(&key) || offsets.len() < MAX_OFFSET_KEYS) {
+                offsets.insert(
+                    key,
+                    base.saturating_add(i64::try_from(count).unwrap_or(i64::MAX)),
+                );
+            }
+            (base, code)
+        },
+    );
+    Ok((acks != 0).then_some(response))
 }
 
 /// The CONSUME-side broker backend (see `KAFKA-FETCH-DESIGN.md`). The `kafka-broker` mode wires this to a sealed
@@ -320,7 +326,13 @@ pub trait KafkaBroker: Send + Sync {
     ///
     /// # Errors
     /// Propagates a read/open error.
-    fn fetch(&self, topic: &str, partition: i32, offset: i64, max_bytes: i32) -> io::Result<Vec<Vec<u8>>>;
+    fn fetch(
+        &self,
+        topic: &str,
+        partition: i32,
+        offset: i64,
+        max_bytes: i32,
+    ) -> io::Result<Vec<Vec<u8>>>;
 
     /// The logical `(earliest, latest)` offsets for `(topic, partition)` (latest = the next offset to be written).
     fn bounds(&self, topic: &str, partition: i32) -> (i64, i64);
@@ -350,7 +362,35 @@ pub trait KafkaBroker: Send + Sync {
     ///
     /// # Errors
     /// Propagates a seal/store error (the producer then retries the `EndTxn`).
-    fn commit_txn(&self, _producer_id: i64, _epoch: i16, _partitions: &[(String, i32)]) -> io::Result<()> {
+    fn commit_txn(
+        &self,
+        _producer_id: i64,
+        _epoch: i16,
+        _partitions: &[(String, i32)],
+    ) -> io::Result<()> {
+        Ok(())
+    }
+
+    /// COMMIT a transaction and its staged consumer offsets under one broker-specific durability boundary when
+    /// supported. The default preserves compatibility for stores that only implement the older partition method.
+    ///
+    /// # Errors
+    /// Propagates a seal, store, or offset durability error.
+    fn commit_txn_with_offsets(
+        &self,
+        _transactional_id: &str,
+        producer_id: i64,
+        epoch: i16,
+        partitions: &[(String, i32)],
+        group: Option<&str>,
+        offsets: &[(String, i32, i64)],
+    ) -> io::Result<()> {
+        self.commit_txn(producer_id, epoch, partitions)?;
+        if let Some(group) = group {
+            for (topic, partition, offset) in offsets {
+                self.commit_offset(group, topic, *partition, *offset)?;
+            }
+        }
         Ok(())
     }
 
@@ -363,7 +403,13 @@ pub trait KafkaBroker: Send + Sync {
     ///
     /// # Errors
     /// Propagates a durable-store error (the consumer then gets a retriable code, never a false success).
-    fn commit_offset(&self, _group: &str, _topic: &str, _partition: i32, _offset: i64) -> io::Result<()> {
+    fn commit_offset(
+        &self,
+        _group: &str,
+        _topic: &str,
+        _partition: i32,
+        _offset: i64,
+    ) -> io::Result<()> {
         Ok(())
     }
 
@@ -418,10 +464,22 @@ pub fn serve_broker<B: KafkaBroker + 'static>(
         let conn_wrap = Arc::clone(conn_wrap);
         let creds = creds.clone();
         std::thread::spawn(move || {
-            let ctx = BrokerCtx { host: &host, port: advertised_port, partitions, next_producer_id: &pid };
+            let ctx = BrokerCtx {
+                host: &host,
+                port: advertised_port,
+                partitions,
+                next_producer_id: &pid,
+            };
             // Wrap the raw socket (identity for plaintext, a TLS handshake otherwise) before serving.
             if let Ok(mut s) = conn_wrap.wrap(stream) {
-                let _ = handle_broker_connection(&mut *s, broker.as_ref(), &ctx, &coord, &txn, creds.as_deref());
+                let _ = handle_broker_connection(
+                    &mut *s,
+                    broker.as_ref(),
+                    &ctx,
+                    &coord,
+                    &txn,
+                    creds.as_deref(),
+                );
             }
             active.fetch_sub(1, Ordering::Relaxed);
         });
@@ -455,7 +513,14 @@ fn handle_broker_connection<S: Read + Write, B: KafkaBroker>(
         if request_is_flexible(api_key, api_version) {
             reader.skip_tagged_fields()?;
         }
-        match handle_sasl(api_key, api_version, correlation_id, &mut reader, creds, &mut authenticated)? {
+        match handle_sasl(
+            api_key,
+            api_version,
+            correlation_id,
+            &mut reader,
+            creds,
+            &mut authenticated,
+        )? {
             SaslOutcome::Reply(r) => {
                 stream.write_all(&Writer::frame(&r))?;
                 stream.flush()?;
@@ -471,10 +536,14 @@ fn handle_broker_connection<S: Read + Write, B: KafkaBroker>(
         if !authenticated && api_key != API_VERSIONS {
             return Ok(());
         }
-        let bctx = BrokerReqCtx { broker, ctx, coordinator, txn };
-        let (response, suppress) = handle_broker_request(
-            api_key, api_version, correlation_id, &mut reader, &bctx,
-        )?;
+        let bctx = BrokerReqCtx {
+            broker,
+            ctx,
+            coordinator,
+            txn,
+        };
+        let (response, suppress) =
+            handle_broker_request(api_key, api_version, correlation_id, &mut reader, &bctx)?;
         if !suppress {
             stream.write_all(&Writer::frame(&response))?;
             stream.flush()?;
@@ -504,7 +573,14 @@ fn handle_broker_request<B: KafkaBroker>(
         API_VERSIONS => api_versions_response(api_version, correlation_id),
         API_METADATA => {
             let topics = parse_metadata_topics(reader)?;
-            metadata_response(api_version, correlation_id, bctx.ctx.host, bctx.ctx.port, &topics, bctx.ctx.partitions)
+            metadata_response(
+                api_version,
+                correlation_id,
+                bctx.ctx.host,
+                bctx.ctx.port,
+                &topics,
+                bctx.ctx.partitions,
+            )
         }
         API_INIT_PRODUCER_ID => {
             if let Some(tid) = parse_init_producer_id(reader)? {
@@ -520,29 +596,24 @@ fn handle_broker_request<B: KafkaBroker>(
             let ProducedRequest { acks, topics } = parse_produce(reader, api_version)?;
             let results = produce_results(bctx.broker, bctx.txn, &topics);
             suppress_response = acks == 0;
-            produce_response(api_version, correlation_id, &topics, &mut |name, part, _count| {
-                results.get(&(name.to_owned(), part)).copied().unwrap_or((0, 0))
-            })
+            produce_response(
+                api_version,
+                correlation_id,
+                &topics,
+                &mut |name, part, _count| {
+                    results
+                        .get(&(name.to_owned(), part))
+                        .copied()
+                        .unwrap_or((0, 0))
+                },
+            )
         }
         API_FETCH => {
             let topics = parse_fetch(reader, api_version)?;
             let out = fetch_results(bctx.broker, &topics);
             fetch_response(api_version, correlation_id, &out)
         }
-        API_LIST_OFFSETS => {
-            let topics = parse_list_offsets(reader, api_version)?;
-            let mut out = Vec::with_capacity(topics.len());
-            for t in &topics {
-                let mut parts = Vec::with_capacity(t.partitions.len());
-                for p in &t.partitions {
-                    let (earliest, latest) = bctx.broker.bounds(&t.name, p.partition);
-                    let offset = if p.timestamp == -2 { earliest } else { latest };
-                    parts.push(ListOffsetResult { partition: p.partition, offset });
-                }
-                out.push(ListOffsetTopicResult { name: t.name.clone(), partitions: parts });
-            }
-            list_offsets_response(api_version, correlation_id, &out)
-        }
+        API_LIST_OFFSETS => handle_list_offsets(reader, api_version, correlation_id, bctx.broker)?,
         API_FIND_COORDINATOR => {
             let _group = parse_find_coordinator(reader, api_version)?;
             find_coordinator_response(api_version, correlation_id, 0, bctx.ctx.host, bctx.ctx.port)
@@ -558,16 +629,58 @@ fn handle_broker_request<B: KafkaBroker>(
             offset_fetch_response(api_version, correlation_id, &out)
         }
         other => {
-            if let Some(resp) = dispatch_group_api(other, api_version, correlation_id, reader, bctx.coordinator)? {
+            if let Some(resp) =
+                dispatch_group_api(other, api_version, correlation_id, reader, bctx.coordinator)?
+            {
                 resp
-            } else if let Some(resp) = dispatch_txn_api(other, api_version, correlation_id, reader, bctx.txn, bctx.broker)? {
+            } else if let Some(resp) = dispatch_txn_api(
+                other,
+                api_version,
+                correlation_id,
+                reader,
+                bctx.txn,
+                bctx.broker,
+            )? {
                 resp
             } else {
-                return Err(io::Error::other(format!("unsupported Kafka api_key {other}")));
+                return Err(io::Error::other(format!(
+                    "unsupported Kafka api_key {other}"
+                )));
             }
         }
     };
     Ok((response, suppress_response))
+}
+
+fn handle_list_offsets<B: KafkaBroker>(
+    reader: &mut Reader<'_>,
+    api_version: i16,
+    correlation_id: i32,
+    broker: &B,
+) -> io::Result<Vec<u8>> {
+    let topics = parse_list_offsets(reader, api_version)?;
+    let out = topics
+        .iter()
+        .map(|topic| ListOffsetTopicResult {
+            name: topic.name.clone(),
+            partitions: topic
+                .partitions
+                .iter()
+                .map(|partition| {
+                    let (earliest, latest) = broker.bounds(&topic.name, partition.partition);
+                    ListOffsetResult {
+                        partition: partition.partition,
+                        offset: if partition.timestamp == -2 {
+                            earliest
+                        } else {
+                            latest
+                        },
+                    }
+                })
+                .collect(),
+        })
+        .collect::<Vec<_>>();
+    Ok(list_offsets_response(api_version, correlation_id, &out))
 }
 
 /// What the SASL pre-stage decided for a request: send a reply and keep going, send a reply then close (failed
@@ -591,18 +704,31 @@ fn handle_sasl(
 ) -> io::Result<SaslOutcome> {
     if api_key == crate::sasl::API_SASL_HANDSHAKE {
         let mechanism = crate::sasl::parse_sasl_handshake(reader)?;
-        let code = if mechanism == crate::sasl::PLAIN { 0 } else { crate::sasl::UNSUPPORTED_SASL_MECHANISM };
-        return Ok(SaslOutcome::Reply(crate::sasl::sasl_handshake_response(correlation_id, code, &[crate::sasl::PLAIN])));
+        let code = if mechanism == crate::sasl::PLAIN {
+            0
+        } else {
+            crate::sasl::UNSUPPORTED_SASL_MECHANISM
+        };
+        return Ok(SaslOutcome::Reply(crate::sasl::sasl_handshake_response(
+            correlation_id,
+            code,
+            &[crate::sasl::PLAIN],
+        )));
     }
     if api_key == crate::sasl::API_SASL_AUTHENTICATE {
         let token = crate::sasl::parse_sasl_authenticate(reader, api_version)?;
         let ok = creds.is_none_or(|c| crate::sasl::verify_plain(&token, &c.user, &c.pass));
-        let resp = |code, msg| crate::sasl::sasl_authenticate_response(correlation_id, api_version, code, msg, &[], 0);
+        let resp = |code, msg| {
+            crate::sasl::sasl_authenticate_response(correlation_id, api_version, code, msg, &[], 0)
+        };
         if ok {
             *authenticated = true;
             return Ok(SaslOutcome::Reply(resp(0, None)));
         }
-        return Ok(SaslOutcome::CloseAfter(resp(crate::sasl::SASL_AUTHENTICATION_FAILED, Some("authentication failed"))));
+        return Ok(SaslOutcome::CloseAfter(resp(
+            crate::sasl::SASL_AUTHENTICATION_FAILED,
+            Some("authentication failed"),
+        )));
     }
     Ok(SaslOutcome::Pass)
 }
@@ -619,8 +745,11 @@ fn dispatch_group_api(
     let resp = match api_key {
         API_JOIN_GROUP => {
             let req = parse_join_group(reader, api_version)?;
-            let protocols: Vec<(String, Vec<u8>)> =
-                req.protocols.into_iter().map(|p| (p.name, p.metadata)).collect();
+            let protocols: Vec<(String, Vec<u8>)> = req
+                .protocols
+                .into_iter()
+                .map(|p| (p.name, p.metadata))
+                .collect();
             let o = coordinator.join(
                 &req.group_id,
                 &req.member_id,
@@ -641,9 +770,17 @@ fn dispatch_group_api(
         }
         API_SYNC_GROUP => {
             let req = parse_sync_group(reader, api_version)?;
-            let assignments: Vec<(String, Vec<u8>)> =
-                req.assignments.into_iter().map(|a| (a.member_id, a.assignment)).collect();
-            let o = coordinator.sync(&req.group_id, &req.member_id, req.generation_id, &assignments);
+            let assignments: Vec<(String, Vec<u8>)> = req
+                .assignments
+                .into_iter()
+                .map(|a| (a.member_id, a.assignment))
+                .collect();
+            let o = coordinator.sync(
+                &req.group_id,
+                &req.member_id,
+                req.generation_id,
+                &assignments,
+            );
             sync_group_response(api_version, correlation_id, o.error_code, &o.assignment)
         }
         API_HEARTBEAT => {
@@ -662,9 +799,8 @@ fn dispatch_group_api(
 }
 
 /// Handle the TRANSACTIONAL producer APIs (AddPartitionsToTxn/AddOffsetsToTxn/TxnOffsetCommit/EndTxn) against the
-/// txn coordinator. Returns `None` if `api_key` is not one of them. On `EndTxn(commit)` the staged consumer
-/// offsets are durably committed via the broker; COMMIT/ABORT markers + `read_committed` isolation land in the
-/// next increments (until then a transactional ABORT does NOT yet hide its records — honestly tracked).
+/// txn coordinator. Returns `None` if `api_key` is not one of them. On `EndTxn(commit)`, the broker owns one
+/// durability boundary for participant logs plus staged consumer offsets when its store supports it.
 fn dispatch_txn_api<B: KafkaBroker>(
     api_key: i16,
     api_version: i16,
@@ -676,9 +812,13 @@ fn dispatch_txn_api<B: KafkaBroker>(
     let resp = match api_key {
         API_ADD_PARTITIONS_TO_TXN => {
             let req = parse_add_partitions(reader, api_version)?;
-            let parts: Vec<(String, i32)> =
-                req.topics.iter().flat_map(|(t, ps)| ps.iter().map(move |&p| (t.clone(), p))).collect();
-            let code = txn.add_partitions(&req.transactional_id, req.producer_id, req.epoch, &parts);
+            let parts: Vec<(String, i32)> = req
+                .topics
+                .iter()
+                .flat_map(|(t, ps)| ps.iter().map(move |&p| (t.clone(), p)))
+                .collect();
+            let code =
+                txn.add_partitions(&req.transactional_id, req.producer_id, req.epoch, &parts);
             add_partitions_response(correlation_id, &req.topics, code)
         }
         API_ADD_OFFSETS_TO_TXN => {
@@ -688,7 +828,12 @@ fn dispatch_txn_api<B: KafkaBroker>(
         }
         API_TXN_OFFSET_COMMIT => {
             let req = parse_txn_offset_commit(reader, api_version)?;
-            let code = txn.stage_offsets(&req.transactional_id, req.producer_id, req.epoch, &req.offsets);
+            let code = txn.stage_offsets(
+                &req.transactional_id,
+                req.producer_id,
+                req.epoch,
+                &req.offsets,
+            );
             txn_offset_commit_response(correlation_id, &req.topics, code)
         }
         API_END_TXN => {
@@ -705,28 +850,26 @@ fn dispatch_txn_api<B: KafkaBroker>(
                 // (A permanent contract violation can NOT surface here: it is rejected at BUFFER time with
                 // non-retriable INVALID_RECORD 87 on its own ProduceResponse — see `KafkaBrokerStore::buffer_txn` —
                 // so by construction a commit-time failure is transient and 56 is the honest answer.)
-                if broker.commit_txn(pid, epoch, &out.partitions).is_err() {
+                if broker
+                    .commit_txn_with_offsets(
+                        &tid,
+                        pid,
+                        epoch,
+                        &out.partitions,
+                        out.group.as_deref(),
+                        &out.offsets,
+                    )
+                    .is_err()
+                {
                     56
                 } else {
-                    let mut offsets_ok = true;
-                    if let Some(group) = &out.group {
-                        for (topic, partition, offset) in &out.offsets {
-                            if broker.commit_offset(group, topic, *partition, *offset).is_err() {
-                                offsets_ok = false;
-                            }
-                        }
-                    }
-                    if offsets_ok {
-                        txn.finish_txn(&tid);
-                        0
-                    } else {
-                        56 // retriable: re-EndTxn re-commits the (idempotent) offsets; records already durable
-                    }
+                    txn.finish_txn(&tid, pid, epoch);
+                    0
                 }
             } else {
                 // ABORT: discard the buffered records — they never become durable/visible.
                 broker.abort_txn(pid, epoch, &out.partitions);
-                txn.finish_txn(&tid);
+                txn.finish_txn(&tid, pid, epoch);
                 0
             };
             throttle_error_response(correlation_id, code)
@@ -737,7 +880,11 @@ fn dispatch_txn_api<B: KafkaBroker>(
 }
 
 /// Build a `TxnOffsetCommit` response mirroring the topics/partitions with a per-partition error code.
-fn txn_offset_commit_response(correlation_id: i32, topics: &[(String, Vec<i32>)], error_code: i16) -> Vec<u8> {
+fn txn_offset_commit_response(
+    correlation_id: i32,
+    topics: &[(String, Vec<i32>)],
+    error_code: i16,
+) -> Vec<u8> {
     // Same wire shape as AddPartitionsToTxn's response body (throttle + topics[name, partitions[idx, error]]).
     add_partitions_response(correlation_id, topics, error_code)
 }
@@ -760,9 +907,16 @@ fn produce_results<B: KafkaBroker>(
                 continue;
             }
             let outcome = if let Some(eos) = p.eos.filter(|e| e.transactional) {
-                let code = txn.produce_check(eos.producer_id, eos.producer_epoch, &t.name, p.partition);
+                let code =
+                    txn.produce_check(eos.producer_id, eos.producer_epoch, &t.name, p.partition);
                 if code == 0 {
-                    match broker.buffer_txn(eos.producer_id, eos.producer_epoch, &t.name, p.partition, &p.values) {
+                    match broker.buffer_txn(
+                        eos.producer_id,
+                        eos.producer_epoch,
+                        &t.name,
+                        p.partition,
+                        &p.values,
+                    ) {
                         Ok(base) => (base, 0i16),
                         Err(e) => (-1, produce_error_code(&t.name, p.partition, &e)),
                     }
@@ -791,39 +945,67 @@ fn produce_results<B: KafkaBroker>(
 ///   retries rather than treating the records as durably stored — never a false NONE ack (audit A).
 fn produce_error_code(topic: &str, partition: i32, e: &io::Error) -> i16 {
     if e.kind() == io::ErrorKind::InvalidData {
-        eprintln!("kafka: produce rejected (non-retriable) topic={topic} partition={partition} error={e}");
+        eprintln!(
+            "kafka: produce rejected (non-retriable) topic={topic} partition={partition} error={e}"
+        );
         87
+    } else if e.kind() == io::ErrorKind::InvalidInput {
+        eprintln!(
+            "kafka: produce rejected (message too large) topic={topic} partition={partition} error={e}"
+        );
+        10
     } else {
-        eprintln!("kafka: produce failed (retriable) topic={topic} partition={partition} error={e}");
+        eprintln!(
+            "kafka: produce failed (retriable) topic={topic} partition={partition} error={e}"
+        );
         56
     }
 }
 
 /// Resolve a parsed `Fetch` request against the broker: un-seal each partition's records at the edge into a v2
 /// `RecordBatch` (or empty), carrying the high-watermark; a read/open error maps to `OFFSET_OUT_OF_RANGE` (1).
-fn fetch_results<B: KafkaBroker>(broker: &B, topics: &[crate::consume::FetchTopic]) -> Vec<FetchTopicResult> {
+fn fetch_results<B: KafkaBroker>(
+    broker: &B,
+    topics: &[crate::consume::FetchTopic],
+) -> Vec<FetchTopicResult> {
     let mut out = Vec::with_capacity(topics.len());
     for t in topics {
         let mut parts = Vec::with_capacity(t.partitions.len());
         for p in &t.partitions {
             let (_, latest) = broker.bounds(&t.name, p.partition);
-            let (error_code, records) = match broker.fetch(&t.name, p.partition, p.fetch_offset, p.max_bytes) {
-                Ok(values) if values.is_empty() => (0, Vec::new()),
-                Ok(values) => (0, build_record_batch(p.fetch_offset, &values)),
-                // InvalidData = the store's record at this offset is unreadable (corruption) → CORRUPT_MESSAGE
-                // (2), so the consumer surfaces it instead of silently spinning; anything else keeps the
-                // OFFSET_OUT_OF_RANGE (1) mapping.
-                Err(e) => {
-                    eprintln!(
-                        "kafka: fetch failed topic={} partition={} offset={} error={e}",
-                        t.name, p.partition, p.fetch_offset
-                    );
-                    (if e.kind() == io::ErrorKind::InvalidData { 2 } else { 1 }, Vec::new())
-                }
-            };
-            parts.push(FetchPartitionResult { partition: p.partition, error_code, high_watermark: latest, records });
+            let (error_code, records) =
+                match broker.fetch(&t.name, p.partition, p.fetch_offset, p.max_bytes) {
+                    Ok(values) if values.is_empty() => (0, Vec::new()),
+                    Ok(values) => (0, build_record_batch(p.fetch_offset, &values)),
+                    // InvalidData = the store's record at this offset is unreadable (corruption) → CORRUPT_MESSAGE
+                    // (2), so the consumer surfaces it instead of silently spinning; anything else keeps the
+                    // OFFSET_OUT_OF_RANGE (1) mapping.
+                    Err(e) => {
+                        eprintln!(
+                            "kafka: fetch failed topic={} partition={} offset={} error={e}",
+                            t.name, p.partition, p.fetch_offset
+                        );
+                        (
+                            if e.kind() == io::ErrorKind::InvalidData {
+                                2
+                            } else {
+                                1
+                            },
+                            Vec::new(),
+                        )
+                    }
+                };
+            parts.push(FetchPartitionResult {
+                partition: p.partition,
+                error_code,
+                high_watermark: latest,
+                records,
+            });
         }
-        out.push(FetchTopicResult { name: t.name.clone(), partitions: parts });
+        out.push(FetchTopicResult {
+            name: t.name.clone(),
+            partitions: parts,
+        });
     }
     out
 }
@@ -839,13 +1021,20 @@ fn offset_commit_results<B: KafkaBroker>(
     for t in &req.topics {
         let mut parts = Vec::with_capacity(t.partitions.len());
         for p in &t.partitions {
-            let error_code = match broker.commit_offset(&req.group_id, &t.name, p.partition, p.offset) {
-                Ok(()) => 0,
-                Err(_) => 16, // COORDINATOR_NOT_AVAILABLE-class: retriable, never a false success
-            };
-            parts.push(OffsetCommitPartitionResult { partition: p.partition, error_code });
+            let error_code =
+                match broker.commit_offset(&req.group_id, &t.name, p.partition, p.offset) {
+                    Ok(()) => 0,
+                    Err(_) => 16, // COORDINATOR_NOT_AVAILABLE-class: retriable, never a false success
+                };
+            parts.push(OffsetCommitPartitionResult {
+                partition: p.partition,
+                error_code,
+            });
         }
-        out.push(OffsetCommitTopicResult { name: t.name.clone(), partitions: parts });
+        out.push(OffsetCommitTopicResult {
+            name: t.name.clone(),
+            partitions: parts,
+        });
     }
     out
 }
@@ -861,10 +1050,17 @@ fn offset_fetch_results<B: KafkaBroker>(
     for t in &req.topics {
         let mut parts = Vec::with_capacity(t.partitions.len());
         for &partition in &t.partitions {
-            let offset = broker.fetch_offset(&req.group_id, &t.name, partition).ok().flatten().unwrap_or(-1);
+            let offset = broker
+                .fetch_offset(&req.group_id, &t.name, partition)
+                .ok()
+                .flatten()
+                .unwrap_or(-1);
             parts.push(OffsetFetchPartitionResult { partition, offset });
         }
-        out.push(OffsetFetchTopicResult { name: t.name.clone(), partitions: parts });
+        out.push(OffsetFetchTopicResult {
+            name: t.name.clone(),
+            partitions: parts,
+        });
     }
     out
 }
@@ -887,7 +1083,13 @@ mod tests {
         fn produce(&self, _topic: &str, _partition: i32, _records: &[Vec<u8>]) -> io::Result<i64> {
             Err(io::Error::new(self.kind, "forced produce failure for test"))
         }
-        fn fetch(&self, _topic: &str, _partition: i32, _offset: i64, _max_bytes: i32) -> io::Result<Vec<Vec<u8>>> {
+        fn fetch(
+            &self,
+            _topic: &str,
+            _partition: i32,
+            _offset: i64,
+            _max_bytes: i32,
+        ) -> io::Result<Vec<Vec<u8>>> {
             Ok(Vec::new())
         }
         fn bounds(&self, _topic: &str, _partition: i32) -> (i64, i64) {
@@ -912,11 +1114,29 @@ mod tests {
     /// (87). Regression: a retriable code here makes librdkafka re-send the still-rejected batch forever.
     #[test]
     fn produce_invalid_data_maps_to_non_retriable_87() {
-        let broker = FailingBroker { kind: io::ErrorKind::InvalidData };
+        let broker = FailingBroker {
+            kind: io::ErrorKind::InvalidData,
+        };
         let txn = TxnCoordinator::new(1000);
         let results = produce_results(&broker, &txn, &one_partition_batch());
         let (base, code) = results[&("events".to_owned(), 0)];
-        assert_eq!(code, 87, "InvalidData must map to INVALID_RECORD (87, non-retriable)");
+        assert_eq!(
+            code, 87,
+            "InvalidData must map to INVALID_RECORD (87, non-retriable)"
+        );
+        assert_eq!(base, -1, "a rejected batch reports no base offset");
+    }
+
+    /// A framing overflow is permanent → `MESSAGE_TOO_LARGE` (10), not retriable storage error 56.
+    #[test]
+    fn produce_invalid_input_maps_to_message_too_large_10() {
+        let broker = FailingBroker {
+            kind: io::ErrorKind::InvalidInput,
+        };
+        let txn = TxnCoordinator::new(1000);
+        let results = produce_results(&broker, &txn, &one_partition_batch());
+        let (base, code) = results[&("events".to_owned(), 0)];
+        assert_eq!(code, 10, "InvalidInput must map to MESSAGE_TOO_LARGE (10)");
         assert_eq!(base, -1, "a rejected batch reports no base offset");
     }
 
@@ -925,11 +1145,16 @@ mod tests {
     /// retriable path so a future refactor cannot silently promote a transient failure to a permanent reject.
     #[test]
     fn produce_other_error_stays_retriable_56() {
-        let broker = FailingBroker { kind: io::ErrorKind::Other };
+        let broker = FailingBroker {
+            kind: io::ErrorKind::Other,
+        };
         let txn = TxnCoordinator::new(1000);
         let results = produce_results(&broker, &txn, &one_partition_batch());
         let (base, code) = results[&("events".to_owned(), 0)];
-        assert_eq!(code, 56, "a non-InvalidData error stays KAFKA_STORAGE_ERROR (56, retriable)");
+        assert_eq!(
+            code, 56,
+            "a non-InvalidData error stays KAFKA_STORAGE_ERROR (56, retriable)"
+        );
         assert_eq!(base, -1, "a failed batch reports no base offset");
     }
 }
