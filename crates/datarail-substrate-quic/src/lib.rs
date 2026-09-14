@@ -115,7 +115,8 @@ fn server_config() -> io::Result<quinn::ServerConfig> {
         .with_single_cert(vec![cert], key)
         .map_err(io::Error::other)?;
     crypto.alpn_protocols = vec![ALPN.to_vec()];
-    let qsc = quinn::crypto::rustls::QuicServerConfig::try_from(crypto).map_err(io::Error::other)?;
+    let qsc =
+        quinn::crypto::rustls::QuicServerConfig::try_from(crypto).map_err(io::Error::other)?;
     Ok(quinn::ServerConfig::with_crypto(Arc::new(qsc)))
 }
 
@@ -148,7 +149,8 @@ fn dev_client_config() -> io::Result<quinn::ClientConfig> {
         .with_custom_certificate_verifier(Arc::new(AcceptAnyServerCert(provider)))
         .with_no_client_auth();
     crypto.alpn_protocols = vec![ALPN.to_vec()];
-    let qcc = quinn::crypto::rustls::QuicClientConfig::try_from(crypto).map_err(io::Error::other)?;
+    let qcc =
+        quinn::crypto::rustls::QuicClientConfig::try_from(crypto).map_err(io::Error::other)?;
     Ok(quinn::ClientConfig::new(Arc::new(qcc)))
 }
 
@@ -339,7 +341,9 @@ async fn send_frame(
     };
     let len = u32::try_from(bytes.len())
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "cofre exceeds u32 frame"))?;
-    s.write_all(&len.to_le_bytes()).await.map_err(io::Error::other)?;
+    s.write_all(&len.to_le_bytes())
+        .await
+        .map_err(io::Error::other)?;
     s.write_all(bytes).await.map_err(io::Error::other)?;
     Ok(())
 }
@@ -426,10 +430,14 @@ impl Substrate for QuicSubstrate {
     /// [`io::Error`] if this substrate has no send side, the cofre exceeds a `u32` frame, or the write fails.
     fn send(&mut self, cofre: &Cofre) -> Result<(), Self::Error> {
         let conn = self.send_conn.clone().ok_or_else(|| {
-            io::Error::new(io::ErrorKind::NotConnected, "this QUIC substrate has no send side")
+            io::Error::new(
+                io::ErrorKind::NotConnected,
+                "this QUIC substrate has no send side",
+            )
         })?;
         let bytes = datarail_cofre::encode(cofre);
-        self.rt.block_on(send_frame(&conn, &mut self.send_stream, &bytes))
+        self.rt
+            .block_on(send_frame(&conn, &mut self.send_stream, &bytes))
     }
 
     /// Return the next complete cofre, reading from the uni stream as needed; `None` once the transport is
