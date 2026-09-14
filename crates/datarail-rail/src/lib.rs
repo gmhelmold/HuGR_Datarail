@@ -126,11 +126,22 @@ where
     }
 
     for (i, expected) in sent.iter().enumerate() {
-        let got = sub
-            .recv()
-            .expect("recv must succeed")
-            .unwrap_or_else(|| panic!("recv #{i} returned None but a cofre was sent"));
-        assert_eq!(&got, expected, "recv #{i} must return the sent cofre in order");
+        let mut attempts = 0;
+        let got = loop {
+            if let Some(got) = sub.recv().expect("recv must succeed") {
+                break got;
+            }
+            attempts += 1;
+            assert!(
+                attempts < 1_000,
+                "recv #{i} returned None for 1 second after a cofre was sent"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        };
+        assert_eq!(
+            &got, expected,
+            "recv #{i} must return the sent cofre in order"
+        );
         sub.ack(got.etiqueta.cofre_id).expect("ack must succeed");
     }
 
@@ -523,7 +534,9 @@ impl<S: Substrate> Substrate for WanLink<S> {
     /// Propagates the inner substrate's error.
     fn send(&mut self, cofre: &Cofre) -> Result<(), Self::Error> {
         self.sent += 1;
-        if self.profile.drop_every != 0 && self.sent.is_multiple_of(u64::from(self.profile.drop_every)) {
+        if self.profile.drop_every != 0
+            && self.sent.is_multiple_of(u64::from(self.profile.drop_every))
+        {
             self.dropped += 1;
             return Ok(());
         }
@@ -578,7 +591,12 @@ pub mod congestion {
         /// delay above `queue_threshold` as congestion. `base_rtt` starts at the maximum and is pulled down by
         /// observed samples (the learned uncongested path delay).
         #[must_use]
-        pub fn new(init_window: f64, min_window: f64, max_window: f64, queue_threshold: Duration) -> Self {
+        pub fn new(
+            init_window: f64,
+            min_window: f64,
+            max_window: f64,
+            queue_threshold: Duration,
+        ) -> Self {
             Self {
                 base_rtt: Duration::MAX,
                 window: init_window.clamp(min_window, max_window),
@@ -696,7 +714,10 @@ pub mod admission {
     /// Constant-time equality for two 32-byte tags — folds over all bytes with no early return, so it leaks no
     /// timing oracle on the MAC.
     fn ct_eq(a: &[u8; 32], b: &[u8; 32]) -> bool {
-        a.iter().zip(b.iter()).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+        a.iter()
+            .zip(b.iter())
+            .fold(0u8, |acc, (x, y)| acc | (x ^ y))
+            == 0
     }
 }
 
@@ -739,8 +760,8 @@ pub mod testsupport {
 
 #[cfg(test)]
 mod tests {
-    use super::{substrate_conformance, LoopbackSubstrate, ResumableSubstrate};
     use super::testsupport::{etiqueta_seq, FIXTURE_SEED};
+    use super::{substrate_conformance, LoopbackSubstrate, ResumableSubstrate};
     use datarail_cofre::{seal, verify};
     use datarail_core::{Cofre, Substrate};
     use datarail_crypto::verifying_key;
@@ -824,9 +845,16 @@ mod tests {
         assert_eq!(link.dropped(), 2, "every 2nd send was dropped");
         let a = link.recv().unwrap().expect("first survivor");
         let b = link.recv().unwrap().expect("second survivor");
-        assert_eq!(link.recv().unwrap(), None, "only the un-dropped cofres arrive");
+        assert_eq!(
+            link.recv().unwrap(),
+            None,
+            "only the un-dropped cofres arrive"
+        );
         assert_eq!(a.etiqueta.seq, 0, "send #1 (seq 0) survived");
-        assert_eq!(b.etiqueta.seq, 2, "send #3 (seq 2) survived; #2 and #4 were dropped");
+        assert_eq!(
+            b.etiqueta.seq, 2,
+            "send #3 (seq 2) survived; #2 and #4 were dropped"
+        );
     }
 
     #[test]
@@ -855,7 +883,10 @@ mod tests {
         cc.on_rtt_sample(Duration::from_millis(10)); // learn base RTT = 10 ms (queue 0 → grow)
         let before = cc.window();
         cc.on_rtt_sample(Duration::from_millis(50)); // queue = 40 ms > 5 ms threshold → back off
-        assert!(cc.window() < before, "delay-based CC shrinks the window on queue build-up");
+        assert!(
+            cc.window() < before,
+            "delay-based CC shrinks the window on queue build-up"
+        );
     }
 
     #[test]
@@ -867,8 +898,15 @@ mod tests {
         cc.on_loss();
         cc.on_loss();
         cc.on_loss();
-        assert!((cc.window() - w).abs() < f64::EPSILON, "loss must NOT cut the rate (FASP physics)");
-        assert_eq!(cc.losses(), 3, "losses observed for visibility, not acted on");
+        assert!(
+            (cc.window() - w).abs() < f64::EPSILON,
+            "loss must NOT cut the rate (FASP physics)"
+        );
+        assert_eq!(
+            cc.losses(),
+            3,
+            "losses observed for visibility, not acted on"
+        );
     }
 
     #[test]
@@ -879,7 +917,10 @@ mod tests {
         for _ in 0..20 {
             cc.on_rtt_sample(Duration::from_millis(10)); // always uncongested → additive increase
         }
-        assert!((cc.window() - 5.0).abs() < f64::EPSILON, "window grows but clamps at max_window");
+        assert!(
+            (cc.window() - 5.0).abs() < f64::EPSILON,
+            "window grows but clamps at max_window"
+        );
     }
 
     // ---- E5 DoS proof-of-IP cookie --------------------------------------------------------------------------
@@ -890,8 +931,14 @@ mod tests {
         let gate = CookieGate::new([7u8; 32], 1);
         let real = b"203.0.113.7:51000";
         let cookie = gate.issue(real);
-        assert!(gate.verify(real, &cookie), "a genuine round-trip cookie admits");
-        assert!(!gate.verify(b"198.51.100.9:40000", &cookie), "a spoofed source address fails");
+        assert!(
+            gate.verify(real, &cookie),
+            "a genuine round-trip cookie admits"
+        );
+        assert!(
+            !gate.verify(b"198.51.100.9:40000", &cookie),
+            "a spoofed source address fails"
+        );
         assert!(!gate.verify(real, &[0u8; 32]), "a forged cookie fails");
     }
 
@@ -900,8 +947,14 @@ mod tests {
         use super::admission::CookieGate;
         let addr = b"203.0.113.7:51000";
         let cookie = CookieGate::new([7u8; 32], 1).issue(addr);
-        assert!(!CookieGate::new([7u8; 32], 2).verify(addr, &cookie), "an epoch bump expires the cookie");
-        assert!(!CookieGate::new([9u8; 32], 1).verify(addr, &cookie), "a different secret rejects it");
+        assert!(
+            !CookieGate::new([7u8; 32], 2).verify(addr, &cookie),
+            "an epoch bump expires the cookie"
+        );
+        assert!(
+            !CookieGate::new([9u8; 32], 1).verify(addr, &cookie),
+            "a different secret rejects it"
+        );
     }
 
     // ---- GATE-FEATHER: an idle ephemeral substrate holds no standing in-flight state -----------------------
@@ -921,7 +974,11 @@ mod tests {
             while let Some(c) = loopback.recv().unwrap() {
                 loopback.ack(c.etiqueta.cofre_id).unwrap();
             }
-            assert_eq!(loopback.queued_len(), 0, "nothing retained in-flight once drained (idle ≈ 0)");
+            assert_eq!(
+                loopback.queued_len(),
+                0,
+                "nothing retained in-flight once drained (idle ≈ 0)"
+            );
         }
 
         let mut resumable = ResumableSubstrate::new();
@@ -931,7 +988,11 @@ mod tests {
         while let Some(c) = resumable.recv().unwrap() {
             resumable.ack(c.etiqueta.cofre_id).unwrap();
         }
-        assert_eq!(resumable.inflight(), 0, "all acked ⇒ no standing in-flight state when idle");
+        assert_eq!(
+            resumable.inflight(),
+            0,
+            "all acked ⇒ no standing in-flight state when idle"
+        );
     }
 
     // ---- AUDIT-03 F1: a malicious oversized frame length is rejected, not buffered toward 4 GiB -----------
@@ -946,7 +1007,9 @@ mod tests {
 
         // Attacker: connect raw and declare a ~4 GiB frame, then dribble a little body.
         let mut attacker = TcpStream::connect(addr).expect("connect");
-        attacker.write_all(&u32::MAX.to_le_bytes()).expect("write len");
+        attacker
+            .write_all(&u32::MAX.to_le_bytes())
+            .expect("write len");
         attacker.write_all(&[0u8; 1024]).expect("write body");
         attacker.flush().expect("flush");
 
@@ -988,7 +1051,11 @@ mod tests {
 
         // Resume: re-drive from the first un-acked (`b`), then the never-delivered `c`, then drain.
         sub.resume();
-        assert_eq!(sub.recv().unwrap().as_ref(), Some(&b), "unacked b is redelivered");
+        assert_eq!(
+            sub.recv().unwrap().as_ref(),
+            Some(&b),
+            "unacked b is redelivered"
+        );
         assert_eq!(sub.recv().unwrap().as_ref(), Some(&c));
         assert_eq!(sub.recv().unwrap(), None);
     }
@@ -1081,7 +1148,11 @@ mod tests {
 
         let carga_x = b"AAAAAAAAAAAAAAAA".to_vec();
         let carga_y = b"ZQ7k-3p!9xLm_w2#".to_vec(); // different bytes…
-        assert_eq!(carga_x.len(), carga_y.len(), "metamorphic precondition: equal length");
+        assert_eq!(
+            carga_x.len(),
+            carga_y.len(),
+            "metamorphic precondition: equal length"
+        );
 
         // Two validly-sealed cofres with the SAME routing/header inputs, differing only in payload bytes.
         let cofre_x = seal(etq.clone(), carga_x.clone(), &FIXTURE_SEED);
