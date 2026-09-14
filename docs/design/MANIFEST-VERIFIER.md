@@ -6,6 +6,8 @@
 
 - `DeliveryReceipt`: typed receipt bundle containing payload bytes, route/stream/sequence/epoch, inclusion proof,
   signed tree head, and pinned source/destination verifying keys.
+- `OwnedDeliveryReceipt`: owned typed-input boundary for parsers that need to retain receipt evidence before calling
+  `verify()`.
 - `verify_receipt`: verifies payload content address, STH signature, proof metadata and Merkle path, ack signature,
   ack position, and ack root binding.
 - `InclusionProof`, `SignedTreeHead`, `DestAck`: receipt evidence types.
@@ -36,4 +38,5 @@ verify_receipt(&DeliveryReceipt {
 ```
 
 No serialization or network protocol is defined here. Callers may serialize these fixed-layout fields in their own
-transport, then reconstruct the typed values before verification.
+transport, then reconstruct `OwnedDeliveryReceipt` before verification. CLI verifier remains out of scope until a wire
+format is defined.
