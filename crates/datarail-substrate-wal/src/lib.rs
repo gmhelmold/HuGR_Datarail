@@ -22,6 +22,8 @@
 
 #![forbid(unsafe_code)]
 
+#[cfg(test)]
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -32,6 +34,12 @@ use datarail_core::{Cofre, Substrate, MAX_COFRE_WIRE_LEN};
 
 /// Frame overhead on disk: a 4-byte big-endian length prefix + a 4-byte big-endian CRC-32 suffix.
 const FRAME_OVERHEAD: usize = 8;
+
+#[cfg(test)]
+thread_local! {
+    static FAIL_DIR_FSYNC: Cell<bool> = const { Cell::new(false) };
+    static FAIL_SEGMENT_SYNC: Cell<bool> = const { Cell::new(false) };
+}
 
 /// Tunables for the log (all have warp-but-safe defaults).
 #[derive(Debug, Clone, Copy)]
@@ -46,7 +54,11 @@ pub struct WalConfig {
 
 impl Default for WalConfig {
     fn default() -> Self {
-        Self { flush_bytes: 1 << 20, flush_micros: 1000, segment_bytes: 256 << 20 }
+        Self {
+            flush_bytes: 1 << 20,
+            flush_micros: 1000,
+            segment_bytes: 256 << 20,
+        }
     }
 }
 
@@ -87,7 +99,11 @@ const CRC32_TABLE: [u32; 256] = {
         let mut c = i;
         let mut k = 0;
         while k < 8 {
-            c = if c & 1 != 0 { 0xEDB8_8320 ^ (c >> 1) } else { c >> 1 };
+            c = if c & 1 != 0 {
+                0xEDB8_8320 ^ (c >> 1)
+            } else {
+                c >> 1
+            };
             k += 1;
         }
         table[i as usize] = c;
@@ -122,6 +138,7 @@ pub struct DurableLog {
     // ---- ack / GC (RAM: bounded by the in-flight, delivered-but-un-acked window — NOT total volume) ----
     inflight: HashMap<[u8; 32], u64>, // cofre_id → segment id it was delivered from
     seg_inflight: HashMap<u64, u64>,  // segment id → count of delivered-un-acked cofres in it
+    poisoned: bool,
 }
 
 impl DurableLog {
@@ -151,10 +168,14 @@ impl DurableLog {
         let (_read_id, _read_off, ack_id, ack_off) = load_cursor(&dir);
         let active_id = highest_segment(&dir)?.unwrap_or(1);
         let path = seg_path(&dir, active_id);
-        let mut active =
-            OpenOptions::new().create(true).read(true).write(true).truncate(false).open(&path)?;
+        let mut active = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(&path)?;
         fsync_dir(&dir)?; // the active segment's dir-entry must be durable
-        // Recovery: scan the active segment, truncate any torn tail to the last intact frame.
+                          // Recovery: scan the active segment, truncate any torn tail to the last intact frame.
         let write_off = recover_segment_end(&mut active)?;
         active.set_len(write_off)?;
         active.seek(SeekFrom::Start(write_off))?;
@@ -171,11 +192,17 @@ impl DurableLog {
             read_file: None,
             inflight: HashMap::new(),
             seg_inflight: HashMap::new(),
+            poisoned: false,
         })
     }
 
     /// Frame and buffer a cofre; flush+fsync if the byte or time threshold is hit. Buffer is reused (no growth).
     fn append(&mut self, cofre: &Cofre) -> Result<(), WalError> {
+        if self.poisoned {
+            return Err(
+                std::io::Error::other("wal is poisoned after a prior write failure").into(),
+            );
+        }
         let bytes = datarail_cofre::encode(cofre);
         if bytes.len() > MAX_COFRE_WIRE_LEN {
             return Err(WalError::Codec("cofre exceeds MAX_COFRE_WIRE_LEN".into()));
@@ -201,17 +228,41 @@ impl DurableLog {
     /// # Errors
     /// [`WalError::Io`] on write/fsync failure.
     pub fn flush(&mut self) -> Result<(), WalError> {
+        if self.poisoned {
+            return Err(
+                std::io::Error::other("wal is poisoned after a prior write failure").into(),
+            );
+        }
         if !self.buf.is_empty() {
-            self.active.write_all(&self.buf)?;
+            if let Err(error) = self.active.write_all(&self.buf) {
+                self.poisoned = true;
+                self.buf.clear();
+                return Err(error.into());
+            }
             // sync_all (not sync_data) so the inode metadata is durable too. NOTE: std `fsync` flushes to the
             // device but does NOT issue a drive-cache barrier on macOS (needs F_FULLFSYNC, unavailable in safe
             // std) — true power-loss durability holds on Linux/ext4/xfs with write barriers, not on the macOS
             // dev box or a no-barrier container FS. See DURABLE-LOG.md "durability boundary".
-            self.active.sync_all()?;
+            #[cfg(test)]
+            let sync_result = if FAIL_SEGMENT_SYNC.with(Cell::get) {
+                Err(std::io::Error::from_raw_os_error(5))
+            } else {
+                self.active.sync_all()
+            };
+            #[cfg(not(test))]
+            let sync_result = self.active.sync_all();
+            if let Err(error) = sync_result {
+                self.poisoned = true;
+                self.buf.clear();
+                return Err(error.into());
+            }
             self.write_off += self.buf.len() as u64;
             self.buf.clear();
             if self.write_off >= self.cfg.segment_bytes {
-                self.rotate()?;
+                if let Err(error) = self.rotate() {
+                    self.poisoned = true;
+                    return Err(error);
+                }
             }
         }
         self.last_flush = Instant::now();
@@ -232,7 +283,12 @@ impl DurableLog {
     fn rotate(&mut self) -> Result<(), WalError> {
         self.active_id += 1;
         let path = seg_path(&self.dir, self.active_id);
-        let active = OpenOptions::new().create(true).read(true).write(true).truncate(true).open(&path)?;
+        let active = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(true)
+            .open(&path)?;
         fsync_dir(&self.dir)?;
         self.active = active;
         self.write_off = 0;
@@ -245,7 +301,11 @@ impl DurableLog {
     fn checkpoint(&mut self) -> Result<(), WalError> {
         let ack_floor = self.ack_floor();
         let tmp = self.dir.join("cursor.tmp");
-        let mut f = OpenOptions::new().create(true).write(true).truncate(true).open(&tmp)?;
+        let mut f = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&tmp)?;
         let mut rec = Vec::with_capacity(32);
         rec.extend_from_slice(&self.read_id.to_be_bytes());
         rec.extend_from_slice(&self.read_off.to_be_bytes());
@@ -262,7 +322,12 @@ impl DurableLog {
     fn ack_floor(&self) -> (u64, u64) {
         // Conservative: the oldest segment that still has an in-flight (un-acked) cofre bounds GC; if none,
         // the read cursor is the floor (all delivered are acked).
-        let oldest = self.seg_inflight.iter().filter(|(_, &n)| n > 0).map(|(&s, _)| s).min();
+        let oldest = self
+            .seg_inflight
+            .iter()
+            .filter(|(_, &n)| n > 0)
+            .map(|(&s, _)| s)
+            .min();
         oldest.map_or((self.read_id, self.read_off), |s| (s, 0))
     }
 
@@ -293,7 +358,10 @@ impl Substrate for DurableLog {
     fn recv(&mut self) -> Result<Option<Cofre>, WalError> {
         loop {
             // Make sure anything buffered is durable before it can be read (read-your-writes within a process).
-            if self.read_id == self.active_id && self.read_off >= self.write_off && !self.buf.is_empty() {
+            if self.read_id == self.active_id
+                && self.read_off >= self.write_off
+                && !self.buf.is_empty()
+            {
                 self.flush()?;
             }
             if !self.ensure_read_file()? {
@@ -307,10 +375,14 @@ impl Substrate for DurableLog {
                 }
                 return Ok(None);
             }
-            let frame = read_frame(self.read_file.as_mut().expect("read_file set above"), self.read_id == self.active_id)?;
+            let frame = read_frame(
+                self.read_file.as_mut().expect("read_file set above"),
+                self.read_id == self.active_id,
+            )?;
             match frame {
                 FrameRead::Cofre { bytes, advance } => {
-                    let cofre = datarail_cofre::decode(&bytes).map_err(|e| WalError::Codec(e.to_string()))?;
+                    let cofre = datarail_cofre::decode(&bytes)
+                        .map_err(|e| WalError::Codec(e.to_string()))?;
                     self.read_off += advance;
                     let id = cofre.etiqueta.cofre_id;
                     self.inflight.insert(id, self.read_id);
@@ -332,16 +404,27 @@ impl Substrate for DurableLog {
     }
 
     fn ack(&mut self, cofre_id: [u8; 32]) -> Result<(), WalError> {
-        if let Some(seg) = self.inflight.remove(&cofre_id) {
+        let removed = if let Some(seg) = self.inflight.remove(&cofre_id) {
             if let Some(n) = self.seg_inflight.get_mut(&seg) {
                 *n = n.saturating_sub(1);
             }
-        }
+            Some(seg)
+        } else {
+            None
+        };
         // CRASH-SAFE GC ORDER: durably checkpoint the advanced cursor FIRST, THEN delete segments. If we deleted
         // first and crashed before the cursor was durable, recovery would point at a deleted segment — the
         // total-loss bug. (recv's skip-forward is the additional safety net if a delete still races a stale
         // cursor.) The dir fsync in checkpoint() makes the cursor rename itself durable.
-        self.checkpoint()?;
+        if let Err(error) = self.checkpoint() {
+            // A failed directory fsync means caller has no durable ack. Restore in-memory bookkeeping so a retry
+            // cannot silently skip the cofre after a transient persistence failure.
+            if let Some(seg) = removed {
+                self.inflight.insert(cofre_id, seg);
+                *self.seg_inflight.entry(seg).or_insert(0) += 1;
+            }
+            return Err(error);
+        }
         let floor = self.ack_floor().0;
         let mut s = 1u64;
         let mut deleted = false;
@@ -363,6 +446,9 @@ impl Substrate for DurableLog {
 
 impl Drop for DurableLog {
     fn drop(&mut self) {
+        if self.poisoned {
+            return;
+        }
         let _ = self.flush();
         let _ = self.checkpoint();
     }
@@ -374,14 +460,29 @@ fn seg_path(dir: &Path, id: u64) -> PathBuf {
     dir.join(format!("{id:012}.seg"))
 }
 
-/// fsync a directory so a create/rename/unlink of its entries is durable (Unix semantics). Best-effort: some
-/// filesystems return `EINVAL` for a directory fsync — that's tolerated (durability there relies on the FS's
-/// own ordering), but a failure to OPEN the directory is a real error.
+/// fsync a directory so a create/rename/unlink of its entries is durable (Unix semantics). Some filesystems
+/// return `EINVAL` for a directory fsync — that unsupported operation is tolerated. Other sync failures are
+/// real durability errors and must reach the caller.
 fn fsync_dir(dir: &Path) -> Result<(), WalError> {
+    #[cfg(test)]
+    if FAIL_DIR_FSYNC.with(Cell::get) {
+        return Err(std::io::Error::from_raw_os_error(5).into());
+    }
+    fsync_dir_with(dir, File::sync_all)
+}
+
+fn fsync_dir_with<F>(dir: &Path, sync: F) -> Result<(), WalError>
+where
+    F: FnOnce(&File) -> std::io::Result<()>,
+{
     match File::open(dir) {
         Ok(f) => {
-            let _ = f.sync_all(); // ignore EINVAL on FSes without dir-fsync; succeeds on ext4/xfs where it matters
-            Ok(())
+            match sync(&f) {
+                Ok(()) => Ok(()),
+                // POSIX directory fsync is unavailable on some supported filesystems (notably macOS APIs).
+                Err(error) if error.raw_os_error() == Some(22) => Ok(()),
+                Err(error) => Err(error.into()),
+            }
         }
         Err(e) => Err(e.into()),
     }
@@ -472,4 +573,97 @@ fn read_frame(file: &mut File, active: bool) -> Result<FrameRead, WalError> {
     }
     let advance = (FRAME_OVERHEAD + len) as u64;
     Ok(FrameRead::Cofre { bytes, advance })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use datarail_core::Substrate;
+    use datarail_rail::testsupport::cofre_seq;
+
+    use super::{fsync_dir_with, DurableLog, WalError, FAIL_DIR_FSYNC, FAIL_SEGMENT_SYNC};
+
+    static UNIQUE: AtomicU64 = AtomicU64::new(0);
+
+    fn temp_dir() -> std::path::PathBuf {
+        let id = UNIQUE.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "datarail-wal-fsync-dir-{}-{id}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create test directory");
+        dir
+    }
+
+    #[test]
+    fn directory_sync_tolerates_only_unsupported_einval() {
+        let dir = temp_dir();
+        let unsupported = io::Error::from_raw_os_error(22);
+        assert!(fsync_dir_with(&dir, |_| Err(unsupported)).is_ok());
+
+        let real_failure = io::Error::from_raw_os_error(5);
+        assert!(matches!(
+            fsync_dir_with(&dir, |_| Err(real_failure)),
+            Err(WalError::Io(_))
+        ));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn failed_directory_sync_does_not_consume_ack() {
+        let dir = temp_dir();
+        let mut log = DurableLog::open(&dir).expect("open test log");
+        log.send(&cofre_seq(0)).expect("send");
+        log.flush().expect("flush");
+        let cofre = log.recv().expect("recv").expect("record");
+
+        FAIL_DIR_FSYNC.with(|failed| failed.set(true));
+        assert!(log.ack(cofre.etiqueta.cofre_id).is_err());
+        assert_eq!(
+            log.inflight_len(),
+            1,
+            "failed dir fsync must preserve retryable ack state"
+        );
+        FAIL_DIR_FSYNC.with(|failed| failed.set(false));
+        log.ack(cofre.etiqueta.cofre_id).expect("retry ack");
+        drop(log);
+
+        let mut reopened = DurableLog::open(&dir).expect("reopen test log");
+        assert!(reopened.recv().expect("recv after durable ack").is_none());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn failed_segment_sync_poisoned_log_cannot_duplicate_buffer() {
+        let dir = temp_dir();
+        let cfg = super::WalConfig {
+            flush_bytes: 1 << 20,
+            flush_micros: u64::MAX,
+            segment_bytes: 1 << 20,
+        };
+        let mut log = DurableLog::open_with(&dir, cfg).expect("open test log");
+        log.send(&cofre_seq(0)).expect("buffer");
+        FAIL_SEGMENT_SYNC.with(|failed| failed.set(true));
+        assert!(log.flush().is_err());
+        FAIL_SEGMENT_SYNC.with(|failed| failed.set(false));
+        assert!(
+            log.send(&cofre_seq(1)).is_err(),
+            "poisoned log must reject new writes"
+        );
+        assert!(
+            log.flush().is_err(),
+            "failed log must not retry an ambiguous buffer"
+        );
+        drop(log);
+
+        let mut reopened = DurableLog::open_with(&dir, cfg).expect("reopen test log");
+        let cofre = reopened.recv().expect("recv").expect("durable frame");
+        assert_eq!(cofre.etiqueta.seq, 0);
+        reopened.ack(cofre.etiqueta.cofre_id).expect("ack");
+        assert!(reopened.recv().expect("drain").is_none());
+        let _ = std::fs::remove_dir_all(dir);
+    }
 }
