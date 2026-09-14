@@ -76,7 +76,13 @@ fn idempotent_batch(producer_id: i64, base_sequence: i32, values: &[&[u8]]) -> V
 }
 
 /// A `Produce` v7 request to `topic`/partition 0 with one idempotent batch.
-fn produce_req(correlation_id: i32, topic: &str, producer_id: i64, base_sequence: i32, values: &[&[u8]]) -> Vec<u8> {
+fn produce_req(
+    correlation_id: i32,
+    topic: &str,
+    producer_id: i64,
+    base_sequence: i32,
+    values: &[&[u8]],
+) -> Vec<u8> {
     let batch = idempotent_batch(producer_id, base_sequence, values);
     let mut w = req_header(0, 7, correlation_id);
     w.nullable_string(None); // transactional_id (v3+)
@@ -122,27 +128,41 @@ fn idempotent_producer_handshake_and_retry_surface_a_stable_eos_coord() {
     });
 
     let mut stream = TcpStream::connect(addr).expect("connect");
-    stream.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
 
     // 1) InitProducerId → the broker grants a producer_id (response: corr, throttle, error, producer_id, epoch).
-    stream.write_all(&init_producer_id_req(1)).expect("send init");
+    stream
+        .write_all(&init_producer_id_req(1))
+        .expect("send init");
     let resp = read_frame(&mut stream);
     // payload: correlation_id(4) throttle(4) error(2) producer_id(8) epoch(2)
     assert!(resp.len() >= 20, "init response too short: {}", resp.len());
     let error = i16::from_be_bytes([resp[8], resp[9]]);
     assert_eq!(error, 0, "InitProducerId error_code must be NONE");
-    let pid = i64::from_be_bytes([resp[10], resp[11], resp[12], resp[13], resp[14], resp[15], resp[16], resp[17]]);
+    let pid = i64::from_be_bytes([
+        resp[10], resp[11], resp[12], resp[13], resp[14], resp[15], resp[16], resp[17],
+    ]);
     assert!(pid >= 0, "granted producer_id must be >= 0, got {pid}");
 
     // 2) Produce an idempotent batch [0,3), then RETRY the identical batch (same pid+base_sequence).
-    stream.write_all(&produce_req(2, "events", pid, 0, &[b"e:a", b"e:b", b"e:c"])).expect("produce");
+    stream
+        .write_all(&produce_req(2, "events", pid, 0, &[b"e:a", b"e:b", b"e:c"]))
+        .expect("produce");
     let _ = read_frame(&mut stream);
-    stream.write_all(&produce_req(3, "events", pid, 0, &[b"e:a", b"e:b", b"e:c"])).expect("produce retry");
+    stream
+        .write_all(&produce_req(3, "events", pid, 0, &[b"e:a", b"e:b", b"e:c"]))
+        .expect("produce retry");
     let _ = read_frame(&mut stream);
 
     // 3) Both sends surface on the channel with the SAME stable EOS coordinate — what the sink dedups on.
-    let (t1, p1, v1, e1) = coord_rx.recv_timeout(Duration::from_secs(5)).expect("first batch");
-    let (_t2, _p2, _v2, e2) = coord_rx.recv_timeout(Duration::from_secs(5)).expect("retry batch");
+    let (t1, p1, v1, e1) = coord_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("first batch");
+    let (_t2, _p2, _v2, e2) = coord_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("retry batch");
     assert_eq!(t1, "events");
     assert_eq!(p1, 0);
     assert_eq!(v1, vec![b"e:a".to_vec(), b"e:b".to_vec(), b"e:c".to_vec()]);
@@ -152,5 +172,8 @@ fn idempotent_producer_handshake_and_retry_surface_a_stable_eos_coord() {
     assert_eq!(c1.base_sequence, 0);
     assert_eq!(c1.count, 3, "sequence range [0,3)");
     // The retry carries the IDENTICAL coordinate → the sink's commit_at_seq no-ops it (exactly-once).
-    assert_eq!(c1, c2, "an idempotent retry must present the same (producer_id, base_sequence, count)");
+    assert_eq!(
+        c1, c2,
+        "an idempotent retry must present the same (producer_id, base_sequence, count)"
+    );
 }

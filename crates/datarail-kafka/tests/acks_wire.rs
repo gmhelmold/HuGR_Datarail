@@ -84,23 +84,37 @@ fn acks_zero_lands_records_but_sends_no_response_and_connection_keeps_serving() 
     });
 
     let mut stream = TcpStream::connect(addr).expect("connect");
-    stream.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
 
     // 1) acks=0 produce: the records must LAND (arrive on the channel), and NO response frame must be written.
-    stream.write_all(&produce_req(1, "events", 0, &[b"a0:x", b"a0:y"])).expect("send acks=0 produce");
-    let (topic, partition, values) = land_rx.recv_timeout(Duration::from_secs(5)).expect("records must land");
+    stream
+        .write_all(&produce_req(1, "events", 0, &[b"a0:x", b"a0:y"]))
+        .expect("send acks=0 produce");
+    let (topic, partition, values) = land_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("records must land");
     assert_eq!(topic, "events");
     assert_eq!(partition, 0);
-    assert_eq!(values, vec![b"a0:x".to_vec(), b"a0:y".to_vec()], "acks=0 still lands records durably");
+    assert_eq!(
+        values,
+        vec![b"a0:x".to_vec(), b"a0:y".to_vec()],
+        "acks=0 still lands records durably"
+    );
 
     // 2) There must be NO response bytes for the acks=0 produce. Give the broker a moment to (not) reply, then a
     // short read window: reading a length prefix must TIME OUT (no data), proving nothing was written.
     std::thread::sleep(Duration::from_millis(150));
-    stream.set_read_timeout(Some(Duration::from_millis(400))).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_millis(400)))
+        .unwrap();
     let mut probe = [0u8; 1];
     match stream.read(&mut probe) {
         Ok(0) => panic!("connection closed after acks=0 produce — it must keep serving"),
-        Ok(n) => panic!("acks=0 produce must write NO response, but {n} byte(s) arrived: {probe:?}"),
+        Ok(n) => {
+            panic!("acks=0 produce must write NO response, but {n} byte(s) arrived: {probe:?}")
+        }
         Err(e) => {
             let k = e.kind();
             assert!(
@@ -112,18 +126,32 @@ fn acks_zero_lands_records_but_sends_no_response_and_connection_keeps_serving() 
 
     // 3) The SAME connection keeps serving: a follow-up Metadata request gets its response with the right
     // correlation id (the acks=0 produce did NOT consume a response slot / shift the stream).
-    stream.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
-    stream.write_all(&metadata_req(99, "events")).expect("send metadata");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    stream
+        .write_all(&metadata_req(99, "events"))
+        .expect("send metadata");
     let resp = read_frame(&mut stream);
     assert!(resp.len() >= 4, "metadata response too short");
     let corr = i32::from_be_bytes([resp[0], resp[1], resp[2], resp[3]]);
-    assert_eq!(corr, 99, "the follow-up response must carry ITS own correlation id (stream not desynchronized)");
+    assert_eq!(
+        corr, 99,
+        "the follow-up response must carry ITS own correlation id (stream not desynchronized)"
+    );
 
     // 4) And an acks=1 produce on the same connection DOES get a response (contrast with acks=0).
-    stream.write_all(&produce_req(100, "events", 1, &[b"a1:z"])).expect("send acks=1 produce");
-    let (_t, _p, v) = land_rx.recv_timeout(Duration::from_secs(5)).expect("acks=1 records land too");
+    stream
+        .write_all(&produce_req(100, "events", 1, &[b"a1:z"]))
+        .expect("send acks=1 produce");
+    let (_t, _p, v) = land_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("acks=1 records land too");
     assert_eq!(v, vec![b"a1:z".to_vec()]);
     let resp = read_frame(&mut stream);
     let corr = i32::from_be_bytes([resp[0], resp[1], resp[2], resp[3]]);
-    assert_eq!(corr, 100, "acks=1 produce IS answered, with its correlation id");
+    assert_eq!(
+        corr, 100,
+        "acks=1 produce IS answered, with its correlation id"
+    );
 }

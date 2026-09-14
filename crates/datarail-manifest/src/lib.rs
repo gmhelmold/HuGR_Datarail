@@ -403,7 +403,13 @@ pub fn verify_ack(
     if !verify_domain(
         ctx::ACK,
         dest_vk,
-        &ack_signing_bytes(&ack.route_id, &ack.stream_id, ack.seq, &ack.sth_root, ack.epoch),
+        &ack_signing_bytes(
+            &ack.route_id,
+            &ack.stream_id,
+            ack.seq,
+            &ack.sth_root,
+            ack.epoch,
+        ),
         &ack.dest_sig,
     ) {
         return Err(ManifestError::BadAckSig);
@@ -450,7 +456,60 @@ pub struct DeliveryProof<'a> {
 }
 
 /// Public name for an offline delivery receipt.
+///
+/// The alias keeps [`DeliveryProof`] available for existing callers while making the verifier-facing
+/// vocabulary explicit. A receipt contains typed in-memory evidence; serialization is intentionally outside this
+/// crate because no wire format is defined by SPEC 04.
 pub type DeliveryReceipt<'a> = DeliveryProof<'a>;
+
+/// Owned typed-input boundary for consumers that parse receipts outside this crate.
+///
+/// This type deliberately carries no parser or wire-format policy. An external consumer owns the evidence, then
+/// calls [`OwnedDeliveryReceipt::verify`] without importing CLI internals.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OwnedDeliveryReceipt {
+    /// Delivered cofre payload bytes.
+    pub carga: Vec<u8>,
+    /// Claimed route.
+    pub route_id: [u8; 16],
+    /// Claimed stream.
+    pub stream_id: [u8; 16],
+    /// Claimed per-stream sequence.
+    pub seq: u64,
+    /// Claimed manifest epoch.
+    pub epoch: u64,
+    /// Merkle inclusion proof.
+    pub proof: InclusionProof,
+    /// Signed Tree Head.
+    pub sth: SignedTreeHead,
+    /// Pinned source verifying key.
+    pub source_vk: [u8; 32],
+    /// Destination delivery ack.
+    pub ack: DestAck,
+    /// Pinned destination verifying key.
+    pub dest_vk: [u8; 32],
+}
+
+impl OwnedDeliveryReceipt {
+    /// Verify owned receipt evidence offline.
+    ///
+    /// # Errors
+    /// Returns the corresponding [`ManifestError`] from [`verify_receipt`].
+    pub fn verify(&self) -> Result<(), ManifestError> {
+        verify_receipt(&DeliveryReceipt {
+            carga: &self.carga,
+            route_id: &self.route_id,
+            stream_id: &self.stream_id,
+            seq: self.seq,
+            epoch: self.epoch,
+            proof: &self.proof,
+            sth: &self.sth,
+            source_vk: &self.source_vk,
+            ack: &self.ack,
+            dest_vk: &self.dest_vk,
+        })
+    }
+}
 
 /// The full offline delivery proof for *"this cofre was delivered, exactly once, intact"* (AC-5).
 ///
@@ -489,10 +548,20 @@ pub fn verify_receipt(p: &DeliveryReceipt<'_>) -> Result<(), ManifestError> {
         return Err(ManifestError::BadInclusion);
     }
     // (4) ack signed by dest, position matches the leaf, and its bound STH-root matches the proof root.
-    verify_ack(p.ack, p.dest_vk, p.route_id, p.stream_id, p.seq, p.epoch, &p.sth.root)
+    verify_ack(
+        p.ack,
+        p.dest_vk,
+        p.route_id,
+        p.stream_id,
+        p.seq,
+        p.epoch,
+        &p.sth.root,
+    )
 }
 
-/// Verify an offline delivery proof using its original API name.
+/// Verify an offline delivery proof.
+///
+/// Kept as the original entry point; new external consumers should prefer [`verify_receipt`].
 ///
 /// # Errors
 /// Returns the corresponding [`ManifestError`] from [`verify_receipt`].
@@ -606,7 +675,11 @@ pub mod bao {
                 });
             }
         }
-        Committed { root, total, pieces }
+        Committed {
+            root,
+            total,
+            pieces,
+        }
     }
 
     /// A resumable chunk receiver: the trusted `root` + `total`, a received-chunk bitfield, and the reassembly
@@ -658,7 +731,9 @@ pub mod bao {
         /// The indices still missing — the resume request set.
         #[must_use]
         pub fn missing(&self) -> Vec<usize> {
-            (0..self.total).filter(|&i| self.slots[i].is_none()).collect()
+            (0..self.total)
+                .filter(|&i| self.slots[i].is_none())
+                .collect()
         }
 
         /// Whether every chunk has arrived.
@@ -717,7 +792,10 @@ pub mod bao {
             }
             assert!(!rx.is_complete());
             let missing = rx.missing();
-            assert!(missing.iter().all(|i| i % 2 == 1), "only odd chunks remain: {missing:?}");
+            assert!(
+                missing.iter().all(|i| i % 2 == 1),
+                "only odd chunks remain: {missing:?}"
+            );
             assert_eq!(rx.reassemble(), Err(BaoError::Incomplete));
 
             // Resume: deliver exactly the missing chunks.
@@ -725,7 +803,11 @@ pub mod bao {
                 rx.accept(&c.pieces[i]).expect("resumed chunk");
             }
             assert!(rx.is_complete());
-            assert_eq!(rx.reassemble().expect("complete"), data, "partial + resume reassembles the original");
+            assert_eq!(
+                rx.reassemble().expect("complete"),
+                data,
+                "partial + resume reassembles the original"
+            );
         }
 
         #[test]
@@ -735,7 +817,11 @@ pub mod bao {
             let mut rx = ChunkReceiver::new(c.root, c.total);
             let mut bad = c.pieces[2].clone();
             bad.bytes[0] ^= 0x01; // flip one byte
-            assert_eq!(rx.accept(&bad), Err(BaoError::Unauthenticated), "a tampered chunk is rejected");
+            assert_eq!(
+                rx.accept(&bad),
+                Err(BaoError::Unauthenticated),
+                "a tampered chunk is rejected"
+            );
             assert!(!rx.has(2));
         }
 
@@ -784,8 +870,8 @@ pub mod bao {
 mod tests {
     use super::{
         leaf_hash, merkle_root, root_from_path, sign_ack, verify_ack, verify_delivery,
-        verify_inclusion, verify_sth, DeliveryProof, DestAck, ManifestError, ManifestLog, ProofStep,
-        SignedTreeHead,
+        verify_inclusion, verify_sth, DeliveryProof, DestAck, ManifestError, ManifestLog,
+        ProofStep, SignedTreeHead,
     };
     use datarail_crypto::{blake3_256, ctx, verify_domain, verifying_key};
 
@@ -944,13 +1030,13 @@ mod tests {
 
     /// A fully-valid bundle for index 3 of a 9-leaf log, returned with all the pieces to tamper.
     fn valid_fixture() -> (
-        Vec<u8>,            // carga
-        u64,                // seq
+        Vec<u8>, // carga
+        u64,     // seq
         super::InclusionProof,
         SignedTreeHead,
-        [u8; 32],           // source_vk
+        [u8; 32], // source_vk
         DestAck,
-        [u8; 32],           // dest_vk
+        [u8; 32], // dest_vk
     ) {
         let cs = cargas(9);
         let log = build_log(&cs);
@@ -1002,7 +1088,16 @@ mod tests {
         let mut bad = carga.clone();
         bad[0] ^= 0x01;
         ack.cofre_id = blake3_256(&bad);
-        ack.dest_sig = sign_ack(&DEST_SEED, ack.cofre_id, ROUTE, STREAM, seq, sth.root, EPOCH).dest_sig;
+        ack.dest_sig = sign_ack(
+            &DEST_SEED,
+            ack.cofre_id,
+            ROUTE,
+            STREAM,
+            seq,
+            sth.root,
+            EPOCH,
+        )
+        .dest_sig;
         assert_eq!(
             run(&bad, seq, &proof, &sth, &svk, &ack, &dvk),
             Err(ManifestError::BadInclusion)
@@ -1067,17 +1162,13 @@ mod tests {
             s.root = forged_root;
             // re-sign over the forged root
             super::SignedTreeHead {
-                sig: datarail_crypto::sign_domain(
-                    ctx::STH,
-                    &SOURCE_SEED,
-                    &{
-                        let mut b = Vec::new();
-                        b.extend_from_slice(&forged_root);
-                        b.extend_from_slice(&s.tree_size.to_le_bytes());
-                        b.extend_from_slice(&s.ts.to_le_bytes());
-                        b
-                    },
-                ),
+                sig: datarail_crypto::sign_domain(ctx::STH, &SOURCE_SEED, &{
+                    let mut b = Vec::new();
+                    b.extend_from_slice(&forged_root);
+                    b.extend_from_slice(&s.tree_size.to_le_bytes());
+                    b.extend_from_slice(&s.ts.to_le_bytes());
+                    b
+                }),
                 ..s
             }
         };
@@ -1120,7 +1211,15 @@ mod tests {
 
         // (b) ack lifted onto a different route → position mismatch (signature stays valid for its own msg).
         let (carga_b, seq_b, proof_b, sth_b, svk_b, _a_b, dvk_b) = valid_fixture();
-        let ack_b = sign_ack(&DEST_SEED, blake3_256(&carga_b), [0xAA; 16], STREAM, seq_b, sth_b.root, EPOCH);
+        let ack_b = sign_ack(
+            &DEST_SEED,
+            blake3_256(&carga_b),
+            [0xAA; 16],
+            STREAM,
+            seq_b,
+            sth_b.root,
+            EPOCH,
+        );
         assert_eq!(
             run(&carga_b, seq_b, &proof_b, &sth_b, &svk_b, &ack_b, &dvk_b),
             Err(ManifestError::AckPositionMismatch)
@@ -1130,7 +1229,15 @@ mod tests {
         let (carga_c, seq_c, proof_c, sth_c, svk_c, _a, dvk_c) = valid_fixture();
         let mut stale_root = sth_c.root;
         stale_root[0] ^= 0x01;
-        let ack_c = sign_ack(&DEST_SEED, blake3_256(&carga_c), ROUTE, STREAM, seq_c, stale_root, EPOCH);
+        let ack_c = sign_ack(
+            &DEST_SEED,
+            blake3_256(&carga_c),
+            ROUTE,
+            STREAM,
+            seq_c,
+            stale_root,
+            EPOCH,
+        );
         assert_eq!(
             run(&carga_c, seq_c, &proof_c, &sth_c, &svk_c, &ack_c, &dvk_c),
             Err(ManifestError::AckRootMismatch)
@@ -1211,6 +1318,9 @@ mod tests {
             sibling: sib,
             sibling_is_right: true,
         };
-        assert_eq!(root_from_path(&leaf, &[step]), super::hash_node(&leaf, &sib));
+        assert_eq!(
+            root_from_path(&leaf, &[step]),
+            super::hash_node(&leaf, &sib)
+        );
     }
 }

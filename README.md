@@ -88,8 +88,9 @@ method and raw results in [`docs/BENCH-INDEPENDENT-2026-07-01.md`](docs/BENCH-IN
   *negative* scaling, ~1 core ceiling). The per-batch seal is now parallelized (a reserved seq range + an
   immutable `board_at`): a same-minute interleaved A/B on the same 4 vCPU host measured **~2.5×** (serial
   1.3 → parallel 3.3 MB/s in a degraded-host window; that shared sandbox's absolute numbers drift ~4.5× across
-  hours, so trust the ratio, not the absolutes — method in the bench addendum). The global broker lock still
-  serializes batches; per-partition locking is the next lever.
+  hours, so trust the ratio, not the absolutes — method in the bench addendum). The current worktree removes the
+  global broker-state mutex from partition paths; local WP-01 evidence is tracked separately and is not an
+  independent product benchmark.
 
 The older headline figures in the design docs (`~72×` Kafka's RAM, throughput "tie") were measured on
 `datarail-omb-shim` — a point-to-point mover, not this broker — at a ~51 MB/s operating point, self-run, n=3
@@ -179,12 +180,13 @@ raw demo secrets by design; real deployments should reference keys, not inline t
 The sharp edges, before you find them:
 
 - **Single-node.** No replication or failover of any kind; this is the project's largest open front.
-- **Throughput ceiling, partially addressed:** the per-batch seal is now parallel (~2.5× measured, same-minute
-  A/B), but the global broker lock still serializes batches — true multi-producer scaling needs per-partition
-  locking (planned).
-- **Transactions are not crash-atomic across partitions:** the txn coordinator is in-memory; a crash mid-commit
-  can land a partial multi-partition transaction. Documented in
-  [`docs/design/KAFKA-TXN-DESIGN.md`](docs/design/KAFKA-TXN-DESIGN.md); a durable txn log is future work.
+- **Throughput scaling is not independently evidenced:** per-partition locking is implemented; local 512-byte
+  interleaved A/B samples ranged `1.154x–1.684x` on this host, with high variance. Independent product evidence,
+  CI-scale samples, and RSS remain absent. See [`docs/roadmap/WP-01-BENCH-LOCAL-2026-09-12.md`](docs/roadmap/WP-01-BENCH-LOCAL-2026-09-12.md).
+- **Transactional crash atomicity is single-node scoped:** broker has durable prepare/commit journaling, rollback,
+  startup recovery, process-boundary faults, and partial/complete journal-write cuts with all-or-none recovery.
+  This is not Kafka marker/LSO compatibility or multi-node atomicity. See
+  [`docs/design/KAFKA-TXN-DURABILITY.md`](docs/design/KAFKA-TXN-DURABILITY.md).
 - **Broker restarts are at-least-once** for non-idempotent producers (the general dedup index is not wired in).
 - **QUIC substrate ships dev-only embedded certs and the client accepts any server cert** — an active MITM on
   that hop can read envelope (*etiqueta*) metadata — route/stream ids, sequence, timing — never payloads.
