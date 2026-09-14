@@ -263,7 +263,8 @@ impl Once {
             st.delivered_keys.retain(|seq, _| *seq >= st.gc_floor);
             // `seen` is rebuilt from the replayed entries; drop anything now below the floor is unnecessary here
             // because restore runs at open before traffic, but keep `seen` consistent with `delivered_keys`:
-            let live: std::collections::HashSet<[u8; 32]> = st.delivered_keys.values().copied().collect();
+            let live: std::collections::HashSet<[u8; 32]> =
+                st.delivered_keys.values().copied().collect();
             st.seen.retain(|k| live.contains(k));
         }
     }
@@ -340,8 +341,16 @@ mod tests {
         // watermark pinned with a gap at 0, deliver seq 5, then re-present seq 5 under a regenerated key.
         let mut o = Once::new(SEED);
         assert_eq!(o.admit(S, 5, key(5)), Disposition::Delivered);
-        assert_eq!(o.low_watermark(S), 0, "the gap at 0 pins the watermark; seq 5 is merely parked");
-        assert_eq!(o.admit(S, 5, key(999)), Disposition::Duplicate, "same seq, new key -> committed once");
+        assert_eq!(
+            o.low_watermark(S),
+            0,
+            "the gap at 0 pins the watermark; seq 5 is merely parked"
+        );
+        assert_eq!(
+            o.admit(S, 5, key(999)),
+            Disposition::Duplicate,
+            "same seq, new key -> committed once"
+        );
     }
 
     #[test]

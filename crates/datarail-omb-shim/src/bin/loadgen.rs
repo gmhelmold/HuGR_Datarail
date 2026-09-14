@@ -72,7 +72,12 @@ fn topic_header(topic: &str, sub: Option<&str>) -> Vec<u8> {
 }
 
 /// Producer: stream pre-built frames as fast as the shim will accept (its bounded queue self-throttles us).
-fn run_producer(addr: &str, topic: &str, msg_size: usize, stop: &Arc<AtomicBool>) -> std::io::Result<()> {
+fn run_producer(
+    addr: &str,
+    topic: &str,
+    msg_size: usize,
+    stop: &Arc<AtomicBool>,
+) -> std::io::Result<()> {
     let mut sock = TcpStream::connect(addr)?;
     sock.set_nodelay(true)?;
     sock.write_all(&topic_header(topic, None))?;
@@ -137,7 +142,10 @@ fn run_consumer(
         let mut pos = 0usize;
         while buf.len() - pos >= FRAME_HEADER {
             let len = usize::try_from(u32::from_be_bytes([
-                buf[pos], buf[pos + 1], buf[pos + 2], buf[pos + 3],
+                buf[pos],
+                buf[pos + 1],
+                buf[pos + 2],
+                buf[pos + 3],
             ]))
             .unwrap_or(usize::MAX);
             let total = FRAME_HEADER.saturating_add(len);
@@ -161,7 +169,12 @@ fn main() {
     let args = parse_args();
     println!(
         "datarail-loadgen: topics={} msg_size={} warmup={}s measure={}s ingress={} egress={}",
-        args.topics, args.msg_size, args.warmup_secs, args.measure_secs, args.ingress_addr, args.egress_addr
+        args.topics,
+        args.msg_size,
+        args.warmup_secs,
+        args.measure_secs,
+        args.ingress_addr,
+        args.egress_addr
     );
     let delivered = Arc::new(AtomicU64::new(0));
     let stop = Arc::new(AtomicBool::new(false));
@@ -170,8 +183,12 @@ fn main() {
     for i in 0..args.topics {
         let topic = format!("t{i}");
         // Consumer first so it is subscribed before the producer floods (the shim fans out to live subscribers).
-        let (caddr, ctopic, cdel, cstop) =
-            (args.egress_addr.clone(), topic.clone(), Arc::clone(&delivered), Arc::clone(&stop));
+        let (caddr, ctopic, cdel, cstop) = (
+            args.egress_addr.clone(),
+            topic.clone(),
+            Arc::clone(&delivered),
+            Arc::clone(&stop),
+        );
         handles.push(thread::spawn(move || {
             if let Err(e) = run_consumer(&caddr, &ctopic, &cdel, &cstop) {
                 eprintln!("consumer {ctopic}: {e}");
@@ -181,8 +198,12 @@ fn main() {
     thread::sleep(Duration::from_millis(300)); // let consumers register
     for i in 0..args.topics {
         let topic = format!("t{i}");
-        let (paddr, ptopic, psize, pstop) =
-            (args.ingress_addr.clone(), topic, args.msg_size, Arc::clone(&stop));
+        let (paddr, ptopic, psize, pstop) = (
+            args.ingress_addr.clone(),
+            topic,
+            args.msg_size,
+            Arc::clone(&stop),
+        );
         handles.push(thread::spawn(move || {
             if let Err(e) = run_producer(&paddr, &ptopic, psize, &pstop) {
                 eprintln!("producer {ptopic}: {e}");
