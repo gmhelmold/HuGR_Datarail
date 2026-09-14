@@ -30,8 +30,14 @@ const TENANT_SECRET: [u8; 32] = [6u8; 32];
 
 /// Resident set size of this process, in MB (Linux `/proc/self/statm` resident pages × 4 KiB; 0 off-Linux).
 fn rss_mb() -> u64 {
-    let Ok(s) = std::fs::read_to_string("/proc/self/statm") else { return 0 };
-    let pages: u64 = s.split_whitespace().nth(1).and_then(|p| p.parse().ok()).unwrap_or(0);
+    let Ok(s) = std::fs::read_to_string("/proc/self/statm") else {
+        return 0;
+    };
+    let pages: u64 = s
+        .split_whitespace()
+        .nth(1)
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(0);
     pages * 4096 / (1024 * 1024)
 }
 
@@ -58,7 +64,10 @@ fn main() {
     let cofres: u64 = a.first().and_then(|s| s.parse().ok()).unwrap_or(200_000);
     let per_cofre: usize = a.get(1).and_then(|s| s.parse().ok()).unwrap_or(128);
     let msg_size: usize = a.get(2).and_then(|s| s.parse().ok()).unwrap_or(1024);
-    let dir = a.get(3).map_or_else(|| std::env::temp_dir().join("datarail-store-bench"), PathBuf::from);
+    let dir = a.get(3).map_or_else(
+        || std::env::temp_dir().join("datarail-store-bench"),
+        PathBuf::from,
+    );
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("create store dir");
 
@@ -103,7 +112,11 @@ fn main() {
     let rss_final = rss_mb();
     let put_rate = u128::from(cofres).saturating_mul(1_000_000) / micros; // cofres/s, integer
     println!("\nRESULT: stored {stored} MB durably across {cofres} sealed cofres on disk");
-    println!("        process RSS: baseline {rss_base} MB → final {rss_final} MB (max {rss_peak} MB)");
-    println!("        ⇒ durability scaled on DISK (cheap/abundant); RAM stayed ~FLAT (scarce/expensive)");
+    println!(
+        "        process RSS: baseline {rss_base} MB → final {rss_final} MB (max {rss_peak} MB)"
+    );
+    println!(
+        "        ⇒ durability scaled on DISK (cheap/abundant); RAM stayed ~FLAT (scarce/expensive)"
+    );
     println!("        ({put_rate} cofres/s sealed+PUT)");
 }

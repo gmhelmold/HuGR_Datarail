@@ -158,7 +158,10 @@ impl Percentiles {
 fn report_idle_footprint(fx: &Fixtures) {
     println!("GATE-FEATHER — idle footprint (RSS via /proc/self/statm; DIRECTIONAL on dev HW):");
     let baseline = read_rss_bytes();
-    println!("  baseline RSS (startup)                 {}", fmt_rss(baseline));
+    println!(
+        "  baseline RSS (startup)                 {}",
+        fmt_rss(baseline)
+    );
 
     // Build the rail + terminals and run repeated burst → drain → ack cycles. After each drain the in-flight
     // count must be 0: a passive substrate accumulates no standing state when idle (the architectural half).
@@ -171,14 +174,20 @@ fn report_idle_footprint(fx: &Fixtures) {
     for cycle in 0..64u64 {
         for _ in 0..256 {
             let rk = cycle.to_le_bytes();
-            let cofre = src.board(&rec, &rk).expect("board must succeed for a contract-conforming record");
+            let cofre = src
+                .board(&rec, &rk)
+                .expect("board must succeed for a contract-conforming record");
             sub.send(&cofre).expect("loopback send is infallible");
         }
         while let Some(cofre) = sub.recv().expect("loopback recv is infallible") {
-            if matches!(dst.offload(&cofre).expect("offload is infallible"), Disposition::Delivered) {
+            if matches!(
+                dst.offload(&cofre).expect("offload is infallible"),
+                Disposition::Delivered
+            ) {
                 delivered += 1;
             }
-            sub.ack(cofre.etiqueta.cofre_id).expect("loopback ack is infallible");
+            sub.ack(cofre.etiqueta.cofre_id)
+                .expect("loopback ack is infallible");
         }
         assert_eq!(
             sub.queued_len(),
@@ -188,7 +197,10 @@ fn report_idle_footprint(fx: &Fixtures) {
     }
 
     let drained = read_rss_bytes();
-    println!("  RSS after build + drain-to-idle        {}", fmt_rss(drained));
+    println!(
+        "  RSS after build + drain-to-idle        {}",
+        fmt_rss(drained)
+    );
     if let (Some(base), Some(now)) = (baseline, drained) {
         let delta = now.saturating_sub(base);
         let shrank = base.saturating_sub(now);
@@ -247,8 +259,12 @@ fn report_latency_percentiles(fx: &Fixtures) {
         let disp = dst.offload(&got).expect("offload is infallible");
         offload_ns.push(u64::try_from(t1.elapsed().as_nanos()).unwrap_or(u64::MAX));
 
-        debug_assert!(matches!(disp, Disposition::Delivered), "unique keys must deliver");
-        sub.ack(got.etiqueta.cofre_id).expect("loopback ack is infallible");
+        debug_assert!(
+            matches!(disp, Disposition::Delivered),
+            "unique keys must deliver"
+        );
+        sub.ack(got.etiqueta.cofre_id)
+            .expect("loopback ack is infallible");
     }
 
     Percentiles::from_samples(&mut board_ns).print_row("board");

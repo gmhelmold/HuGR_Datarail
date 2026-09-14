@@ -51,7 +51,10 @@ fn no_record_is_lost_across_arbitrary_broker_crashes() {
     {
         let mut producer = open_broker(&tdir, &odir);
         for i in 0..N {
-            let r = producer.handle(Request::Produce { key: Vec::new(), payload: format!("v{i}").into_bytes() });
+            let r = producer.handle(Request::Produce {
+                key: Vec::new(),
+                payload: format!("v{i}").into_bytes(),
+            });
             assert!(matches!(r, Response::Produced(_)), "produce failed: {r:?}");
         }
     }
@@ -69,10 +72,15 @@ fn no_record_is_lost_across_arbitrary_broker_crashes() {
 
     while committed < end {
         guard += 1;
-        assert!(guard < 2_000_000, "chaos did not converge (committed {committed} < end {end})");
+        assert!(
+            guard < 2_000_000,
+            "chaos did not converge (committed {committed} < end {end})"
+        );
         match rng.next() % 10 {
             // 0–5: poll (consume) a record.
-            0..=5 => match server.handle(Request::Poll { group: "g".to_owned() }) {
+            0..=5 => match server.handle(Request::Poll {
+                group: "g".to_owned(),
+            }) {
                 Response::Record(Some((resume_off, _key, payload))) => {
                     seen.insert(payload);
                     last_resume = resume_off;
@@ -86,7 +94,10 @@ fn no_record_is_lost_across_arbitrary_broker_crashes() {
             // 6–7: durably commit the last resume point.
             6 | 7 => {
                 assert_eq!(
-                    server.handle(Request::Commit { group: "g".to_owned(), offset: last_resume }),
+                    server.handle(Request::Commit {
+                        group: "g".to_owned(),
+                        offset: last_resume
+                    }),
                     Response::Committed
                 );
                 committed = last_resume;
@@ -103,10 +114,16 @@ fn no_record_is_lost_across_arbitrary_broker_crashes() {
     }
 
     // THE INVARIANT: across all the crashes, every produced record was consumed at least once — nothing lost.
-    assert!(crashes > 0, "the chaos must actually have crashed the broker");
+    assert!(
+        crashes > 0,
+        "the chaos must actually have crashed the broker"
+    );
     for i in 0..N {
         let want = format!("v{i}").into_bytes();
-        assert!(seen.contains(&want), "record v{i} was LOST across the crash chaos ({crashes} crashes)");
+        assert!(
+            seen.contains(&want),
+            "record v{i} was LOST across the crash chaos ({crashes} crashes)"
+        );
     }
     assert_eq!(committed, end, "did not durably consume to the end");
 

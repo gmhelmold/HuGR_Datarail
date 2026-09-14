@@ -91,12 +91,26 @@ impl FileOnce {
         let mut once = Once::new(seed);
         let appended = {
             let mut buf = Vec::new();
-            OpenOptions::new().read(true).append(true).create(true).open(&path)?.read_to_end(&mut buf)?;
+            OpenOptions::new()
+                .read(true)
+                .append(true)
+                .create(true)
+                .open(&path)?
+                .read_to_end(&mut buf)?;
             replay(&buf, &mut once)
         };
-        let log = OpenOptions::new().read(true).append(true).create(true).open(&path)?;
+        let log = OpenOptions::new()
+            .read(true)
+            .append(true)
+            .create(true)
+            .open(&path)?;
         fsync_dir(&dir)?;
-        Ok(Self { once, log, dir, appended })
+        Ok(Self {
+            once,
+            log,
+            dir,
+            appended,
+        })
     }
 
     /// Admit a record durably: decide via the in-memory gate, and on `Delivered` append a fsync'd `D` record so a
@@ -131,13 +145,23 @@ impl FileOnce {
         let live_path = self.dir.join(LOG_NAME);
         let mut written = 0u64;
         {
-            let mut tmp = OpenOptions::new().write(true).create(true).truncate(true).open(&tmp_path)?;
+            let mut tmp = OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&tmp_path)?;
             let mut snapshot = Vec::new();
             for (stream, watermark, entries) in self.once.checkpoints() {
-                snapshot.extend_from_slice(&encode(TAG_CHECKPOINT, &checkpoint_body(&stream, watermark)));
+                snapshot.extend_from_slice(&encode(
+                    TAG_CHECKPOINT,
+                    &checkpoint_body(&stream, watermark),
+                ));
                 written += 1;
                 for (seq, key) in entries {
-                    snapshot.extend_from_slice(&encode(TAG_DELIVERED, &delivered_body(&stream, seq, &key)));
+                    snapshot.extend_from_slice(&encode(
+                        TAG_DELIVERED,
+                        &delivered_body(&stream, seq, &key),
+                    ));
                     written += 1;
                 }
             }
@@ -145,7 +169,10 @@ impl FileOnce {
             tmp.sync_all()?;
         }
         std::fs::rename(&tmp_path, &live_path)?;
-        self.log = OpenOptions::new().read(true).append(true).open(&live_path)?;
+        self.log = OpenOptions::new()
+            .read(true)
+            .append(true)
+            .open(&live_path)?;
         fsync_dir(&self.dir)?;
         self.appended = written;
         Ok(())
@@ -172,22 +199,38 @@ fn replay(buf: &[u8], once: &mut Once) -> u64 {
         if rec_end > buf.len() {
             break; // torn tail
         }
-        let Some(framed) = buf.get(pos..crc_start) else { break };
-        let Some(stored) = buf.get(crc_start..rec_end) else { break };
+        let Some(framed) = buf.get(pos..crc_start) else {
+            break;
+        };
+        let Some(stored) = buf.get(crc_start..rec_end) else {
+            break;
+        };
         if stored != crc4(framed) {
             break; // corrupt / torn record
         }
-        let Some(body) = buf.get(pos + 1..crc_start) else { break };
-        let Some(stream) = body.get(0..16).and_then(|b| <[u8; 16]>::try_from(b).ok()) else { break };
+        let Some(body) = buf.get(pos + 1..crc_start) else {
+            break;
+        };
+        let Some(stream) = body.get(0..16).and_then(|b| <[u8; 16]>::try_from(b).ok()) else {
+            break;
+        };
         match tag {
             TAG_DELIVERED => {
-                let seq = body.get(16..24).and_then(|b| <[u8; 8]>::try_from(b).ok()).map(u64::from_le_bytes);
+                let seq = body
+                    .get(16..24)
+                    .and_then(|b| <[u8; 8]>::try_from(b).ok())
+                    .map(u64::from_le_bytes);
                 let key = body.get(24..56).and_then(|b| <[u8; 32]>::try_from(b).ok());
-                let (Some(seq), Some(key)) = (seq, key) else { break };
+                let (Some(seq), Some(key)) = (seq, key) else {
+                    break;
+                };
                 let _ = once.admit(stream, seq, key);
             }
             TAG_CHECKPOINT => {
-                let Some(wm) = body.get(16..24).and_then(|b| <[u8; 8]>::try_from(b).ok()).map(u64::from_le_bytes)
+                let Some(wm) = body
+                    .get(16..24)
+                    .and_then(|b| <[u8; 8]>::try_from(b).ok())
+                    .map(u64::from_le_bytes)
                 else {
                     break;
                 };
@@ -228,16 +271,31 @@ mod tests {
         {
             let mut o = FileOnce::open(&dir, SEED).expect("open");
             for n in 0..5u64 {
-                assert_eq!(o.admit(S, n, key(n)).expect("admit"), Disposition::Delivered);
+                assert_eq!(
+                    o.admit(S, n, key(n)).expect("admit"),
+                    Disposition::Delivered
+                );
             }
         }
         // "Crash" + restart: a fresh FileOnce over the same dir must REMEMBER the dedup state (no flood).
         let mut o = FileOnce::open(&dir, SEED).expect("reopen");
-        assert_eq!(o.low_watermark(S), 5, "watermark recovered from the durable log");
+        assert_eq!(
+            o.low_watermark(S),
+            5,
+            "watermark recovered from the durable log"
+        );
         for n in 0..5u64 {
-            assert_eq!(o.admit(S, n, key(n)).expect("replay"), Disposition::Duplicate, "redelivery dropped");
+            assert_eq!(
+                o.admit(S, n, key(n)).expect("replay"),
+                Disposition::Duplicate,
+                "redelivery dropped"
+            );
         }
-        assert_eq!(o.admit(S, 5, key(5)).expect("new"), Disposition::Delivered, "genuinely new still delivered");
+        assert_eq!(
+            o.admit(S, 5, key(5)).expect("new"),
+            Disposition::Delivered,
+            "genuinely new still delivered"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -247,13 +305,22 @@ mod tests {
         {
             let mut o = FileOnce::open(&dir, SEED).expect("open");
             // Gap at 0: deliver 5 (parked above the watermark).
-            assert_eq!(o.admit(S, 5, key(5)).expect("admit"), Disposition::Delivered);
+            assert_eq!(
+                o.admit(S, 5, key(5)).expect("admit"),
+                Disposition::Delivered
+            );
             assert_eq!(o.low_watermark(S), 0);
         }
         let mut o = FileOnce::open(&dir, SEED).expect("reopen");
         // The parked, above-watermark seq 5 must still be deduped after the restart.
-        assert_eq!(o.admit(S, 5, key(5)).expect("replay"), Disposition::Duplicate);
-        assert_eq!(o.admit(S, 5, key(999)).expect("replay-diff-key"), Disposition::Duplicate);
+        assert_eq!(
+            o.admit(S, 5, key(5)).expect("replay"),
+            Disposition::Duplicate
+        );
+        assert_eq!(
+            o.admit(S, 5, key(999)).expect("replay-diff-key"),
+            Disposition::Duplicate
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -273,7 +340,11 @@ mod tests {
         std::fs::write(&path, &bytes).expect("write");
         // Reopen must recover the 3 intact records and ignore the torn tail (no panic).
         let mut o = FileOnce::open(&dir, SEED).expect("reopen torn");
-        assert_eq!(o.low_watermark(S), 3, "intact prefix recovered, torn tail dropped");
+        assert_eq!(
+            o.low_watermark(S),
+            3,
+            "intact prefix recovered, torn tail dropped"
+        );
         assert_eq!(o.admit(S, 0, key(0)).expect("dup"), Disposition::Duplicate);
         let _ = std::fs::remove_dir_all(&dir);
     }

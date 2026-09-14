@@ -48,15 +48,32 @@ fn uc1a_volume_storm_100k_records_committed_exactly_once_in_order() {
 
     // 0-loss / 0-dup / 0-leak: every record committed exactly once, in boarding order.
     let committed = rig.dest.sink().committed();
-    assert_eq!(committed.len(), RECORDS, "every conforming record committed exactly once (0-loss/0-dup)");
-    assert!(rig.dest.dead_letters().is_empty(), "nothing dead-lettered (0-leak): all records were authentic");
+    assert_eq!(
+        committed.len(),
+        RECORDS,
+        "every conforming record committed exactly once (0-loss/0-dup)"
+    );
+    assert!(
+        rig.dest.dead_letters().is_empty(),
+        "nothing dead-lettered (0-leak): all records were authentic"
+    );
     for (i, rec) in committed.iter().enumerate() {
-        assert_eq!(rec.as_slice(), conforming_record(i).as_slice(), "record {i} out of order");
+        assert_eq!(
+            rec.as_slice(),
+            conforming_record(i).as_slice(),
+            "record {i} out of order"
+        );
     }
-    assert_eq!(tally.delivered, boarded_cofres, "every cofre delivered exactly once");
+    assert_eq!(
+        tally.delivered, boarded_cofres,
+        "every cofre delivered exactly once"
+    );
     assert_eq!(tally.duplicate, 0, "no duplicate under a single pass");
     assert_eq!(tally.dead_lettered, 0, "no dead-letter under a single pass");
-    println!("{} (records={RECORDS}, cofres={boarded_cofres})", tally.report("uc1a volume-storm"));
+    println!(
+        "{} (records={RECORDS}, cofres={boarded_cofres})",
+        tally.report("uc1a volume-storm")
+    );
 }
 
 /// (b) TINY-RECORD OVERHEAD STORM — one record per cofre at high count over a **real TCP loopback socket**.
@@ -77,7 +94,10 @@ fn uc1b_tiny_record_overhead_storm_over_real_tcp_is_correct() {
     for i in 0..RECORDS {
         let rec = conforming_record(i);
         let rk = record_key(i);
-        let cofre = rig.source.board(&[rec.as_slice()], &rk).expect("board 1-record cofre");
+        let cofre = rig
+            .source
+            .board(&[rec.as_slice()], &rk)
+            .expect("board 1-record cofre");
         link.send(&cofre).expect("send over tcp");
         sent += 1;
         while let Some(c) = link.recv().expect("recv over tcp") {
@@ -98,15 +118,29 @@ fn uc1b_tiny_record_overhead_storm_over_real_tcp_is_correct() {
     }
 
     let committed = rig.dest.sink().committed();
-    assert_eq!(committed.len(), RECORDS, "every 1-record cofre committed exactly once over real TCP");
-    assert!(rig.dest.dead_letters().is_empty(), "nothing dead-lettered: every cofre survived TCP byte-for-byte");
+    assert_eq!(
+        committed.len(),
+        RECORDS,
+        "every 1-record cofre committed exactly once over real TCP"
+    );
+    assert!(
+        rig.dest.dead_letters().is_empty(),
+        "nothing dead-lettered: every cofre survived TCP byte-for-byte"
+    );
     for (i, rec) in committed.iter().enumerate() {
-        assert_eq!(rec.as_slice(), conforming_record(i).as_slice(), "record {i} out of order over TCP");
+        assert_eq!(
+            rec.as_slice(),
+            conforming_record(i).as_slice(),
+            "record {i} out of order over TCP"
+        );
     }
     assert_eq!(tally.delivered, sent, "every cofre delivered exactly once");
     assert_eq!(tally.duplicate, 0);
     assert_eq!(tally.dead_lettered, 0);
-    println!("{} (records=cofres={RECORDS}, real-tcp)", tally.report("uc1b tiny-record-overhead"));
+    println!(
+        "{} (records=cofres={RECORDS}, real-tcp)",
+        tally.report("uc1b tiny-record-overhead")
+    );
 }
 
 /// (c) DUPLICATE FLOOD — re-offload the SAME cofres 10× through one destination. Every replay is a `Duplicate`
@@ -132,17 +166,28 @@ fn uc1c_duplicate_flood_replays_are_all_duplicate_sink_grows_by_zero() {
     for c in &cofres {
         let disp = rig.dest.offload(c).expect("offload (first pass)");
         tally.observe(disp);
-        assert_eq!(disp, Disposition::Delivered, "first delivery of a distinct cofre");
+        assert_eq!(
+            disp,
+            Disposition::Delivered,
+            "first delivery of a distinct cofre"
+        );
     }
     let baseline = rig.dest.sink().len();
-    assert_eq!(baseline, N, "first pass committed every distinct record exactly once");
+    assert_eq!(
+        baseline, N,
+        "first pass committed every distinct record exactly once"
+    );
 
     // DUPLICATE FLOOD: replay the SAME cofres REPLAYS times. Each must be Duplicate; the sink must not grow.
     for pass in 0..REPLAYS {
         for c in &cofres {
             let disp = rig.dest.offload(c).expect("offload (replay)");
             tally.observe(disp);
-            assert_eq!(disp, Disposition::Duplicate, "replayed cofre must dedup to Duplicate");
+            assert_eq!(
+                disp,
+                Disposition::Duplicate,
+                "replayed cofre must dedup to Duplicate"
+            );
         }
         assert_eq!(
             rig.dest.sink().len(),
@@ -151,9 +196,19 @@ fn uc1c_duplicate_flood_replays_are_all_duplicate_sink_grows_by_zero() {
         );
     }
 
-    assert!(rig.dest.dead_letters().is_empty(), "duplicates are dropped, never dead-lettered");
+    assert!(
+        rig.dest.dead_letters().is_empty(),
+        "duplicates are dropped, never dead-lettered"
+    );
     assert_eq!(tally.delivered, N as u64, "exactly N first-time deliveries");
-    assert_eq!(tally.duplicate, (N * REPLAYS) as u64, "exactly N*REPLAYS duplicates across the flood");
+    assert_eq!(
+        tally.duplicate,
+        (N * REPLAYS) as u64,
+        "exactly N*REPLAYS duplicates across the flood"
+    );
     assert_eq!(tally.lost, 0);
-    println!("{} (distinct={N}, replays={REPLAYS})", tally.report("uc1c duplicate-flood"));
+    println!(
+        "{} (distinct={N}, replays={REPLAYS})",
+        tally.report("uc1c duplicate-flood")
+    );
 }
