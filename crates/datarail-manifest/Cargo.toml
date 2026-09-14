@@ -11,5 +11,4 @@ description = "datarail-manifest — Merkle log, signed tree head, inclusion-pro
 workspace = true
 
 [dependencies]
-datarail-core = { path = "../datarail-core" }
 datarail-crypto = { path = "../datarail-crypto" }
