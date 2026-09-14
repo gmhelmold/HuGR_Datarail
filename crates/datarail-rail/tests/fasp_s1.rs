@@ -28,7 +28,11 @@ fn s1_reliable_ordered_delivery_over_real_udp_and_rtt_is_learned() {
 
     let deadline = Instant::now() + Duration::from_secs(20);
     while (got.len() as u64) < N {
-        assert!(Instant::now() < deadline, "S1 did not converge: delivered {}/{N}", got.len());
+        assert!(
+            Instant::now() < deadline,
+            "S1 did not converge: delivered {}/{N}",
+            got.len()
+        );
         // Offer the next message when the window has room (send() also self-paces on max_inflight).
         if sent < N && a.inflight_len() < cfg.max_inflight {
             a.send(&sent.to_be_bytes()).expect("send");
@@ -52,7 +56,10 @@ fn s1_reliable_ordered_delivery_over_real_udp_and_rtt_is_learned() {
     let sb = b.stats();
     let sa = a.stats();
     assert_eq!(sb.delivered, N, "B delivered all");
-    assert!(sa.base_rtt < Duration::MAX, "A learned a base RTT from real ACKs");
+    assert!(
+        sa.base_rtt < Duration::MAX,
+        "A learned a base RTT from real ACKs"
+    );
     assert!(sa.window >= cfg.min_window, "window stayed valid");
     // Clean loopback: delivery completes; if any spurious retransmit happened it must still be exactly-once
     // (asserted above). We don't hard-assert 0 retransmits — a slow CI box can trip the RTO benignly.

@@ -85,7 +85,10 @@ fn bench_fasp(secs: u64) -> f64 {
     let elapsed = start.elapsed().as_secs_f64();
     stop.store(true, Ordering::Relaxed);
     rx.join().expect("rx join");
-    mbps(delivered.load(Ordering::Relaxed) * MAX_FASP_PAYLOAD as u64, elapsed)
+    mbps(
+        delivered.load(Ordering::Relaxed) * MAX_FASP_PAYLOAD as u64,
+        elapsed,
+    )
 }
 
 /// Push bytes over kernel TCP on the same loopback for `secs`; return MB/s of bytes *received* (timing starts
@@ -121,11 +124,17 @@ fn bench_tcp(secs: u64) -> f64 {
     c.flush().ok();
     c.shutdown(std::net::Shutdown::Write).ok();
     acc.join().expect("acc join");
-    mbps(received.load(Ordering::Relaxed), start.elapsed().as_secs_f64())
+    mbps(
+        received.load(Ordering::Relaxed),
+        start.elapsed().as_secs_f64(),
+    )
 }
 
 fn main() {
-    let secs: u64 = std::env::args().nth(1).and_then(|s| s.parse().ok()).unwrap_or(5);
+    let secs: u64 = std::env::args()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(5);
     let fasp = bench_fasp(secs);
     let tcp = bench_tcp(secs);
     let ratio = if tcp > 0.0 { fasp / tcp } else { 0.0 };
