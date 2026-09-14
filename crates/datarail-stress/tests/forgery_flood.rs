@@ -10,8 +10,8 @@
 //! failure — and their payloads are deliberately distinct from the authentic ones so any leak is detectable.
 
 use datarail_core::Disposition;
-use datarail_terminal::{DeadLetterReason, SourceTerminal};
 use datarail_stress::{conforming_record, forger_source, record_key, Rig, Tally};
+use datarail_terminal::{DeadLetterReason, SourceTerminal};
 
 /// A forged payload for index `i` — distinct from any authentic payload, so a leak into the sink is detectable.
 fn forged_payload(i: usize) -> Vec<u8> {
@@ -35,30 +35,54 @@ fn forgery_flood_delivers_only_authentic_dead_letters_every_forgery() {
         // Authentic: boarded through the real source (pinned key) ⇒ must be Delivered.
         let rec = conforming_record(i);
         let rk = record_key(i);
-        let good = rig.source.board(&[rec.as_slice()], &rk).expect("board authentic");
+        let good = rig
+            .source
+            .board(&[rec.as_slice()], &rk)
+            .expect("board authentic");
         authentic_payloads.push(rec);
         let disp_good = rig.dest.offload(&good).expect("offload authentic");
         tally.observe(disp_good);
-        assert_eq!(disp_good, Disposition::Delivered, "authentic cofre must be delivered");
+        assert_eq!(
+            disp_good,
+            Disposition::Delivered,
+            "authentic cofre must be delivered"
+        );
 
         // Forged: boarded through the forger (wrong signer) with a DISTINCT payload ⇒ must be dead-lettered.
         let fpay = forged_payload(i);
         let frk = record_key(10_000_000 + i);
-        let bad = forger.board(&[fpay.as_slice()], &frk).expect("board forged (structurally valid)");
+        let bad = forger
+            .board(&[fpay.as_slice()], &frk)
+            .expect("board forged (structurally valid)");
         forged_set.push(fpay);
         let disp_bad = rig.dest.offload(&bad).expect("offload forged");
         tally.observe(disp_bad);
-        assert_eq!(disp_bad, Disposition::DeadLettered, "forged cofre must be dead-lettered, never delivered");
+        assert_eq!(
+            disp_bad,
+            Disposition::DeadLettered,
+            "forged cofre must be dead-lettered, never delivered"
+        );
     }
 
     // --- 0 forged delivered / 0-leak / exactly-N authentic. ---
     let committed = rig.dest.sink().committed();
-    assert_eq!(committed.len(), N, "exactly the N authentic records delivered (0 forged delivered)");
-    assert_eq!(committed, authentic_payloads.as_slice(), "authentic records delivered exactly once, in order");
+    assert_eq!(
+        committed.len(),
+        N,
+        "exactly the N authentic records delivered (0 forged delivered)"
+    );
+    assert_eq!(
+        committed,
+        authentic_payloads.as_slice(),
+        "authentic records delivered exactly once, in order"
+    );
 
     // The sink must NEVER contain a forged payload.
     for fpay in &forged_set {
-        assert!(!committed.contains(fpay), "a forged payload reached the sink (0-leak violation)");
+        assert!(
+            !committed.contains(fpay),
+            "a forged payload reached the sink (0-leak violation)"
+        );
     }
 
     // Every forgery is reason-coded as a signer-pin failure on the dead-letter siding.
