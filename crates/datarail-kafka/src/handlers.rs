@@ -29,31 +29,107 @@ struct ApiRange {
 /// producer. `Fetch`/`ListOffsets` are the CONSUME side (only the `kafka-broker` mode serves them; advertising
 /// them is harmless for ingest-only producers). All are non-flexible versions (no KIP-482 tagged fields).
 const SUPPORTED: [ApiRange; 19] = [
-    ApiRange { key: API_PRODUCE, min: 0, max: 7 },
-    ApiRange { key: crate::consume::API_FETCH, min: 0, max: 4 },
-    ApiRange { key: crate::consume::API_LIST_OFFSETS, min: 0, max: 2 },
-    ApiRange { key: API_METADATA, min: 0, max: 1 },
-    ApiRange { key: API_VERSIONS, min: 0, max: 3 },
-    ApiRange { key: API_INIT_PRODUCER_ID, min: 0, max: 1 },
+    ApiRange {
+        key: API_PRODUCE,
+        min: 0,
+        max: 7,
+    },
+    ApiRange {
+        key: crate::consume::API_FETCH,
+        min: 0,
+        max: 4,
+    },
+    ApiRange {
+        key: crate::consume::API_LIST_OFFSETS,
+        min: 0,
+        max: 2,
+    },
+    ApiRange {
+        key: API_METADATA,
+        min: 0,
+        max: 1,
+    },
+    ApiRange {
+        key: API_VERSIONS,
+        min: 0,
+        max: 3,
+    },
+    ApiRange {
+        key: API_INIT_PRODUCER_ID,
+        min: 0,
+        max: 1,
+    },
     // Consumer-group OFFSET side (kafka-broker mode): durable committed offsets (`KAFKA-GROUPS-DESIGN.md`).
-    ApiRange { key: crate::groups::API_OFFSET_COMMIT, min: 0, max: 2 },
-    ApiRange { key: crate::groups::API_OFFSET_FETCH, min: 0, max: 2 },
-    ApiRange { key: crate::groups::API_FIND_COORDINATOR, min: 0, max: 2 },
+    ApiRange {
+        key: crate::groups::API_OFFSET_COMMIT,
+        min: 0,
+        max: 2,
+    },
+    ApiRange {
+        key: crate::groups::API_OFFSET_FETCH,
+        min: 0,
+        max: 2,
+    },
+    ApiRange {
+        key: crate::groups::API_FIND_COORDINATOR,
+        min: 0,
+        max: 2,
+    },
     // Consumer-group REBALANCE (kafka-broker mode): automatic assignment (`KAFKA-REBALANCE-DESIGN.md`).
     // Non-flexible version caps (group-instance-id / KIP-482 tagged fields are out of scope).
-    ApiRange { key: crate::groups::API_JOIN_GROUP, min: 1, max: 4 },
-    ApiRange { key: crate::groups::API_HEARTBEAT, min: 0, max: 2 },
-    ApiRange { key: crate::groups::API_LEAVE_GROUP, min: 0, max: 2 },
-    ApiRange { key: crate::groups::API_SYNC_GROUP, min: 0, max: 2 },
+    ApiRange {
+        key: crate::groups::API_JOIN_GROUP,
+        min: 1,
+        max: 4,
+    },
+    ApiRange {
+        key: crate::groups::API_HEARTBEAT,
+        min: 0,
+        max: 2,
+    },
+    ApiRange {
+        key: crate::groups::API_LEAVE_GROUP,
+        min: 0,
+        max: 2,
+    },
+    ApiRange {
+        key: crate::groups::API_SYNC_GROUP,
+        min: 0,
+        max: 2,
+    },
     // Transactional producer (kafka-broker mode): `KAFKA-TXN-DESIGN.md`. Non-flexible caps.
-    ApiRange { key: crate::txn::API_ADD_PARTITIONS_TO_TXN, min: 0, max: 1 },
-    ApiRange { key: crate::txn::API_ADD_OFFSETS_TO_TXN, min: 0, max: 1 },
-    ApiRange { key: crate::txn::API_END_TXN, min: 0, max: 1 },
-    ApiRange { key: crate::txn::API_TXN_OFFSET_COMMIT, min: 0, max: 1 },
+    ApiRange {
+        key: crate::txn::API_ADD_PARTITIONS_TO_TXN,
+        min: 0,
+        max: 1,
+    },
+    ApiRange {
+        key: crate::txn::API_ADD_OFFSETS_TO_TXN,
+        min: 0,
+        max: 1,
+    },
+    ApiRange {
+        key: crate::txn::API_END_TXN,
+        min: 0,
+        max: 1,
+    },
+    ApiRange {
+        key: crate::txn::API_TXN_OFFSET_COMMIT,
+        min: 0,
+        max: 1,
+    },
     // SASL/PLAIN authentication (kafka-broker mode, `KAFKA-SASL-DESIGN.md`). Advertised so a SASL client negotiates;
     // only enforced when the broker is started with a credential.
-    ApiRange { key: crate::sasl::API_SASL_HANDSHAKE, min: 0, max: 1 },
-    ApiRange { key: crate::sasl::API_SASL_AUTHENTICATE, min: 0, max: 1 },
+    ApiRange {
+        key: crate::sasl::API_SASL_HANDSHAKE,
+        min: 0,
+        max: 1,
+    },
+    ApiRange {
+        key: crate::sasl::API_SASL_AUTHENTICATE,
+        min: 0,
+        max: 1,
+    },
 ];
 
 /// Build the full `InitProducerId` response (response header v0 + body v0) granting `producer_id` with epoch 0.
@@ -154,7 +230,11 @@ pub fn metadata_response(
     }
 
     // topics: ARRAY of { error_code INT16, name STRING, [is_internal BOOL (v1+)], partitions ARRAY }
-    let names: Vec<&String> = if topics.is_empty() { Vec::new() } else { topics.iter().collect() };
+    let names: Vec<&String> = if topics.is_empty() {
+        Vec::new()
+    } else {
+        topics.iter().collect()
+    };
     let count = i32::try_from(names.len()).unwrap_or(0);
     w.int32(count);
     for name in names {
