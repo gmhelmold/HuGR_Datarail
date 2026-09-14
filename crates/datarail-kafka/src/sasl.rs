@@ -32,7 +32,11 @@ pub fn parse_sasl_handshake(reader: &mut Reader) -> io::Result<String> {
 
 /// Build a `SaslHandshake` response (v0/v1 share the body): `error_code` + the `enabled_mechanisms` STRING array.
 #[must_use]
-pub fn sasl_handshake_response(correlation_id: i32, error_code: i16, mechanisms: &[&str]) -> Vec<u8> {
+pub fn sasl_handshake_response(
+    correlation_id: i32,
+    error_code: i16,
+    mechanisms: &[&str],
+) -> Vec<u8> {
     let mut w = Writer::new();
     write_response_header(&mut w, correlation_id, false);
     w.int16(error_code);
@@ -104,8 +108,8 @@ fn ct_eq(a: &[u8], b: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        parse_sasl_authenticate, parse_sasl_handshake, sasl_authenticate_response, sasl_handshake_response,
-        verify_plain, PLAIN,
+        parse_sasl_authenticate, parse_sasl_handshake, sasl_authenticate_response,
+        sasl_handshake_response, verify_plain, PLAIN,
     };
     use crate::codec::{Reader, Writer};
 
@@ -143,12 +147,30 @@ mod tests {
 
     #[test]
     fn verify_plain_accepts_correct_and_rejects_wrong() {
-        assert!(verify_plain(b"\0alice\0s3cret", "alice", "s3cret"), "correct credential");
-        assert!(!verify_plain(b"\0alice\0WRONG", "alice", "s3cret"), "wrong password");
-        assert!(!verify_plain(b"\0bob\0s3cret", "alice", "s3cret"), "wrong username");
-        assert!(!verify_plain(b"\0alice", "alice", "s3cret"), "malformed (missing password field)");
-        assert!(!verify_plain(b"nonulls", "alice", "s3cret"), "malformed (no NUL separators)");
+        assert!(
+            verify_plain(b"\0alice\0s3cret", "alice", "s3cret"),
+            "correct credential"
+        );
+        assert!(
+            !verify_plain(b"\0alice\0WRONG", "alice", "s3cret"),
+            "wrong password"
+        );
+        assert!(
+            !verify_plain(b"\0bob\0s3cret", "alice", "s3cret"),
+            "wrong username"
+        );
+        assert!(
+            !verify_plain(b"\0alice", "alice", "s3cret"),
+            "malformed (missing password field)"
+        );
+        assert!(
+            !verify_plain(b"nonulls", "alice", "s3cret"),
+            "malformed (no NUL separators)"
+        );
         // An authzid present (some clients set it) still works — we ignore it.
-        assert!(verify_plain(b"alice\0alice\0s3cret", "alice", "s3cret"), "authzid ignored");
+        assert!(
+            verify_plain(b"alice\0alice\0s3cret", "alice", "s3cret"),
+            "authzid ignored"
+        );
     }
 }
