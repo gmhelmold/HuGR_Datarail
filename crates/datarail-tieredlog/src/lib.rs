@@ -100,7 +100,12 @@ impl<B: BlobStore> TieredLog<B> {
         let active_start = local_segment_starts(&dir)?.last().copied().unwrap_or(0);
         let path = dir.join(seg_local_name(active_start));
         let valid_len = scan_valid_len(&path)?;
-        let active = OpenOptions::new().create(true).read(true).write(true).truncate(false).open(&path)?;
+        let active = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(&path)?;
         active.set_len(valid_len)?;
         let mut active = active;
         active.seek(SeekFrom::Start(valid_len))?;
@@ -168,10 +173,10 @@ impl<B: BlobStore> TieredLog<B> {
         let mut bytes = Vec::new();
         File::open(&sealed_path)?.read_to_end(&mut bytes)?;
         self.blob.put(&seg_blob_key(self.active_start), &bytes)?; // offload to the cold tier (durable) FIRST
-        // WP1 audit CRITICAL-1 fix: create the NEW hot segment BEFORE evicting the old one, so a crash in the
-        // rotate window always leaves ≥1 local segment — `open` can never see an empty local dir and reset the
-        // offset space to 0. (If the crash lands before this create, the old sealed segment is still local AND
-        // already in cold, so `open` finds it, full, and simply re-rotates it on the next append — self-healing.)
+                                                                  // WP1 audit CRITICAL-1 fix: create the NEW hot segment BEFORE evicting the old one, so a crash in the
+                                                                  // rotate window always leaves ≥1 local segment — `open` can never see an empty local dir and reset the
+                                                                  // offset space to 0. (If the crash lands before this create, the old sealed segment is still local AND
+                                                                  // already in cold, so `open` finds it, full, and simply re-rotates it on the next append — self-healing.)
         let new_start = self.write_offset;
         let new_active = OpenOptions::new()
             .create(true)
@@ -214,7 +219,9 @@ impl<B: BlobStore> TieredLog<B> {
             File::open(self.dir.join(seg_local_name(start)))?.read_to_end(&mut bytes)?;
             Ok(bytes)
         } else {
-            self.blob.get(&seg_blob_key(start))?.ok_or(TieredError::MissingSegment(start))
+            self.blob
+                .get(&seg_blob_key(start))?
+                .ok_or(TieredError::MissingSegment(start))
         }
     }
 
@@ -235,8 +242,12 @@ impl<B: BlobStore> TieredLog<B> {
             let mut pos = 0usize;
             let mut offset = seg_start;
             while pos + 4 <= bytes.len() {
-                let len =
-                    u32::from_le_bytes([bytes[pos], bytes[pos + 1], bytes[pos + 2], bytes[pos + 3]]) as usize;
+                let len = u32::from_le_bytes([
+                    bytes[pos],
+                    bytes[pos + 1],
+                    bytes[pos + 2],
+                    bytes[pos + 3],
+                ]) as usize;
                 if len > MAX_RECORD || pos + 4 + len + 4 > bytes.len() {
                     break; // torn tail / corruption → stop this segment
                 }
@@ -274,7 +285,12 @@ fn local_segment_starts(dir: &Path) -> Result<Vec<u64>, TieredError> {
     let mut starts = Vec::new();
     for entry in std::fs::read_dir(dir)? {
         let path = entry?.path();
-        if let Some(s) = path.file_name().and_then(|n| n.to_str()).and_then(|n| n.strip_suffix(".seg")).and_then(|n| n.parse().ok()) {
+        if let Some(s) = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .and_then(|n| n.strip_suffix(".seg"))
+            .and_then(|n| n.parse().ok())
+        {
             starts.push(s);
         }
     }
@@ -292,7 +308,8 @@ fn scan_valid_len(path: &Path) -> Result<u64, TieredError> {
     };
     let mut pos = 0usize;
     while pos + 4 <= bytes.len() {
-        let len = u32::from_le_bytes([bytes[pos], bytes[pos + 1], bytes[pos + 2], bytes[pos + 3]]) as usize;
+        let len = u32::from_le_bytes([bytes[pos], bytes[pos + 1], bytes[pos + 2], bytes[pos + 3]])
+            as usize;
         if len > MAX_RECORD || pos + 4 + len + 4 > bytes.len() {
             break;
         }
@@ -336,9 +353,17 @@ mod tests {
         log.sync().expect("sync");
 
         // The headline: local disk holds ONLY the hot segment; all the rest was offloaded to the cold tier.
-        assert_eq!(log.local_segment_count().expect("count"), 1, "local disk must hold only the hot segment");
+        assert_eq!(
+            log.local_segment_count().expect("count"),
+            1,
+            "local disk must hold only the hot segment"
+        );
         let cold = log.blob().list("seg/").expect("list");
-        assert!(cold.len() >= 5, "sealed segments must be offloaded to the cold tier (got {})", cold.len());
+        assert!(
+            cold.len() >= 5,
+            "sealed segments must be offloaded to the cold tier (got {})",
+            cold.len()
+        );
 
         // Replay everything — reads cold segments back from the blob + the hot local one.
         let got = log.replay_from(0).expect("replay");
@@ -371,7 +396,8 @@ mod tests {
         let dir = tmp("tierrecover");
         let cold = tmp("tiercold"); // a durable (on-disk) cold tier that persists across instances
         {
-            let mut log = TieredLog::open(&dir, FsBlob::open(&cold).expect("cold"), 4096).expect("open");
+            let mut log =
+                TieredLog::open(&dir, FsBlob::open(&cold).expect("cold"), 4096).expect("open");
             for i in 0u32..3000 {
                 log.append(format!("rec{i}").as_bytes()).expect("append");
             }
