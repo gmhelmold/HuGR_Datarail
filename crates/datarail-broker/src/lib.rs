@@ -308,7 +308,11 @@ impl<O: OffsetStore> Server<O> {
     /// Build a server over an open `topic` and an offset store.
     #[must_use]
     pub fn new(topic: Topic, offsets: O) -> Self {
-        Self { topic, offsets, groups: BTreeMap::new() }
+        Self {
+            topic,
+            offsets,
+            groups: BTreeMap::new(),
+        }
     }
 
     /// Borrow the injected offset store (e.g. to read back a committed offset).
@@ -408,7 +412,10 @@ fn read_frame(stream: &mut impl Read) -> io::Result<Option<Vec<u8>>> {
     stream.read_exact(&mut len_bytes[1..])?;
     let body_len = usize::try_from(u32::from_le_bytes(len_bytes)).unwrap_or(usize::MAX);
     if body_len > MAX_FRAME_BODY {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "frame body length too large"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "frame body length too large",
+        ));
     }
     let mut frame = Vec::with_capacity(8 + body_len);
     frame.extend_from_slice(&len_bytes);
@@ -452,7 +459,9 @@ where
 /// [`io::Error`] on a socket failure. A malformed request frame ends the connection cleanly.
 fn serve_conn<O: OffsetStore>(server: &Mutex<Server<O>>, mut stream: TcpStream) -> io::Result<()> {
     while let Some(frame) = read_frame(&mut stream)? {
-        let Some(req) = decode_request(&frame) else { break };
+        let Some(req) = decode_request(&frame) else {
+            break;
+        };
         let resp = match server.lock() {
             Ok(mut guard) => guard.handle(req),
             Err(_) => Response::Err("server lock poisoned".to_owned()),
@@ -475,7 +484,9 @@ impl Client {
     /// # Errors
     /// [`io::Error`] if the address cannot be resolved or the connection fails.
     pub fn connect(addr: impl ToSocketAddrs) -> io::Result<Self> {
-        Ok(Self { stream: TcpStream::connect(addr)? })
+        Ok(Self {
+            stream: TcpStream::connect(addr)?,
+        })
     }
 
     /// Send one request and read its response, validating the frame round-trip.
@@ -497,10 +508,16 @@ impl Client {
     /// # Errors
     /// [`io::Error`] on a transport failure or if the server replies with an error.
     pub fn produce(&mut self, key: &[u8], payload: &[u8]) -> io::Result<u64> {
-        match self.round_trip(&Request::Produce { key: key.to_vec(), payload: payload.to_vec() })? {
+        match self.round_trip(&Request::Produce {
+            key: key.to_vec(),
+            payload: payload.to_vec(),
+        })? {
             Response::Produced(offset) => Ok(offset),
             Response::Err(msg) => Err(io::Error::other(msg)),
-            other => Err(io::Error::new(io::ErrorKind::InvalidData, format!("unexpected reply: {other:?}"))),
+            other => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("unexpected reply: {other:?}"),
+            )),
         }
     }
 
@@ -509,10 +526,15 @@ impl Client {
     /// # Errors
     /// [`io::Error`] on a transport failure or if the server replies with an error.
     pub fn poll(&mut self, group: &str) -> io::Result<Option<ClientRecord>> {
-        match self.round_trip(&Request::Poll { group: group.to_owned() })? {
+        match self.round_trip(&Request::Poll {
+            group: group.to_owned(),
+        })? {
             Response::Record(rec) => Ok(rec),
             Response::Err(msg) => Err(io::Error::other(msg)),
-            other => Err(io::Error::new(io::ErrorKind::InvalidData, format!("unexpected reply: {other:?}"))),
+            other => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("unexpected reply: {other:?}"),
+            )),
         }
     }
 
@@ -521,10 +543,16 @@ impl Client {
     /// # Errors
     /// [`io::Error`] on a transport failure or if the server replies with an error.
     pub fn commit(&mut self, group: &str, offset: u64) -> io::Result<()> {
-        match self.round_trip(&Request::Commit { group: group.to_owned(), offset })? {
+        match self.round_trip(&Request::Commit {
+            group: group.to_owned(),
+            offset,
+        })? {
             Response::Committed => Ok(()),
             Response::Err(msg) => Err(io::Error::other(msg)),
-            other => Err(io::Error::new(io::ErrorKind::InvalidData, format!("unexpected reply: {other:?}"))),
+            other => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("unexpected reply: {other:?}"),
+            )),
         }
     }
 }
@@ -549,12 +577,28 @@ mod tests {
     #[test]
     fn request_round_trips_all_variants() {
         let cases = [
-            Request::Produce { key: b"k".to_vec(), payload: b"hello world".to_vec() },
-            Request::Produce { key: Vec::new(), payload: Vec::new() },
-            Request::Poll { group: "g1".to_owned() },
-            Request::Poll { group: String::new() },
-            Request::Commit { group: "orders".to_owned(), offset: 0 },
-            Request::Commit { group: "orders".to_owned(), offset: u64::MAX },
+            Request::Produce {
+                key: b"k".to_vec(),
+                payload: b"hello world".to_vec(),
+            },
+            Request::Produce {
+                key: Vec::new(),
+                payload: Vec::new(),
+            },
+            Request::Poll {
+                group: "g1".to_owned(),
+            },
+            Request::Poll {
+                group: String::new(),
+            },
+            Request::Commit {
+                group: "orders".to_owned(),
+                offset: 0,
+            },
+            Request::Commit {
+                group: "orders".to_owned(),
+                offset: u64::MAX,
+            },
         ];
         for c in &cases {
             let bytes = encode_request(c);
@@ -586,10 +630,15 @@ mod tests {
     /// A bit-flip in the frame must fail the CRC and decode to `None`.
     #[test]
     fn corrupt_frame_rejected() {
-        let mut bytes = encode_request(&Request::Poll { group: "g".to_owned() });
+        let mut bytes = encode_request(&Request::Poll {
+            group: "g".to_owned(),
+        });
         let last = bytes.len() - 1;
         bytes[last] ^= 0xFF;
-        assert!(decode_request(&bytes).is_none(), "corrupt frame must not decode");
+        assert!(
+            decode_request(&bytes).is_none(),
+            "corrupt frame must not decode"
+        );
         assert!(decode_request(&[]).is_none(), "empty input must not decode");
     }
 
@@ -601,11 +650,17 @@ mod tests {
         let mut server = Server::new(topic, MemOffsets::new());
 
         // Two produces — offsets must be assigned and increasing.
-        let o0 = match server.handle(Request::Produce { key: b"a".to_vec(), payload: b"v0".to_vec() }) {
+        let o0 = match server.handle(Request::Produce {
+            key: b"a".to_vec(),
+            payload: b"v0".to_vec(),
+        }) {
             Response::Produced(o) => o,
             other => panic!("expected Produced, got {other:?}"),
         };
-        let o1 = match server.handle(Request::Produce { key: b"b".to_vec(), payload: b"v1".to_vec() }) {
+        let o1 = match server.handle(Request::Produce {
+            key: b"b".to_vec(),
+            payload: b"v1".to_vec(),
+        }) {
             Response::Produced(o) => o,
             other => panic!("expected Produced, got {other:?}"),
         };
@@ -613,15 +668,22 @@ mod tests {
 
         // Two polls — records come back in produce order (key+payload); the returned offset is the RESUME point
         // (the cursor AFTER the record), so resume-after-record-0 equals the START of record 1 (o1).
-        let resume0 = match server.handle(Request::Poll { group: "g".to_owned() }) {
+        let resume0 = match server.handle(Request::Poll {
+            group: "g".to_owned(),
+        }) {
             Response::Record(Some((off, k, p))) => {
                 assert_eq!((k, p), (b"a".to_vec(), b"v0".to_vec()));
                 off
             }
             other => panic!("expected a record, got {other:?}"),
         };
-        assert_eq!(resume0, o1, "resume point after record 0 must be the start of record 1");
-        let resume1 = match server.handle(Request::Poll { group: "g".to_owned() }) {
+        assert_eq!(
+            resume0, o1,
+            "resume point after record 0 must be the start of record 1"
+        );
+        let resume1 = match server.handle(Request::Poll {
+            group: "g".to_owned(),
+        }) {
             Response::Record(Some((off, k, p))) => {
                 assert_eq!((k, p), (b"b".to_vec(), b"v1".to_vec()));
                 off
@@ -631,14 +693,26 @@ mod tests {
         assert!(resume1 > resume0, "resume offsets must increase");
 
         // Tail — no more records.
-        assert_eq!(server.handle(Request::Poll { group: "g".to_owned() }), Response::Record(None));
+        assert_eq!(
+            server.handle(Request::Poll {
+                group: "g".to_owned()
+            }),
+            Response::Record(None)
+        );
 
         // Commit the last resume point; it is durable in the injected store.
         assert_eq!(
-            server.handle(Request::Commit { group: "g".to_owned(), offset: resume1 }),
+            server.handle(Request::Commit {
+                group: "g".to_owned(),
+                offset: resume1
+            }),
             Response::Committed
         );
-        assert_eq!(server.offsets().fetch("g"), Some(resume1), "committed offset not retrievable");
+        assert_eq!(
+            server.offsets().fetch("g"),
+            Some(resume1),
+            "committed offset not retrievable"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -670,7 +744,11 @@ mod tests {
         // point, not the record's own start, so we match on key/payload).
         for expected in &produced {
             let got = client.poll("g").expect("poll").expect("record present");
-            assert_eq!((&got.1, &got.2), (&expected.1, &expected.2), "polled record key/payload mismatch");
+            assert_eq!(
+                (&got.1, &got.2),
+                (&expected.1, &expected.2),
+                "polled record key/payload mismatch"
+            );
         }
         // Tail: nothing left.
         assert_eq!(client.poll("g").expect("poll tail"), None);
@@ -698,17 +776,25 @@ mod tests {
             let topic = Topic::open(&tdir, 1 << 16).expect("topic");
             let mut server = Server::new(topic, FileOffsets::open(&odir).expect("offsets"));
             for i in 0..N {
-                let r = server.handle(Request::Produce { key: Vec::new(), payload: format!("v{i}").into_bytes() });
+                let r = server.handle(Request::Produce {
+                    key: Vec::new(),
+                    payload: format!("v{i}").into_bytes(),
+                });
                 assert!(matches!(r, Response::Produced(_)), "produce failed: {r:?}");
             }
             for _ in 0..HALF {
-                resume = match server.handle(Request::Poll { group: "g".to_owned() }) {
+                resume = match server.handle(Request::Poll {
+                    group: "g".to_owned(),
+                }) {
                     Response::Record(Some((off, _, _))) => off,
                     other => panic!("expected a record, got {other:?}"),
                 };
             }
             assert_eq!(
-                server.handle(Request::Commit { group: "g".to_owned(), offset: resume }),
+                server.handle(Request::Commit {
+                    group: "g".to_owned(),
+                    offset: resume
+                }),
                 Response::Committed
             );
         }
@@ -717,13 +803,21 @@ mod tests {
         let topic2 = Topic::open(&tdir, 1 << 16).expect("reopen topic");
         let mut server2 = Server::new(topic2, FileOffsets::open(&odir).expect("reopen offsets"));
         let mut got = Vec::new();
-        while let Response::Record(Some((_, _, payload))) =
-            server2.handle(Request::Poll { group: "g".to_owned() })
-        {
+        while let Response::Record(Some((_, _, payload))) = server2.handle(Request::Poll {
+            group: "g".to_owned(),
+        }) {
             got.push(payload);
         }
-        assert_eq!(got.len(), N - HALF, "wrong count on resume — re-delivery or loss");
-        assert_eq!(got[0], format!("v{HALF}").into_bytes(), "first resumed record must be v{HALF}, not a re-delivery");
+        assert_eq!(
+            got.len(),
+            N - HALF,
+            "wrong count on resume — re-delivery or loss"
+        );
+        assert_eq!(
+            got[0],
+            format!("v{HALF}").into_bytes(),
+            "first resumed record must be v{HALF}, not a re-delivery"
+        );
 
         let _ = std::fs::remove_dir_all(&tdir);
         let _ = std::fs::remove_dir_all(&odir);
