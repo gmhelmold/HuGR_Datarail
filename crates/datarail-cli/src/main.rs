@@ -551,7 +551,7 @@ impl AnyRail {
             }
             #[cfg(feature = "quic")]
             "quic" => Ok(Self::Quic(Box::new(
-                datarail_substrate_quic::QuicSubstrate::loopback_pair()
+                datarail_substrate_quic::QuicSubstrate::dev_loopback_pair()
                     .map_err(|e| CliError::Rail(e.to_string()))?,
             ))),
             #[cfg(not(feature = "quic"))]
