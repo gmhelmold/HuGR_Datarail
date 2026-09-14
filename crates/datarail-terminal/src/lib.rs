@@ -28,10 +28,13 @@
 
 #![forbid(unsafe_code)]
 
-use datarail_core::{AeadAlg, Cofre, Disposition, Etiqueta};
 use datarail_cofre::CofreError;
-use datarail_crypto::{aead_open, aead_seal, blake3_256, hmac_blake3, open_key, seal_key, AeadError};
+use datarail_core::{AeadAlg, Cofre, Disposition, Etiqueta};
+use datarail_crypto::{
+    aead_open, aead_seal, blake3_256, hmac_blake3, open_key, seal_key, AeadError,
+};
 use datarail_once::Once;
+use std::collections::HashMap;
 use zeroize::Zeroize as _;
 
 /// Build the AEAD associated data: every **seal-time-final** etiqueta field — all of them *except* `cofre_id`
@@ -80,7 +83,9 @@ fn os_seed_32() -> Result<[u8; 32], TerminalError> {
             *slot = Some(std::fs::File::open("/dev/urandom").map_err(|_| TerminalError::Entropy)?);
         }
         let mut buf = [0u8; 32];
-        let ok = slot.as_mut().is_some_and(|file| file.read_exact(&mut buf).is_ok());
+        let ok = slot
+            .as_mut()
+            .is_some_and(|file| file.read_exact(&mut buf).is_ok());
         if ok {
             Ok(buf)
         } else {
@@ -108,7 +113,9 @@ struct Drbg {
 
 impl Drbg {
     fn seeded() -> Result<Self, TerminalError> {
-        Ok(Self { seed: os_seed_32()? })
+        Ok(Self {
+            seed: os_seed_32()?,
+        })
     }
 
     fn next_32(&mut self) -> Result<[u8; 32], TerminalError> {
@@ -213,7 +220,11 @@ fn unframe_batch(bytes: &[u8]) -> Result<Vec<Vec<u8>>, TerminalError> {
     let count_bytes = bytes
         .get(pos..pos + 4)
         .ok_or(TerminalError::MalformedBatch)?;
-    let count = u32::from_le_bytes(count_bytes.try_into().map_err(|_| TerminalError::MalformedBatch)?);
+    let count = u32::from_le_bytes(
+        count_bytes
+            .try_into()
+            .map_err(|_| TerminalError::MalformedBatch)?,
+    );
     pos += 4;
     // Cap the speculative pre-allocation: each record needs ≥4 header bytes, so a legitimate `count` cannot
     // exceed `bytes.len() / 4`. Prevents a malformed-but-authenticated batch (a buggy/compromised source) from
@@ -223,8 +234,11 @@ fn unframe_batch(bytes: &[u8]) -> Result<Vec<Vec<u8>>, TerminalError> {
         let len_bytes = bytes
             .get(pos..pos + 4)
             .ok_or(TerminalError::MalformedBatch)?;
-        let len = u32::from_le_bytes(len_bytes.try_into().map_err(|_| TerminalError::MalformedBatch)?)
-            as usize;
+        let len = u32::from_le_bytes(
+            len_bytes
+                .try_into()
+                .map_err(|_| TerminalError::MalformedBatch)?,
+        ) as usize;
         pos += 4;
         let end = pos.checked_add(len).ok_or(TerminalError::MalformedBatch)?;
         let record = bytes.get(pos..end).ok_or(TerminalError::MalformedBatch)?;
@@ -256,7 +270,11 @@ pub fn issue_sender_cert(
     sender_vk: &[u8; 32],
     epoch: u64,
 ) -> [u8; 64] {
-    datarail_crypto::sign_domain(datarail_crypto::ctx::CERT, issuer_seed, &cert_identity_msg(sender_id, sender_vk, epoch))
+    datarail_crypto::sign_domain(
+        datarail_crypto::ctx::CERT,
+        issuer_seed,
+        &cert_identity_msg(sender_id, sender_vk, epoch),
+    )
 }
 
 /// The issuer-signed preimage: `sender_id ‖ sender_vk ‖ epoch_le`.
@@ -296,8 +314,18 @@ impl SenderCredential {
     /// Build a credential from the sender's signing seed, its id, and a pre-issued `issuer_sig` (from
     /// [`issue_sender_cert`] over the matching `sender_id`/`sender_vk`/`epoch`).
     #[must_use]
-    pub fn new(sender_id: [u8; 32], sender_seed: [u8; 32], epoch: u64, issuer_sig: [u8; 64]) -> Self {
-        Self { sender_id, sender_seed, epoch, issuer_sig }
+    pub fn new(
+        sender_id: [u8; 32],
+        sender_seed: [u8; 32],
+        epoch: u64,
+        issuer_sig: [u8; 64],
+    ) -> Self {
+        Self {
+            sender_id,
+            sender_seed,
+            epoch,
+            issuer_sig,
+        }
     }
 
     /// Encode the wire `SENDER_CERT` for a cofre with ephemeral key `eph_pk`: appends the per-cofre
@@ -411,7 +439,9 @@ pub enum TerminalError {
 impl core::fmt::Display for TerminalError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         let s = match self {
-            Self::ContractViolation => "record violates the onboarding content contract (never boards)",
+            Self::ContractViolation => {
+                "record violates the onboarding content contract (never boards)"
+            }
             Self::Seal => "AEAD seal failed",
             Self::BatchTooLarge => "record batch exceeds framing limits",
             Self::MalformedBatch => "record batch is malformed",
@@ -462,9 +492,13 @@ impl core::fmt::Display for DeadLetterReason {
         match self {
             Self::SealFailed(e) => write!(f, "seal verification failed: {e}"),
             Self::RouteMismatch => f.write_str("cofre addressed to a different route/stream"),
-            Self::ContractFingerprintMismatch => f.write_str("contract fingerprint mismatch (schema drift)"),
+            Self::ContractFingerprintMismatch => {
+                f.write_str("contract fingerprint mismatch (schema drift)")
+            }
             Self::OpenFailed => f.write_str("AEAD open failed (tamper/wrong key)"),
-            Self::KeyWrapInvalid => f.write_str("key-wrap invalid (low-order/non-contributory eph_pk)"),
+            Self::KeyWrapInvalid => {
+                f.write_str("key-wrap invalid (low-order/non-contributory eph_pk)")
+            }
             Self::MalformedBatch => f.write_str("decrypted record batch is malformed"),
             Self::ContractViolation => f.write_str("decrypted record violates offloading contract"),
             Self::SenderCertInvalid => f.write_str("sealed-sender certificate failed validation"),
@@ -526,7 +560,8 @@ impl DeadLetterSiding {
     /// All-time count of diverted cofres (retained + evicted).
     #[must_use]
     pub fn total(&self) -> u64 {
-        self.dropped.saturating_add(u64::try_from(self.entries.len()).unwrap_or(u64::MAX))
+        self.dropped
+            .saturating_add(u64::try_from(self.entries.len()).unwrap_or(u64::MAX))
     }
 
     /// The diverted entries currently retained, in arrival order (oldest first).
@@ -649,8 +684,10 @@ pub struct SourceTerminal {
     contract: ContentContract,
     /// Ed25519 source signing seed (the route's pinned identity).
     source_seed: [u8; 32],
-    /// Monotonic per-stream sequence counter.
+    /// Monotonic per-stream sequence counter (legacy, used by `board`/`next_seq`).
     seq: u64,
+    /// Per-partition sequence counters for parallel sealing ([`reserve_seqs`] with `partition_id`).
+    seq_per_partition: HashMap<u64, u64>,
     /// Optional sealed-sender credential (SPEC-02 A4). When set, `board` rides an issuer-signed `SENDER_CERT`
     /// **inside** the encrypted carga and sets `sender_present`; when `None`, cofres carry no sender identity.
     sender: Option<SenderCredential>,
@@ -671,6 +708,7 @@ impl core::fmt::Debug for SourceTerminal {
             .field("contract", &self.contract)
             .field("source_seed", &"<redacted>")
             .field("seq", &self.seq)
+            .field("seq_per_partition", &self.seq_per_partition)
             .field("sender", &self.sender)
             .finish()
     }
@@ -685,6 +723,7 @@ impl SourceTerminal {
             contract,
             source_seed,
             seq: 0,
+            seq_per_partition: HashMap::new(),
             sender: None,
         }
     }
@@ -721,15 +760,24 @@ impl SourceTerminal {
         Ok(cofre)
     }
 
-    /// Reserve `n` consecutive sequence numbers and return the first — for callers that seal a batch of
-    /// cofres **in parallel** with explicit per-cofre seqs ([`board_at`](Self::board_at)). The reservation is
-    /// what keeps parallel sealing seq-unique: the counter is bumped once, up front, under whatever lock the
-    /// caller already holds, and each worker stamps `start + i` (order-preserving, no duplicates). Saturates
-    /// at `u64::MAX` rather than wrapping.
+    /// Reserve `n` consecutive sequence numbers for a given `partition_id` and return the first — for
+    /// callers that seal a batch of cofres **in parallel** with explicit per-cofre seqs
+    /// ([`board_at`](Self::board_at)). The reservation is what keeps parallel sealing seq-unique:
+    /// the counter is bumped once, up front, under whatever lock the caller already holds, and
+    /// each worker stamps `start + i` (order-preserving, no duplicates). Saturates at `u64::MAX`
+    /// rather than wrapping.
+    ///
+    /// Each partition has its own independent sequence space, so sequences from different
+    /// partitions never collide.
+    ///
+    /// # Panics
+    /// Never panics. The `entry(...).or_insert(0)` ensures the key exists, and the subsequent
+    /// `get_mut` is guaranteed to succeed.
     #[must_use]
-    pub fn reserve_seqs(&mut self, n: u64) -> u64 {
-        let start = self.seq;
-        self.seq = self.seq.saturating_add(n);
+    pub fn reserve_seqs(&mut self, partition_id: u64, n: u64) -> u64 {
+        let start = *self.seq_per_partition.entry(partition_id).or_insert(0);
+        let entry = self.seq_per_partition.get_mut(&partition_id).unwrap();
+        *entry = entry.saturating_add(n);
         start
     }
 
@@ -743,7 +791,12 @@ impl SourceTerminal {
     /// - [`TerminalError::ContractViolation`] if any record fails the onboarding contract (never boards).
     /// - [`TerminalError::BatchTooLarge`] if the batch exceeds the `u32` framing limits.
     /// - [`TerminalError::Seal`] if the AEAD seal fails (e.g. a bad key length).
-    pub fn board_at(&self, records: &[&[u8]], record_key: &[u8], seq: u64) -> Result<Cofre, TerminalError> {
+    pub fn board_at(
+        &self,
+        records: &[&[u8]],
+        record_key: &[u8],
+        seq: u64,
+    ) -> Result<Cofre, TerminalError> {
         // (1) Enforce the content contract on EVERY record — a single failure means the batch never boards.
         if !records.iter().all(|r| self.contract.validate(r)) {
             return Err(TerminalError::ContractViolation);
@@ -758,7 +811,8 @@ impl SourceTerminal {
         // (4) Per-cofre key-wrap (SPEC A5/03): a fresh ephemeral X25519 key seals a fresh data key to the
         // route's destination public key — only the dest can re-derive it (provider-blind, forward-secure).
         let mut eph_secret = random_32()?;
-        let Some((eph_pk, mut data_key)) = seal_key(&self.config.dest_x25519_pk, &eph_secret) else {
+        let Some((eph_pk, mut data_key)) = seal_key(&self.config.dest_x25519_pk, &eph_secret)
+        else {
             eph_secret.zeroize();
             return Err(TerminalError::Seal); // a low-order dest_x25519_pk is a route misconfiguration (S-3)
         };
@@ -792,7 +846,13 @@ impl SourceTerminal {
             sender_present,
             ts: 0, // informational only; never trusted (SPEC-02). A real wall-clock stamp is a deployment concern.
         };
-        let carga = aead_seal(self.config.aead_alg, &data_key, &nonce, &aead_aad(&etiqueta), &inner)?;
+        let carga = aead_seal(
+            self.config.aead_alg,
+            &data_key,
+            &nonce,
+            &aead_aad(&etiqueta),
+            &inner,
+        )?;
         data_key.zeroize(); // the per-cofre data key is consumed; wipe it (AUDIT-02 F4).
 
         // (6) Seal (Ed25519 over etiqueta ⊗ carga). (The per-stream sequence is advanced by the caller —
@@ -1018,7 +1078,8 @@ impl DestTerminal {
         };
 
         // (5) Sealed-sender (SPEC-02 A4): if the header says a SENDER_CERT rides inside, split + validate it.
-        let (record_bytes, sender_id): (&[u8], Option<[u8; 32]>) = if cofre.etiqueta.sender_present {
+        let (record_bytes, sender_id): (&[u8], Option<[u8; 32]>) = if cofre.etiqueta.sender_present
+        {
             let Some(issuer_vk) = self.sender_issuer_vk else {
                 return Err(DeadLetterReason::SenderCertInvalid);
             };
@@ -1026,7 +1087,12 @@ impl DestTerminal {
                 return Err(DeadLetterReason::SenderCertInvalid);
             }
             let (cert, rest) = batch.split_at(SENDER_CERT_LEN);
-            match validate_sender_cert(cert, &cofre.etiqueta.eph_pk, &issuer_vk, self.min_sender_epoch) {
+            match validate_sender_cert(
+                cert,
+                &cofre.etiqueta.eph_pk,
+                &issuer_vk,
+                self.min_sender_epoch,
+            ) {
                 Some(sid) => (rest, Some(sid)),
                 None => return Err(DeadLetterReason::SenderCertInvalid),
             }
@@ -1052,7 +1118,9 @@ impl DestTerminal {
     /// of the dest key (this terminal) can open; the stored ciphertext reveals nothing.
     #[must_use]
     pub fn open(&self, cofre: &Cofre) -> Option<Vec<Vec<u8>>> {
-        self.open_records(cofre).ok().map(|(records, _sender)| records)
+        self.open_records(cofre)
+            .ok()
+            .map(|(records, _sender)| records)
     }
 }
 

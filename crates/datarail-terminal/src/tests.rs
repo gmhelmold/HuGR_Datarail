@@ -3,8 +3,8 @@
 use super::{
     ContentContract, DeadLetterReason, DestTerminal, SourceTerminal, TerminalConfig, TerminalError,
 };
-use datarail_core::{AeadAlg, Disposition};
 use datarail_cofre::CofreError;
+use datarail_core::{AeadAlg, Disposition};
 use datarail_crypto::{verifying_key, x25519_public};
 
 const SOURCE_SEED: [u8; 32] = [11u8; 32];
@@ -37,7 +37,13 @@ fn source() -> SourceTerminal {
 }
 
 fn dest() -> DestTerminal {
-    DestTerminal::new(config(), contract(), verifying_key(&SOURCE_SEED), DEST_SEED, DEST_X_SECRET)
+    DestTerminal::new(
+        config(),
+        contract(),
+        verifying_key(&SOURCE_SEED),
+        DEST_SEED,
+        DEST_X_SECRET,
+    )
 }
 
 // ---- ContentContract unit behaviour ----------------------------------------------------------------------
@@ -75,8 +81,14 @@ fn round_trip_delivers_records() {
     let mut dst = dest();
     let recs: [&[u8]; 2] = [b"OK:alpha", b"OK:beta"];
     let cofre = src.board(&recs, b"record-key-1").expect("board");
-    assert_eq!(dst.offload(&cofre).expect("offload"), Disposition::Delivered);
-    assert_eq!(dst.sink().committed(), &[b"OK:alpha".to_vec(), b"OK:beta".to_vec()]);
+    assert_eq!(
+        dst.offload(&cofre).expect("offload"),
+        Disposition::Delivered
+    );
+    assert_eq!(
+        dst.sink().committed(),
+        &[b"OK:alpha".to_vec(), b"OK:beta".to_vec()]
+    );
     assert!(dst.dead_letters().is_empty());
     assert_eq!(src.next_seq(), 1);
 }
@@ -88,13 +100,19 @@ fn ac9_board_refuses_contract_violating_record() {
     let mut src = source();
     // One good, one bad (wrong prefix) record: the whole batch must be refused.
     let recs: [&[u8]; 2] = [b"OK:good", b"BAD:nope"];
-    assert_eq!(src.board(&recs, b"rk"), Err(TerminalError::ContractViolation));
+    assert_eq!(
+        src.board(&recs, b"rk"),
+        Err(TerminalError::ContractViolation)
+    );
     // It never boarded: the sequence did not advance.
     assert_eq!(src.next_seq(), 0);
 
     // An empty record is likewise refused.
     let recs2: [&[u8]; 1] = [b""];
-    assert_eq!(src.board(&recs2, b"rk"), Err(TerminalError::ContractViolation));
+    assert_eq!(
+        src.board(&recs2, b"rk"),
+        Err(TerminalError::ContractViolation)
+    );
     assert_eq!(src.next_seq(), 0);
 }
 
@@ -113,12 +131,26 @@ fn dead_letter_siding_is_bounded_under_a_flood() {
         let rec = format!("NO-PREFIX-{i}");
         let recs: [&[u8]; 1] = [rec.as_bytes()];
         let cofre = src.board(&recs, rk.as_bytes()).expect("board");
-        assert_eq!(dst.offload(&cofre).expect("offload"), Disposition::DeadLettered);
+        assert_eq!(
+            dst.offload(&cofre).expect("offload"),
+            Disposition::DeadLettered
+        );
     }
     assert_eq!(dst.dead_letters().len(), cap, "retained count is capped");
-    assert_eq!(dst.dead_letters().dropped(), 100, "older diversions evicted + counted");
-    assert_eq!(dst.dead_letters().total(), u64::try_from(n).unwrap(), "all-time total preserved");
-    assert!(dst.sink().is_empty(), "no dead-lettered cofre is ever committed");
+    assert_eq!(
+        dst.dead_letters().dropped(),
+        100,
+        "older diversions evicted + counted"
+    );
+    assert_eq!(
+        dst.dead_letters().total(),
+        u64::try_from(n).unwrap(),
+        "all-time total preserved"
+    );
+    assert!(
+        dst.sink().is_empty(),
+        "no dead-lettered cofre is ever committed"
+    );
 }
 
 // ---- AC-9 (b): offload of contract-violating records ⇒ dead-lettered, NOT committed ----------------------
@@ -132,7 +164,9 @@ fn ac9_offload_dead_letters_contract_violation_not_committed() {
     let mut dst = dest(); // strict PREFIX contract
 
     let recs: [&[u8]; 1] = [b"NO-PREFIX-here"]; // boards under permissive, violates strict dest contract
-    let cofre = src.board(&recs, b"rk").expect("boards under permissive contract");
+    let cofre = src
+        .board(&recs, b"rk")
+        .expect("boards under permissive contract");
 
     // The dest's contract_fp differs from the cofre's, so the *fingerprint* check fires first (still AC-9:
     // a managed schema event, dead-lettered, never committed).
@@ -156,14 +190,22 @@ fn ac9_offload_dead_letters_post_decrypt_record_violation() {
     let mut src = source(); // boards b"OK:..." records
     let mut dst_strict = ContentContract::new(MAX_LEN, b"OK:STRICT:".to_vec());
     dst_strict.fingerprint = contract().fingerprint; // align fp so step (4) passes, step (5) is reached
-    let mut dst =
-        DestTerminal::new(config(), dst_strict, verifying_key(&SOURCE_SEED), DEST_SEED, DEST_X_SECRET);
+    let mut dst = DestTerminal::new(
+        config(),
+        dst_strict,
+        verifying_key(&SOURCE_SEED),
+        DEST_SEED,
+        DEST_X_SECRET,
+    );
 
     let recs: [&[u8]; 1] = [b"OK:loose"]; // valid at source, fails the dest's stricter prefix
     let cofre = src.board(&recs, b"rk").expect("board");
     let disp = dst.offload(&cofre).expect("offload");
     assert_eq!(disp, Disposition::DeadLettered);
-    assert!(dst.sink().is_empty(), "contract-violating records are NOT committed");
+    assert!(
+        dst.sink().is_empty(),
+        "contract-violating records are NOT committed"
+    );
     assert_eq!(
         dst.dead_letters().entries()[0].reason,
         DeadLetterReason::ContractViolation
@@ -178,12 +220,20 @@ fn ac9_wrong_contract_fingerprint_dead_lettered() {
     let src_contract = ContentContract::new(MAX_LEN, PREFIX.to_vec());
     let dst_contract = ContentContract::new(MAX_LEN, b"V2:".to_vec()); // different fingerprint
     let mut src = SourceTerminal::new(config(), src_contract, SOURCE_SEED);
-    let mut dst =
-        DestTerminal::new(config(), dst_contract, verifying_key(&SOURCE_SEED), DEST_SEED, DEST_X_SECRET);
+    let mut dst = DestTerminal::new(
+        config(),
+        dst_contract,
+        verifying_key(&SOURCE_SEED),
+        DEST_SEED,
+        DEST_X_SECRET,
+    );
 
     let recs: [&[u8]; 1] = [b"OK:payload"];
     let cofre = src.board(&recs, b"rk").expect("board");
-    assert_eq!(dst.offload(&cofre).expect("offload"), Disposition::DeadLettered);
+    assert_eq!(
+        dst.offload(&cofre).expect("offload"),
+        Disposition::DeadLettered
+    );
     assert!(dst.sink().is_empty());
     assert_eq!(
         dst.dead_letters().entries()[0].reason,
@@ -253,14 +303,26 @@ fn exactly_once_same_cofre_twice() {
     let cofre = src.board(&recs, b"record-key-A").expect("board");
 
     // First offload: Delivered, records committed once.
-    assert_eq!(dst.offload(&cofre).expect("offload 1"), Disposition::Delivered);
+    assert_eq!(
+        dst.offload(&cofre).expect("offload 1"),
+        Disposition::Delivered
+    );
     assert_eq!(dst.sink().len(), 2);
-    assert_eq!(dst.sink().committed(), &[b"OK:one".to_vec(), b"OK:two".to_vec()]);
+    assert_eq!(
+        dst.sink().committed(),
+        &[b"OK:one".to_vec(), b"OK:two".to_vec()]
+    );
 
     // Second offload of the identical cofre: Duplicate, sink UNCHANGED (no re-commit).
-    assert_eq!(dst.offload(&cofre).expect("offload 2"), Disposition::Duplicate);
+    assert_eq!(
+        dst.offload(&cofre).expect("offload 2"),
+        Disposition::Duplicate
+    );
     assert_eq!(dst.sink().len(), 2, "duplicate must not re-commit");
-    assert_eq!(dst.sink().committed(), &[b"OK:one".to_vec(), b"OK:two".to_vec()]);
+    assert_eq!(
+        dst.sink().committed(),
+        &[b"OK:one".to_vec(), b"OK:two".to_vec()]
+    );
     assert!(dst.dead_letters().is_empty());
 }
 
@@ -280,7 +342,9 @@ fn distinct_record_keys_are_both_delivered() {
 // ---- A4 sealed-sender: the fine-grained sender rides ENCRYPTED inside the carga (SPEC-02 A4 / 03 MAJ-4) ----
 mod sealed_sender {
     use super::{config, contract, DEST_SEED, DEST_X_SECRET, SOURCE_SEED};
-    use crate::{issue_sender_cert, DeadLetterReason, DestTerminal, SenderCredential, SourceTerminal};
+    use crate::{
+        issue_sender_cert, DeadLetterReason, DestTerminal, SenderCredential, SourceTerminal,
+    };
     use datarail_core::Disposition;
     use datarail_crypto::verifying_key;
 
@@ -293,13 +357,23 @@ mod sealed_sender {
     fn sealed_source() -> SourceTerminal {
         let sender_vk = verifying_key(&SENDER_SEED);
         let issuer_sig = issue_sender_cert(&ISSUER_SEED, &SENDER_ID, &sender_vk, EPOCH);
-        SourceTerminal::new(config(), contract(), SOURCE_SEED)
-            .with_sender(SenderCredential::new(SENDER_ID, SENDER_SEED, EPOCH, issuer_sig))
+        SourceTerminal::new(config(), contract(), SOURCE_SEED).with_sender(SenderCredential::new(
+            SENDER_ID,
+            SENDER_SEED,
+            EPOCH,
+            issuer_sig,
+        ))
     }
 
     fn dest_with_issuer(issuer_vk: [u8; 32]) -> DestTerminal {
-        DestTerminal::new(config(), contract(), verifying_key(&SOURCE_SEED), DEST_SEED, DEST_X_SECRET)
-            .with_sender_issuer(issuer_vk)
+        DestTerminal::new(
+            config(),
+            contract(),
+            verifying_key(&SOURCE_SEED),
+            DEST_SEED,
+            DEST_X_SECRET,
+        )
+        .with_sender_issuer(issuer_vk)
     }
 
     #[test]
@@ -307,11 +381,21 @@ mod sealed_sender {
         let mut src = sealed_source();
         let mut dst = dest_with_issuer(verifying_key(&ISSUER_SEED));
         let cofre = src.board(&[b"OK:hello"], b"rk").expect("board");
-        assert!(cofre.etiqueta.sender_present, "header flags the sealed sender");
+        assert!(
+            cofre.etiqueta.sender_present,
+            "header flags the sealed sender"
+        );
 
-        assert_eq!(dst.offload(&cofre).expect("offload"), Disposition::Delivered);
+        assert_eq!(
+            dst.offload(&cofre).expect("offload"),
+            Disposition::Delivered
+        );
         assert_eq!(dst.sink().committed(), &[b"OK:hello".to_vec()]);
-        assert_eq!(dst.last_sender_id(), Some(SENDER_ID), "the dest validated + exposed the sender id");
+        assert_eq!(
+            dst.last_sender_id(),
+            Some(SENDER_ID),
+            "the dest validated + exposed the sender id"
+        );
         assert!(dst.dead_letters().is_empty());
     }
 
@@ -320,14 +404,25 @@ mod sealed_sender {
         // audit S-2: once the dest pins a higher epoch floor (a key rotation / revocation), a cert minted at the
         // old EPOCH must stop being honored — even though the issuer signature is still valid.
         let mut src = sealed_source();
-        let mut dst = dest_with_issuer(verifying_key(&ISSUER_SEED)).with_min_sender_epoch(EPOCH + 1);
+        let mut dst =
+            dest_with_issuer(verifying_key(&ISSUER_SEED)).with_min_sender_epoch(EPOCH + 1);
         let cofre = src.board(&[b"OK:hello"], b"rk").expect("board");
-        assert_eq!(dst.offload(&cofre).expect("offload"), Disposition::DeadLettered);
-        assert!(dst.last_sender_id().is_none(), "a below-floor sender is never accepted");
+        assert_eq!(
+            dst.offload(&cofre).expect("offload"),
+            Disposition::DeadLettered
+        );
+        assert!(
+            dst.last_sender_id().is_none(),
+            "a below-floor sender is never accepted"
+        );
         // At exactly the floor the same sender is accepted again.
-        let mut at_floor = dest_with_issuer(verifying_key(&ISSUER_SEED)).with_min_sender_epoch(EPOCH);
+        let mut at_floor =
+            dest_with_issuer(verifying_key(&ISSUER_SEED)).with_min_sender_epoch(EPOCH);
         let cofre2 = src.board(&[b"OK:world"], b"rk2").expect("board");
-        assert_eq!(at_floor.offload(&cofre2).expect("offload"), Disposition::Delivered);
+        assert_eq!(
+            at_floor.offload(&cofre2).expect("offload"),
+            Disposition::Delivered
+        );
         assert_eq!(at_floor.last_sender_id(), Some(SENDER_ID));
     }
 
@@ -339,7 +434,10 @@ mod sealed_sender {
         let cofre = src.board(&[b"OK:secret-sender"], b"rk").expect("board");
         let wire = datarail_cofre::encode(&cofre);
         let appears = wire.windows(SENDER_ID.len()).any(|w| w == SENDER_ID);
-        assert!(!appears, "the sender_id bytes must not be observable in the cleartext wire cofre");
+        assert!(
+            !appears,
+            "the sender_id bytes must not be observable in the cleartext wire cofre"
+        );
     }
 
     #[test]
@@ -354,9 +452,15 @@ mod sealed_sender {
             DEST_X_SECRET,
         ); // no with_sender_issuer
         let cofre = src.board(&[b"OK:hello"], b"rk").expect("board");
-        assert_eq!(dst.offload(&cofre).expect("offload"), Disposition::DeadLettered);
+        assert_eq!(
+            dst.offload(&cofre).expect("offload"),
+            Disposition::DeadLettered
+        );
         assert!(dst.sink().is_empty());
-        assert_eq!(dst.dead_letters().entries()[0].reason, DeadLetterReason::SenderCertInvalid);
+        assert_eq!(
+            dst.dead_letters().entries()[0].reason,
+            DeadLetterReason::SenderCertInvalid
+        );
     }
 
     #[test]
@@ -365,9 +469,15 @@ mod sealed_sender {
         let mut src = sealed_source();
         let mut dst = dest_with_issuer(verifying_key(&[88u8; 32])); // not the real issuer
         let cofre = src.board(&[b"OK:hello"], b"rk").expect("board");
-        assert_eq!(dst.offload(&cofre).expect("offload"), Disposition::DeadLettered);
+        assert_eq!(
+            dst.offload(&cofre).expect("offload"),
+            Disposition::DeadLettered
+        );
         assert!(dst.sink().is_empty());
-        assert_eq!(dst.dead_letters().entries()[0].reason, DeadLetterReason::SenderCertInvalid);
+        assert_eq!(
+            dst.dead_letters().entries()[0].reason,
+            DeadLetterReason::SenderCertInvalid
+        );
         assert_eq!(dst.last_sender_id(), None);
     }
 
@@ -378,12 +488,19 @@ mod sealed_sender {
         let real_vk = verifying_key(&SENDER_SEED);
         let issuer_sig = issue_sender_cert(&ISSUER_SEED, &SENDER_ID, &real_vk, EPOCH);
         // Credential carries a DIFFERENT signing seed than the one the issuer vouched for.
-        let mut src = SourceTerminal::new(config(), contract(), SOURCE_SEED)
-            .with_sender(SenderCredential::new(SENDER_ID, [0x55u8; 32], EPOCH, issuer_sig));
+        let mut src = SourceTerminal::new(config(), contract(), SOURCE_SEED).with_sender(
+            SenderCredential::new(SENDER_ID, [0x55u8; 32], EPOCH, issuer_sig),
+        );
         let mut dst = dest_with_issuer(verifying_key(&ISSUER_SEED));
         let cofre = src.board(&[b"OK:hello"], b"rk").expect("board");
-        assert_eq!(dst.offload(&cofre).expect("offload"), Disposition::DeadLettered);
-        assert_eq!(dst.dead_letters().entries()[0].reason, DeadLetterReason::SenderCertInvalid);
+        assert_eq!(
+            dst.offload(&cofre).expect("offload"),
+            Disposition::DeadLettered
+        );
+        assert_eq!(
+            dst.dead_letters().entries()[0].reason,
+            DeadLetterReason::SenderCertInvalid
+        );
     }
 
     #[test]
@@ -399,7 +516,10 @@ mod sealed_sender {
         );
         let cofre = src.board(&[b"OK:plain"], b"rk").expect("board");
         assert!(!cofre.etiqueta.sender_present);
-        assert_eq!(dst.offload(&cofre).expect("offload"), Disposition::Delivered);
+        assert_eq!(
+            dst.offload(&cofre).expect("offload"),
+            Disposition::Delivered
+        );
         assert_eq!(dst.last_sender_id(), None);
     }
 }
@@ -484,8 +604,24 @@ fn drbg_outputs_are_distinct_across_many_draws() {
     let mut seen = HashSet::with_capacity(n);
     for _ in 0..n {
         let r = super::random_32().expect("drbg draw");
-        assert!(seen.insert(r), "DRBG produced a repeated 32-byte output — randomness is broken");
+        assert!(
+            seen.insert(r),
+            "DRBG produced a repeated 32-byte output — randomness is broken"
+        );
         assert_ne!(r, [0u8; 32], "DRBG must not emit all-zeros");
+    }
+}
+
+#[test]
+fn reserved_sequences_are_contiguous_within_each_partition() {
+    let mut src = source();
+    let mut next = [0_u64; 4];
+    for i in 0_u64..1_000 {
+        let partition = usize::try_from(i % 4).expect("partition fits usize");
+        let count = i % 7 + 1;
+        let start = src.reserve_seqs(u64::try_from(partition).expect("partition fits u64"), count);
+        assert_eq!(start, next[partition]);
+        next[partition] += count;
     }
 }
 
@@ -504,12 +640,19 @@ fn drbg_backed_board_still_seals_and_offloads_round_trip() {
     let mut src = SourceTerminal::new(cfg.clone(), contract.clone(), SOURCE_SEED);
     let src_vk = verifying_key(&SOURCE_SEED);
     let mut dst = DestTerminal::new(cfg, contract, src_vk, DEST_SEED, DEST_X_SECRET);
-    let recs: Vec<&[u8]> = vec![b"alpha".as_slice(), b"bravo".as_slice(), b"charlie".as_slice()];
+    let recs: Vec<&[u8]> = vec![
+        b"alpha".as_slice(),
+        b"bravo".as_slice(),
+        b"charlie".as_slice(),
+    ];
     for i in 0u64..200 {
         let cofre = src.board(&recs, &i.to_le_bytes()).expect("board");
         // distinct ephemeral pubkey per cofre (fresh DRBG draw) — no key reuse across cofres
         assert_ne!(cofre.etiqueta.eph_pk, [0u8; 32]);
-        assert_eq!(dst.offload(&cofre).expect("offload"), Disposition::Delivered);
+        assert_eq!(
+            dst.offload(&cofre).expect("offload"),
+            Disposition::Delivered
+        );
     }
     assert_eq!(dst.sink().committed().len(), 200 * recs.len());
 }
@@ -527,7 +670,13 @@ fn drbg_identical_state_clones_diverge_every_draw() {
     for _ in 0..1000 {
         let from_original = original.next_32().expect("original draw");
         let from_clone = clone.next_32().expect("clone draw");
-        assert_ne!(from_original, from_clone, "identical-state clones must diverge every draw (snapshot immunity)");
-        assert!(observed.insert(from_original) && observed.insert(from_clone), "no repeated output across clones");
+        assert_ne!(
+            from_original, from_clone,
+            "identical-state clones must diverge every draw (snapshot immunity)"
+        );
+        assert!(
+            observed.insert(from_original) && observed.insert(from_clone),
+            "no repeated output across clones"
+        );
     }
 }
