@@ -1,5 +1,5 @@
 # datarail — example route config (local demo).
-# In production, [keys] carries key-refs / KMS handles, never raw secrets like this.
+# In production, [keys] can carry env/file key-refs, never raw secrets like this.
 
 [route]
 route_id   = "0xa1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1"   # 16 bytes

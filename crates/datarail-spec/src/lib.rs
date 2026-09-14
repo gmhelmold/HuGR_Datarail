@@ -27,11 +27,12 @@
 //! max_record_len = 1024
 //! required_prefix = "evt:"
 //!
-//! [keys]                       # v1: inline hex for a local demo (prod: a key-ref / KMS handle)
+//! [keys]                       # inline hex for a local demo, or an env/file key-ref
 //! source_seed    = "0x…32 bytes…"
 //! dest_seed      = "0x…32 bytes…"
-//! route_data_key = "0x…32 bytes…"
+//! dest_x25519_secret = "0x…32 bytes…"
 //! tenant_secret  = "0x…32 bytes…"
+//! source_seed_ref = "env:DATARAIL_SOURCE_SEED"
 //! ```
 
 #![forbid(unsafe_code)]
@@ -103,6 +104,25 @@ pub enum SpecError {
         /// The key.
         key: &'static str,
     },
+    /// A key reference had no usable value or its backing store could not be read.
+    KeyRefUnavailable {
+        /// The logical key.
+        key: &'static str,
+        /// The backing store.
+        source: &'static str,
+    },
+    /// A key reference was malformed.
+    KeyRefInvalid {
+        /// The logical key.
+        key: &'static str,
+    },
+    /// A key reference used a scheme this parser does not implement.
+    UnsupportedKeyRef {
+        /// The logical key.
+        key: &'static str,
+        /// The unsupported scheme.
+        scheme: String,
+    },
     /// The `aead` value was not a recognized algorithm.
     UnknownAead(String),
     /// A numeric field was out of its valid range (e.g. `max_record_len <= 0`).
@@ -118,15 +138,21 @@ impl core::fmt::Display for SpecError {
             Self::Syntax { line, msg } => write!(f, "line {line}: {msg}"),
             Self::Duplicate { line, key } => write!(f, "line {line}: duplicate key `{key}`"),
             Self::Missing { section, key } => write!(f, "missing key `{key}` in [{section}]"),
-            Self::BadType {
-                section,
-                key,
-                want,
-            } => write!(f, "[{section}].{key} must be a {want}"),
+            Self::BadType { section, key, want } => write!(f, "[{section}].{key} must be a {want}"),
             Self::BadHexLen { key, want, got } => {
                 write!(f, "`{key}` must be {want} bytes of hex, got {got}")
             }
             Self::BadHex { key } => write!(f, "`{key}` is not valid hex"),
+            Self::KeyRefUnavailable { key, source } => {
+                write!(f, "key reference for `{key}` unavailable from {source}")
+            }
+            Self::KeyRefInvalid { key } => write!(f, "key reference for `{key}` is invalid"),
+            Self::UnsupportedKeyRef { key, scheme } => {
+                write!(
+                    f,
+                    "key reference for `{key}` uses unsupported scheme `{scheme}`"
+                )
+            }
             Self::UnknownAead(s) => write!(f, "unknown aead `{s}`"),
             Self::OutOfRange { key } => write!(f, "`{key}` is out of range"),
         }
@@ -226,12 +252,20 @@ fn from_hex(s: &str) -> Option<Vec<u8>> {
 // Typed extraction helpers.
 // ----------------------------------------------------------------------------------------------------------
 
-fn get<'a>(map: &'a RawMap, section: &'static str, key: &'static str) -> Result<&'a Value, SpecError> {
+fn get<'a>(
+    map: &'a RawMap,
+    section: &'static str,
+    key: &'static str,
+) -> Result<&'a Value, SpecError> {
     map.get(&(section.to_owned(), key.to_owned()))
         .ok_or(SpecError::Missing { section, key })
 }
 
-fn get_str<'a>(map: &'a RawMap, section: &'static str, key: &'static str) -> Result<&'a str, SpecError> {
+fn get_str<'a>(
+    map: &'a RawMap,
+    section: &'static str,
+    key: &'static str,
+) -> Result<&'a str, SpecError> {
     match get(map, section, key)? {
         Value::Str(s) => Ok(s),
         _ => Err(SpecError::BadType {
@@ -262,15 +296,101 @@ fn get_bytes<const N: usize>(
     let hex = s.strip_prefix("0x").unwrap_or(s);
     let bytes = from_hex(hex).ok_or(SpecError::BadHex { key })?;
     let got = bytes.len();
-    bytes.try_into().map_err(|_| SpecError::BadHexLen {
-        key,
-        want: N,
-        got,
-    })
+    bytes
+        .try_into()
+        .map_err(|_| SpecError::BadHexLen { key, want: N, got })
+}
+
+/// Resolve a key reference and decode exactly `N` bytes of hexadecimal key material.
+fn resolve_key_ref<const N: usize>(
+    reference: &str,
+    key: &'static str,
+) -> Result<[u8; N], SpecError> {
+    let (scheme, locator) = reference
+        .split_once(':')
+        .ok_or(SpecError::KeyRefInvalid { key })?;
+    let material = match scheme {
+        "env" => {
+            if !valid_env_name(locator) {
+                return Err(SpecError::KeyRefInvalid { key });
+            }
+            std::env::var(locator).map_err(|_| SpecError::KeyRefUnavailable {
+                key,
+                source: "environment variable",
+            })?
+        }
+        "file" => {
+            let path = std::path::Path::new(locator);
+            if locator.is_empty()
+                || path
+                    .components()
+                    .any(|component| component == std::path::Component::ParentDir)
+            {
+                return Err(SpecError::KeyRefInvalid { key });
+            }
+            std::fs::read_to_string(path).map_err(|_| SpecError::KeyRefUnavailable {
+                key,
+                source: "key file",
+            })?
+        }
+        other => {
+            return Err(SpecError::UnsupportedKeyRef {
+                key,
+                scheme: other.to_owned(),
+            });
+        }
+    };
+
+    let material = material.trim();
+    let bytes = from_hex(material).ok_or(SpecError::BadHex { key })?;
+    let got = bytes.len();
+    if got != N {
+        return Err(SpecError::BadHexLen { key, want: N, got });
+    }
+    bytes
+        .try_into()
+        .map_err(|_| SpecError::BadHexLen { key, want: N, got })
+}
+
+/// Accept conventional portable environment variable names only.
+fn valid_env_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    matches!(chars.next(), Some(c) if c == '_' || c.is_ascii_alphabetic())
+        && chars.all(|c| c == '_' || c.is_ascii_alphanumeric())
+}
+
+/// Read a key reference when present; otherwise preserve the inline demo field.
+fn get_key_bytes<const N: usize>(
+    map: &RawMap,
+    section: &'static str,
+    key: &'static str,
+) -> Result<[u8; N], SpecError> {
+    let ref_key = match key {
+        "source_seed" => "source_seed_ref",
+        "dest_seed" => "dest_seed_ref",
+        "dest_x25519_secret" => "dest_x25519_secret_ref",
+        "tenant_secret" => "tenant_secret_ref",
+        _ => unreachable!("key references only support configured key fields"),
+    };
+    if let Some(value) = map.get(&(section.to_owned(), ref_key.to_owned())) {
+        let Value::Str(reference) = value else {
+            return Err(SpecError::BadType {
+                section,
+                key: ref_key,
+                want: "string",
+            });
+        };
+        return resolve_key_ref(reference, key);
+    }
+    get_bytes::<N>(map, section, key)
 }
 
 /// Bytes for a content prefix: a plain `"string"` becomes its UTF-8 bytes; a `"0x…"` value is decoded as hex.
-fn get_prefix(map: &RawMap, section: &'static str, key: &'static str) -> Result<Vec<u8>, SpecError> {
+fn get_prefix(
+    map: &RawMap,
+    section: &'static str,
+    key: &'static str,
+) -> Result<Vec<u8>, SpecError> {
     let s = get_str(map, section, key)?;
     if let Some(hex) = s.strip_prefix("0x") {
         from_hex(hex).ok_or(SpecError::BadHex { key })
@@ -308,18 +428,17 @@ pub struct ContractSpec {
     pub required_prefix: Vec<u8>,
 }
 
-/// The `[keys]` section. v1 inlines the secrets as hex for a local demo; production carries key-refs.
+/// The `[keys]` section. Inline hex remains available for local demos; `*_ref` resolves external key material.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KeysSpec {
-    /// Ed25519 source signing seed.
+    /// Ed25519 source signing seed, inline or resolved from `source_seed_ref`.
     pub source_seed: [u8; 32],
-    /// Ed25519 destination signing seed (watermarks / acks).
+    /// Ed25519 destination signing seed, inline or resolved from `dest_seed_ref`.
     pub dest_seed: [u8; 32],
-    /// The route destination's X25519 **secret**. (v1 demo carries it inline so one `rail.toml` builds both
-    /// terminals; production would carry only the *public* key on the source side.) `terminal_config` derives
-    /// the public key the source seals each per-cofre data key to.
+    /// The route destination's X25519 **secret**, inline or resolved from `dest_x25519_secret_ref`.
+    /// `terminal_config` derives the public key the source seals each per-cofre data key to.
     pub dest_x25519_secret: [u8; 32],
-    /// Per-tenant secret keying the idempotency MAC.
+    /// Per-tenant secret keying the idempotency MAC, inline or resolved from `tenant_secret_ref`.
     pub tenant_secret: [u8; 32],
 }
 
@@ -338,12 +457,13 @@ pub struct RailSpec {
 
 fn contract_spec(map: &RawMap, section: &'static str) -> Result<ContractSpec, SpecError> {
     let raw = get_int(map, section, "max_record_len")?;
-    let max_record_len = usize::try_from(raw)
-        .ok()
-        .filter(|&n| n > 0)
-        .ok_or(SpecError::OutOfRange {
-            key: "max_record_len",
-        })?;
+    let max_record_len =
+        usize::try_from(raw)
+            .ok()
+            .filter(|&n| n > 0)
+            .ok_or(SpecError::OutOfRange {
+                key: "max_record_len",
+            })?;
     Ok(ContractSpec {
         max_record_len,
         required_prefix: get_prefix(map, section, "required_prefix")?,
@@ -355,7 +475,9 @@ impl RailSpec {
     ///
     /// # Errors
     /// Returns a [`SpecError`] for any syntax problem, a missing/duplicate/mistyped key, a bad-length or
-    /// non-hex byte field, an unknown `aead`, or an out-of-range numeric field.
+    /// non-hex byte field, an unavailable or unsupported key reference, an unknown `aead`, or an out-of-range
+    /// numeric field. Key references accept `env:NAME` and `file:path`; referenced material is trimmed and must
+    /// contain exactly 64 hexadecimal characters.
     pub fn parse(src: &str) -> Result<Self, SpecError> {
         let map = parse_raw(src)?;
 
@@ -377,10 +499,10 @@ impl RailSpec {
         };
 
         let keys = KeysSpec {
-            source_seed: get_bytes::<32>(&map, "keys", "source_seed")?,
-            dest_seed: get_bytes::<32>(&map, "keys", "dest_seed")?,
-            dest_x25519_secret: get_bytes::<32>(&map, "keys", "dest_x25519_secret")?,
-            tenant_secret: get_bytes::<32>(&map, "keys", "tenant_secret")?,
+            source_seed: get_key_bytes::<32>(&map, "keys", "source_seed")?,
+            dest_seed: get_key_bytes::<32>(&map, "keys", "dest_seed")?,
+            dest_x25519_secret: get_key_bytes::<32>(&map, "keys", "dest_x25519_secret")?,
+            tenant_secret: get_key_bytes::<32>(&map, "keys", "tenant_secret")?,
         };
 
         Ok(Self {
@@ -426,8 +548,10 @@ impl RailSpec {
 mod tests {
     use super::{from_hex, RailSpec, SpecError};
     use datarail_core::AeadAlg;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     const SEED32: &str = "0x1111111111111111111111111111111111111111111111111111111111111111";
+    static NEXT_TEST_ID: AtomicUsize = AtomicUsize::new(0);
 
     fn sample() -> String {
         format!(
@@ -481,9 +605,15 @@ mod tests {
 
     #[test]
     fn hex_prefix_for_required_prefix_is_decoded() {
-        let src = sample().replace("required_prefix = \"evt:\"", "required_prefix = \"0xdeadbeef\"");
+        let src = sample().replace(
+            "required_prefix = \"evt:\"",
+            "required_prefix = \"0xdeadbeef\"",
+        );
         let spec = RailSpec::parse(&src).expect("valid");
-        assert_eq!(spec.onboarding.required_prefix, vec![0xde, 0xad, 0xbe, 0xef]);
+        assert_eq!(
+            spec.onboarding.required_prefix,
+            vec![0xde, 0xad, 0xbe, 0xef]
+        );
     }
 
     #[test]
@@ -553,7 +683,10 @@ mod tests {
             "guarantee = \"exactly-once\"\n",
             "guarantee = \"exactly-once\"\nguarantee = \"at-least-once\"\n",
         );
-        assert!(matches!(RailSpec::parse(&src), Err(SpecError::Duplicate { .. })));
+        assert!(matches!(
+            RailSpec::parse(&src),
+            Err(SpecError::Duplicate { .. })
+        ));
     }
 
     #[test]
@@ -569,5 +702,132 @@ mod tests {
         assert_eq!(from_hex("deadBEEF"), Some(vec![0xde, 0xad, 0xbe, 0xef]));
         assert_eq!(from_hex("0d0"), None); // odd length
         assert_eq!(from_hex("zz"), None); // non-hex
+    }
+
+    #[test]
+    fn env_and_file_key_refs_resolve_exact_bytes() {
+        let id = NEXT_TEST_ID.fetch_add(1, Ordering::Relaxed);
+        let env_source = format!("DATARAIL_SPEC_SOURCE_{id}");
+        let env_x25519 = format!("DATARAIL_SPEC_X25519_{id}");
+        let dir = std::env::temp_dir().join(format!("datarail-spec-{}-{id}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("test directory");
+        let dest_file = dir.join("dest");
+        let tenant_file = dir.join("tenant");
+        std::fs::write(&dest_file, format!("  {}\n", "bb".repeat(32)))
+            .expect("destination key file");
+        std::fs::write(&tenant_file, format!("{}\n", "dd".repeat(32))).expect("tenant key file");
+        std::env::set_var(&env_source, "aa".repeat(32));
+        std::env::set_var(&env_x25519, "cc".repeat(32));
+
+        let src = sample()
+            .replace(
+                &format!("source_seed = \"{SEED32}\""),
+                &format!("source_seed = \"not inline\"\nsource_seed_ref = \"env:{env_source}\""),
+            )
+            .replace(
+                &format!("dest_seed = \"{SEED32}\""),
+                &format!("dest_seed = \"not inline\"\ndest_seed_ref = \"file:{}\"", dest_file.display()),
+            )
+            .replace(
+                &format!("dest_x25519_secret = \"{SEED32}\""),
+                &format!(
+                    "dest_x25519_secret = \"not inline\"\ndest_x25519_secret_ref = \"env:{env_x25519}\""
+                ),
+            )
+            .replace(
+                &format!("tenant_secret = \"{SEED32}\""),
+                &format!("tenant_secret = \"not inline\"\ntenant_secret_ref = \"file:{}\"", tenant_file.display()),
+            );
+
+        let spec = RailSpec::parse(&src).expect("external keys resolve");
+        assert_eq!(spec.keys.source_seed, [0xaau8; 32]);
+        assert_eq!(spec.keys.dest_seed, [0xbbu8; 32]);
+        assert_eq!(spec.keys.dest_x25519_secret, [0xccu8; 32]);
+        assert_eq!(spec.keys.tenant_secret, [0xddu8; 32]);
+
+        std::env::remove_var(&env_source);
+        std::env::remove_var(&env_x25519);
+        std::fs::remove_dir_all(dir).expect("remove test directory");
+    }
+
+    #[test]
+    fn missing_key_refs_fail_without_exposing_material() {
+        let id = NEXT_TEST_ID.fetch_add(1, Ordering::Relaxed);
+        let env_name = format!("DATARAIL_SPEC_MISSING_{id}");
+        std::env::remove_var(&env_name);
+        let env_src = sample().replace(
+            &format!("source_seed = \"{SEED32}\""),
+            &format!("source_seed_ref = \"env:{env_name}\""),
+        );
+        assert_eq!(
+            RailSpec::parse(&env_src),
+            Err(SpecError::KeyRefUnavailable {
+                key: "source_seed",
+                source: "environment variable"
+            })
+        );
+
+        let id = NEXT_TEST_ID.fetch_add(1, Ordering::Relaxed);
+        let path =
+            std::env::temp_dir().join(format!("datarail-spec-missing-{}-{id}", std::process::id()));
+        let file_src = sample().replace(
+            &format!("source_seed = \"{SEED32}\""),
+            &format!("source_seed_ref = \"file:{}\"", path.display()),
+        );
+        let error = RailSpec::parse(&file_src).expect_err("missing file must fail");
+        assert_eq!(
+            error,
+            SpecError::KeyRefUnavailable {
+                key: "source_seed",
+                source: "key file"
+            }
+        );
+    }
+
+    #[test]
+    fn malformed_key_refs_fail_closed() {
+        let cases = [
+            (
+                "source_seed_ref = \"kms:production/source\"",
+                SpecError::UnsupportedKeyRef {
+                    key: "source_seed",
+                    scheme: "kms".to_owned(),
+                },
+            ),
+            (
+                "source_seed_ref = \"file:../secret\"",
+                SpecError::KeyRefInvalid { key: "source_seed" },
+            ),
+        ];
+        for (ref_line, expected) in cases {
+            let src = sample().replace(&format!("source_seed = \"{SEED32}\""), ref_line);
+            assert_eq!(RailSpec::parse(&src), Err(expected));
+        }
+    }
+
+    #[test]
+    fn referenced_key_length_and_hex_are_validated() {
+        let id = NEXT_TEST_ID.fetch_add(1, Ordering::Relaxed);
+        let env_name = format!("DATARAIL_SPEC_BAD_{id}");
+        let secret = "ab".repeat(32);
+        std::env::set_var(&env_name, format!("{secret}zz"));
+        let src = sample().replace(
+            &format!("source_seed = \"{SEED32}\""),
+            &format!("source_seed_ref = \"env:{env_name}\""),
+        );
+        let error = RailSpec::parse(&src).expect_err("bad key material must fail");
+        assert_eq!(error, SpecError::BadHex { key: "source_seed" });
+        assert!(!error.to_string().contains(&secret));
+
+        std::env::set_var(&env_name, "aa");
+        assert_eq!(
+            RailSpec::parse(&src),
+            Err(SpecError::BadHexLen {
+                key: "source_seed",
+                want: 32,
+                got: 1
+            })
+        );
+        std::env::remove_var(&env_name);
     }
 }

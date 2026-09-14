@@ -76,8 +76,8 @@ self-audit on record.
 
 The `examples/rail.toml` file carries raw, all-repeated-byte keys by design — they are demo fixtures
 committed to the public repository and must never be used in production. Real deployments should
-reference keys through an external store or KMS handle; the spec supports key-reference values in
-`[keys]` for exactly this reason.
+reference keys through an external store; the spec supports `env:` and `file:` key-reference values in
+`[keys]` for exactly this reason. KMS references are not implemented.
 
 Long-term secrets (route identity keypairs, tenant secrets) are wrapped in types that implement
 `zeroize::Zeroize` and are dropped with `zeroize-on-drop` so they are overwritten in memory before
