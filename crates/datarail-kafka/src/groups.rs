@@ -46,7 +46,13 @@ pub fn parse_find_coordinator(reader: &mut Reader, version: i16) -> io::Result<S
 /// Build a `FindCoordinator` response naming THIS broker as the coordinator (single-node: node 0). `error_code`
 /// is `NONE` (0). Version-gated: v1+ prepends `throttle_time_ms` and inserts a null `error_message`.
 #[must_use]
-pub fn find_coordinator_response(version: i16, correlation_id: i32, node_id: i32, host: &str, port: i32) -> Vec<u8> {
+pub fn find_coordinator_response(
+    version: i16,
+    correlation_id: i32,
+    node_id: i32,
+    host: &str,
+    port: i32,
+) -> Vec<u8> {
     let mut w = Writer::new();
     write_response_header(&mut w, correlation_id, false);
     if version >= 1 {
@@ -228,7 +234,11 @@ pub struct OffsetFetchTopicResult {
 /// Build an `OffsetFetch` response at `version`. Each partition carries its committed offset (or `-1`), null
 /// metadata, and `error_code` 0. v2+ appends a top-level `error_code` (0 = NONE).
 #[must_use]
-pub fn offset_fetch_response(version: i16, correlation_id: i32, topics: &[OffsetFetchTopicResult]) -> Vec<u8> {
+pub fn offset_fetch_response(
+    version: i16,
+    correlation_id: i32,
+    topics: &[OffsetFetchTopicResult],
+) -> Vec<u8> {
     let mut w = Writer::new();
     write_response_header(&mut w, correlation_id, false);
     w.int32(i32::try_from(topics.len()).unwrap_or(0));
@@ -283,7 +293,11 @@ pub struct JoinGroupRequest {
 pub fn parse_join_group(reader: &mut Reader, version: i16) -> io::Result<JoinGroupRequest> {
     let group_id = reader.string()?;
     let session_timeout_ms = reader.int32()?;
-    let rebalance_timeout_ms = if version >= 1 { reader.int32()? } else { session_timeout_ms };
+    let rebalance_timeout_ms = if version >= 1 {
+        reader.int32()?
+    } else {
+        session_timeout_ms
+    };
     let member_id = reader.string()?;
     let protocol_type = reader.string()?;
     let proto_count = reader.int32()?;
@@ -294,7 +308,14 @@ pub fn parse_join_group(reader: &mut Reader, version: i16) -> io::Result<JoinGro
         let metadata = reader.bytes()?;
         protocols.push(JoinProtocol { name, metadata });
     }
-    Ok(JoinGroupRequest { group_id, session_timeout_ms, rebalance_timeout_ms, member_id, protocol_type, protocols })
+    Ok(JoinGroupRequest {
+        group_id,
+        session_timeout_ms,
+        rebalance_timeout_ms,
+        member_id,
+        protocol_type,
+        protocols,
+    })
 }
 
 /// The fields of a `JoinGroup` response (bundled so the builder stays within the argument cap).
@@ -373,14 +394,27 @@ pub fn parse_sync_group(reader: &mut Reader, _version: i16) -> io::Result<SyncGr
     for _ in 0..n {
         let member_id = reader.string()?;
         let assignment = reader.bytes()?;
-        assignments.push(SyncAssignment { member_id, assignment });
+        assignments.push(SyncAssignment {
+            member_id,
+            assignment,
+        });
     }
-    Ok(SyncGroupRequest { group_id, generation_id, member_id, assignments })
+    Ok(SyncGroupRequest {
+        group_id,
+        generation_id,
+        member_id,
+        assignments,
+    })
 }
 
 /// Build a `SyncGroup` response (v0–v2) carrying this member's assignment bytes.
 #[must_use]
-pub fn sync_group_response(version: i16, correlation_id: i32, error_code: i16, assignment: &[u8]) -> Vec<u8> {
+pub fn sync_group_response(
+    version: i16,
+    correlation_id: i32,
+    error_code: i16,
+    assignment: &[u8],
+) -> Vec<u8> {
     let mut w = Writer::new();
     write_response_header(&mut w, correlation_id, false);
     if version >= 1 {
@@ -412,7 +446,11 @@ pub fn parse_heartbeat(reader: &mut Reader, _version: i16) -> io::Result<Heartbe
     let group_id = reader.string()?;
     let generation_id = reader.int32()?;
     let member_id = reader.string()?;
-    Ok(HeartbeatRequest { group_id, generation_id, member_id })
+    Ok(HeartbeatRequest {
+        group_id,
+        generation_id,
+        member_id,
+    })
 }
 
 /// Build a `Heartbeat` response (v0–v2).
@@ -454,9 +492,10 @@ pub fn leave_group_response(version: i16, correlation_id: i32, error_code: i16) 
 #[cfg(test)]
 mod tests {
     use super::{
-        find_coordinator_response, offset_commit_response, offset_fetch_response, parse_find_coordinator,
-        parse_offset_commit, parse_offset_fetch, OffsetCommitPartitionResult, OffsetCommitTopicResult,
-        OffsetFetchPartitionResult, OffsetFetchTopicResult,
+        find_coordinator_response, offset_commit_response, offset_fetch_response,
+        parse_find_coordinator, parse_offset_commit, parse_offset_fetch,
+        OffsetCommitPartitionResult, OffsetCommitTopicResult, OffsetFetchPartitionResult,
+        OffsetFetchTopicResult,
     };
     use crate::codec::{Reader, Writer};
 
@@ -489,7 +528,10 @@ mod tests {
         // The response mirrors the topic/partition with a per-partition NONE error.
         let results = vec![OffsetCommitTopicResult {
             name: "events".to_owned(),
-            partitions: vec![OffsetCommitPartitionResult { partition: 0, error_code: 0 }],
+            partitions: vec![OffsetCommitPartitionResult {
+                partition: 0,
+                error_code: 0,
+            }],
         }];
         let resp = offset_commit_response(7, &results);
         let mut rr = Reader::new(&resp);
@@ -517,7 +559,10 @@ mod tests {
 
         let results = vec![OffsetFetchTopicResult {
             name: "events".to_owned(),
-            partitions: vec![OffsetFetchPartitionResult { partition: 0, offset: 42 }],
+            partitions: vec![OffsetFetchPartitionResult {
+                partition: 0,
+                offset: 42,
+            }],
         }];
         let resp = offset_fetch_response(2, 9, &results);
         let mut rr = Reader::new(&resp);
@@ -546,7 +591,11 @@ mod tests {
         assert_eq!(rr.int32().unwrap(), 3, "correlation");
         assert_eq!(rr.int32().unwrap(), 0, "throttle (v1)");
         assert_eq!(rr.int16().unwrap(), 0, "error NONE");
-        assert_eq!(rr.nullable_string().unwrap(), None, "error_message null (v1)");
+        assert_eq!(
+            rr.nullable_string().unwrap(),
+            None,
+            "error_message null (v1)"
+        );
         assert_eq!(rr.int32().unwrap(), 0, "node 0 = self");
         assert_eq!(rr.string().unwrap(), "broker.local");
         assert_eq!(rr.int32().unwrap(), 9092);
