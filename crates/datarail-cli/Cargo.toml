@@ -25,21 +25,21 @@ tls = ["dep:rustls", "dep:rustls-pemfile"]
 compression = ["datarail-kafka/compression"]
 
 [dependencies]
-datarail-core = { path = "../datarail-core" }
-datarail-crypto = { path = "../datarail-crypto" }
-datarail-cofre = { path = "../datarail-cofre" }
-datarail-manifest = { path = "../datarail-manifest" }
-datarail-rail = { path = "../datarail-rail" }
-datarail-terminal = { path = "../datarail-terminal" }
-datarail-spec = { path = "../datarail-spec" }
-datarail-connectors = { path = "../datarail-connectors" }
-datarail-kafka = { path = "../datarail-kafka" }
-datarail-replaylog = { path = "../datarail-replaylog" }
-datarail-offsets = { path = "../datarail-offsets" }
-datarail-identity = { path = "../datarail-identity" }
-datarail-substrate-shmem = { path = "../datarail-substrate-shmem" }
-datarail-substrate-objectstore = { path = "../datarail-substrate-objectstore" }
-datarail-substrate-quic = { path = "../datarail-substrate-quic", optional = true }
+datarail-core = { path = "../datarail-core", version = "0.1.0" }
+datarail-crypto = { path = "../datarail-crypto", version = "0.1.0" }
+datarail-cofre = { path = "../datarail-cofre", version = "0.1.0" }
+datarail-manifest = { path = "../datarail-manifest", version = "0.1.0" }
+datarail-rail = { path = "../datarail-rail", version = "0.1.0" }
+datarail-terminal = { path = "../datarail-terminal", version = "0.1.0" }
+datarail-spec = { path = "../datarail-spec", version = "0.1.0" }
+datarail-connectors = { path = "../datarail-connectors", version = "0.1.0" }
+datarail-kafka = { path = "../datarail-kafka", version = "0.1.0" }
+datarail-replaylog = { path = "../datarail-replaylog", version = "0.1.0" }
+datarail-offsets = { path = "../datarail-offsets", version = "0.1.0" }
+datarail-identity = { path = "../datarail-identity", version = "0.1.0" }
+datarail-substrate-shmem = { path = "../datarail-substrate-shmem", version = "0.1.0" }
+datarail-substrate-objectstore = { path = "../datarail-substrate-objectstore", version = "0.1.0" }
+datarail-substrate-quic = { path = "../datarail-substrate-quic", version = "0.1.0", optional = true }
 # TLS termination on the Kafka hop (feature = "tls"). ring backend, consistent with the quic substrate.
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"], optional = true }
 rustls-pemfile = { version = "2", optional = true }
