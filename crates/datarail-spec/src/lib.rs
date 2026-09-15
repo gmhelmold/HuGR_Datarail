@@ -41,6 +41,7 @@ use std::collections::BTreeMap;
 
 use datarail_core::AeadAlg;
 use datarail_crypto::x25519_public;
+use datarail_keymgmt::{KeyResolver, EnvKeyProvider, FileKeyProvider, KeyId, Result as KeyResult};
 use datarail_terminal::{ContentContract, TerminalConfig};
 
 /// A scalar value in the `rail.toml` dialect.
@@ -109,7 +110,7 @@ pub enum SpecError {
         /// The logical key.
         key: &'static str,
         /// The backing store.
-        source: &'static str,
+        source: String,
     },
     /// A key reference was malformed.
     KeyRefInvalid {
@@ -301,6 +302,14 @@ fn get_bytes<const N: usize>(
         .map_err(|_| SpecError::BadHexLen { key, want: N, got })
 }
 
+/// Global key resolver for resolving key references.
+fn default_key_resolver() -> datarail_keymgmt::KeyResolver {
+    let mut resolver = datarail_keymgmt::KeyResolver::new();
+    resolver.add_provider(Box::new(datarail_keymgmt::EnvKeyProvider::new("DATARAIL_")));
+    resolver.add_provider(Box::new(datarail_keymgmt::FileKeyProvider::new(".")));
+    resolver
+}
+
 /// Resolve a key reference and decode exactly `N` bytes of hexadecimal key material.
 fn resolve_key_ref<const N: usize>(
     reference: &str,
@@ -309,6 +318,7 @@ fn resolve_key_ref<const N: usize>(
     let (scheme, locator) = reference
         .split_once(':')
         .ok_or(SpecError::KeyRefInvalid { key })?;
+    
     let material = match scheme {
         "env" => {
             if !valid_env_name(locator) {
@@ -316,7 +326,7 @@ fn resolve_key_ref<const N: usize>(
             }
             std::env::var(locator).map_err(|_| SpecError::KeyRefUnavailable {
                 key,
-                source: "environment variable",
+                source: "environment variable".to_string(),
             })?
         }
         "file" => {
@@ -330,8 +340,27 @@ fn resolve_key_ref<const N: usize>(
             }
             std::fs::read_to_string(path).map_err(|_| SpecError::KeyRefUnavailable {
                 key,
-                source: "key file",
+                source: "key file".to_string(),
             })?
+        }
+        "age" | "ssh-agent" | "aws-kms" | "gcp-kms" => {
+            // Use the keymgmt crate for advanced key providers
+            let resolver = default_key_resolver();
+            let key_id = datarail_keymgmt::KeyId::new(reference);
+            let resolved = resolver.resolve(&datarail_keymgmt::KeyId::new(reference))
+                .map_err(|e| match e {
+                    datarail_keymgmt::KeyProviderError::NotFound(_) => SpecError::KeyRefUnavailable {
+                        key,
+                        source: scheme.to_string(),
+                    },
+                    datarail_keymgmt::KeyProviderError::InvalidMaterial(_) => SpecError::BadHex { key },
+                    datarail_keymgmt::KeyProviderError::UnsupportedScheme(s) => SpecError::UnsupportedKeyRef { key, scheme: s },
+                    e => SpecError::KeyRefUnavailable {
+                        key,
+                        source: e.to_string(),
+                    },
+                })?;
+            hex::encode(resolved.material)
         }
         other => {
             return Err(SpecError::UnsupportedKeyRef {
@@ -340,7 +369,7 @@ fn resolve_key_ref<const N: usize>(
             });
         }
     };
-
+    
     let material = material.trim();
     let bytes = from_hex(material).ok_or(SpecError::BadHex { key })?;
     let got = bytes.len();
@@ -763,7 +792,7 @@ mod tests {
             RailSpec::parse(&env_src),
             Err(SpecError::KeyRefUnavailable {
                 key: "source_seed",
-                source: "environment variable"
+                source: "environment variable".to_string()
             })
         );
 
@@ -779,7 +808,7 @@ mod tests {
             error,
             SpecError::KeyRefUnavailable {
                 key: "source_seed",
-                source: "key file"
+                source: "key file".to_string()
             }
         );
     }

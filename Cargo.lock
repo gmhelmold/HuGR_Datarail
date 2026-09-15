@@ -948,7 +948,6 @@ dependencies = [
  "age",
  "aws-sdk-kms",
  "datarail-crypto",
- "datarail-spec",
  "hex",
  "ssh-agent",
  "tempfile",
@@ -1047,7 +1046,9 @@ version = "0.1.0"
 dependencies = [
  "datarail-core",
  "datarail-crypto",
+ "datarail-keymgmt",
  "datarail-terminal",
+ "hex",
 ]
 
 [[package]]

@@ -18,7 +18,6 @@ workspace = true
 
 [dependencies]
 datarail-crypto = { path = "../datarail-crypto" }
-datarail-spec = { path = "../datarail-spec" }
 
 # age encryption support
 age = { version = "0.12", features = ["curve25519-dalek"], optional = true }
