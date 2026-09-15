@@ -855,6 +855,7 @@ dependencies = [
  "datarail-crypto",
  "datarail-identity",
  "datarail-kafka",
+ "datarail-keymgmt",
  "datarail-manifest",
  "datarail-offsets",
  "datarail-rail",
