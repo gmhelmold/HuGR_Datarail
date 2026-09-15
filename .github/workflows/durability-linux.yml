@@ -1,0 +1,26 @@
+name: DUR-01 Linux barrier fault evidence
+
+# Manual evidence only. This job requires a Linux kernel exposing dm-flakey and a real ext4/xfs mount with write
+# barriers. It is deliberately not part of ordinary CI: hosted runners may lack the target and must fail loudly.
+on:
+  workflow_dispatch:
+    inputs:
+      runner:
+        description: "Linux runner label with privileged Docker and dm-flakey"
+        required: true
+        default: ubuntu-latest
+
+permissions:
+  contents: read
+
+jobs:
+  durability:
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run dm-flakey cut on ext4/xfs with barriers
+        env:
+          DATARAIL_DURABILITY_FAULT_MODE: flakey
+        run: scripts/durability-device-mapper.sh
