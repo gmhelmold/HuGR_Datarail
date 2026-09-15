@@ -5,6 +5,64 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.1] - 2026-09-15
+
+### Added — Storage Primitives (WP-01)
+- `ReplayLog`: corruption-aware replay + safe truncation/reopen (`replay_from`, `truncate_to`)
+- `FileOffsets`: partial-tail repair, batch snapshot/restore, compaction-safe watermark
+- `DurableLog` (WAL): fail-closed on ambiguous `fsync`/`dir-fsync`, poison after ambiguous write, ack preservation on failed dir-fsync
+- Standalone WAL durability probe (`datarail-substrate-wal` example) for fault-injection evidence
+- `Terminal`: per-partition sequence allocation, streaming landed-state drain
+
+### Added — Kafka Broker Hardening
+- `GroupCoordinator`: member registration extracted, rebalance semantics preserved, generation bump + deadline management
+- Wire layer: record parsing hardened, bounded reads, compression rejection, CRC-32C validation
+- Groups/SASL: request validation tightened, auth paths verified
+- Transactional wire dispatch: `TxnCoordinator` API aligned with serve loop, stale `finish_txn` rejected, `MESSAGE_TOO_LARGE` (10) error mapping, handler extraction for clippy compliance
+
+### Added — Transport Security
+- Crypto: AEAD round-trip, HMAC determinism, X25519 key-wrap
+- Identity: Noise_KK handshake, SPAKE2 pairing, impostor rejection
+- Rail: FASP bounded retry loop (CI stability), oversized-frame rejection gate (AUDIT-03 F1)
+
+### Added — Spec / Compatibility
+- Spec: external key references (`env:`, `file:`) with malformed-fail-closed
+- QUIC: server cert verification (wrong-CA/hostname rejection), dev/prod API split
+- Manifest: standalone receipt verifier (`verify_receipt`), tree-size binding, external verifier test
+- Compat matrix: real-client harness (Java, franz-go, kafka-python, Sarama, librdkafka 2.x)
+
+### Added — Connectors / Substrates / Bench
+- Connectors: HTTP source hardening, SCRAM-SHA-256 RFC 7677 vectors, Postgres/webhook sink hardening
+- Acceptance: blobstore, erasure, keyrouter, netblob, replication, shmem, objectstore, tieredlog, topic substrates
+- Bench/stress: broker restart survival, Fuzz 13 adversarial tests, Once persist/dedup, Stress UC1-5, System chaos/e2e, OMB shim roundtrip, Bench fairness
+
+### Added — Docs / Roadmap
+- Durability design updates (`DURABLE-LOG.md`, `KAFKA-TXN-DURABILITY.md`)
+- Manifest verifier design (`MANIFEST-VERIFIER.md`)
+- WP-01 roadmap artifacts: checklist (F1-F4), rejected locking plan, rollback, state, local bench, final snapshot
+- Linux `dm-flakey` evidence workflow + `durability-device-mapper.sh` script
+
+### Fixed
+- `ReplayLog` recovery seek after corruption
+- `FileOffsets` partial-tail truncation on reopen
+- WAL: ambiguous `fsync` → fail-closed, poison propagation, ack restoration
+- `Terminal`: per-partition sequence allocation, streaming drain
+- Kafka coordinator: stale epoch fence, member registration
+- Wire: CRC-32C validation, bounded reads, compression rejection
+- Transaction: stale `finish_txn` rejection, error code 10 mapping
+- Terminal: oversized frame rejection
+- Connectors: SCRAM-SHA-256 vectors, Postgres sink hardening
+
+### Known Limitations (Honest Scope)
+- **Single-node** — no replication, failover, or cross-node coordination
+- **Global broker lock** — per-batch seal parallelized (~2.5×), but `Mutex<BrokerInner>` serializes across partitions
+- **Transactions not crash-atomic** — in-memory coordinator, durable txn log is future work
+- **Broker restarts at-least-once** for non-idempotent producers (dedup index not wired)
+- **QUIC substrate** — dev cert only, client accepts any server cert
+- **No real key management** — `rail.toml` carries inline demo seeds
+- **Self-audited, not third-party audited** — "fuzz" = property tests, "chaos" = in-process fault injection
+- **DUR-01 physical evidence** — `dm-flakey` evidence pending self-hosted Linux runner
+
 ## [0.1.0] - 2026-09-10
 
 ### Added — Rail Mode (Zero-Knowledge)
