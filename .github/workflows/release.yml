@@ -33,21 +33,9 @@ jobs:
           name: datarail-${{ matrix.os }}-${{ github.ref_name }}
           path: target/release/datarail-${{ matrix.os }}-${{ github.ref_name }}.tar.gz
 
-  publish-crate:
-    name: Publish datarail-cli to crates.io
-    needs: build
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - name: Publish
-        run: cargo publish -p datarail-cli --dry-run
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-
   release:
     name: Create GitHub Release
-    needs: [build, publish-crate]
+    needs: build
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
