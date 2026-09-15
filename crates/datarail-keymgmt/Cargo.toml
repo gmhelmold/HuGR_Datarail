@@ -1,0 +1,53 @@
+# datarail-keymgmt — Key Management Provider Abstraction
+#
+# Defines the KeyProvider trait and implementations for external key sources
+# (age, SSH agent, env, file, KMS). Used by CLI and spec to resolve key
+# references without inline secrets in rail.toml.
+
+[package]
+name = "datarail-keymgmt"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Key management provider abstraction for datarail"
+
+[lints]
+workspace = true
+
+[dependencies]
+datarail-crypto = { path = "../datarail-crypto" }
+datarail-spec = { path = "../datarail-spec" }
+
+# age encryption support
+age = { version = "0.12", features = ["curve25519-dalek"], optional = true }
+
+# SSH agent support
+ssh-agent = { version = "0.2", optional = true }
+
+# async SSH for agent communication
+tokio = { version = "1", features = ["io-util", "net", "process", "rt-multi-thread", "sync"], optional = true }
+
+# KMS providers (optional)
+aws-sdk-kms = { version = "1.0", optional = true }
+# gcp-kms = { version = "0.1", optional = true }  # crate name TBD
+
+# Error handling
+thiserror = "1.0"
+
+# Hex encoding
+hex = "0.4"
+
+# Temp file for tests
+tempfile = { version = "3.0", optional = true }
+
+[dev-dependencies]
+tempfile = "3.0"
+
+[features]
+default = ["age", "ssh-agent"]
+age = ["dep:age"]
+ssh-agent = ["dep:ssh-agent", "dep:tokio"]
+aws-kms = ["dep:aws-sdk-kms"]
+# gcp-kms = ["dep:gcp-kms"]

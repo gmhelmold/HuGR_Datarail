@@ -36,6 +36,7 @@ members = [
     "crates/datarail-metrics",
     "crates/datarail-omb-shim",
     "crates/datarail-kafka",
+    "crates/datarail-keymgmt",
 ]
 
 [workspace.package]
